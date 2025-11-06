@@ -92,7 +92,7 @@ opts = [
                       'failed firmware update tasks')),
     cfg.IntOpt('firmware_update_wait_unresponsive_bmc',
                min=0,
-               default=300,
+               default=0,
                help=_('Number of seconds to wait before proceeding with the '
                       'reboot to finish the BMC firmware update step')),
     cfg.IntOpt('firmware_update_required_successes',
@@ -123,6 +123,19 @@ opts = [
                       'BMC firmware updates may need extended time to handle '
                       'BMC transitional states during the firmware update '
                       'process.')),
+    cfg.IntOpt('firmware_update_reboot_delay',
+               min=0,
+               default=300,
+               help=_('Default wait time (in seconds) for component-specific '
+                      'firmware update operations. Used for: BIOS firmware '
+                      'update wait before reboot, BMC firmware version check '
+                      'timeout, and NIC firmware task completion timeout.')),
+    cfg.IntOpt('firmware_update_bmc_version_check_interval',
+               min=0,
+               default=30,
+               help=_('Interval (in seconds) for checking BMC firmware '
+                      'version after BMC firmware update. Used to verify '
+                      'if BMC firmware has been successfully applied.')),
     cfg.StrOpt('firmware_source',
                choices=[('http', _('If firmware source URL is also HTTP, then '
                                    'serve from original location, otherwise '
