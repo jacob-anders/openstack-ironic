@@ -721,6 +721,13 @@ class RedfishFirmware(base.FirmwareInterface):
                 manager_utils.notify_conductor_resume_deploy(task)
 
         else:
+            # Validate BMC is responsive before continuing with next update
+            # This is critical for multi-component updates where BMC may be
+            # temporarily unresponsive after completing previous firmware update
+            LOG.debug('Validating BMC responsiveness before continuing '
+                      'to next firmware update for node %s', node.uuid)
+            self._validate_resources_stability(node)
+
             settings.pop(0)
             self._execute_firmware_update(node,
                                           update_service,
@@ -802,9 +809,6 @@ class RedfishFirmware(base.FirmwareInterface):
                      {'node': node.uuid,
                       'firmware_image': current_update['url'],
                       'messages': ", ".join(messages)})
-
-            # Validate BMC resources are consistently available
-            self._validate_resources_stability(node)
 
             # Component-specific post-update handling
             component = current_update.get('component', '')
