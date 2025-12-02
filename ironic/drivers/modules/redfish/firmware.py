@@ -221,21 +221,8 @@ class RedfishFirmware(base.FirmwareInterface):
                   {'node_uuid': node.uuid, 'settings': settings})
         self._execute_firmware_update(node, update_service, settings)
 
-        fw_upd = settings[0]
-        component = fw_upd.get('component', '')
-        component_type = self._get_component_type(component)
-
-        # Component-specific setup
-        if component_type == 'bmc':
-            self._setup_bmc_update_monitoring(node, fw_upd)
-        elif component_type == 'nic':
-            self._setup_nic_update_monitoring(node)
-        elif component_type == 'bios':
-            self._setup_bios_update_monitoring(node)
-        else:
-            self._setup_default_update_monitoring(node, fw_upd)
-
-        # Store updated settings
+        # Store updated settings - component-specific setup is now done
+        # in _execute_firmware_update() for each component
         node.set_driver_internal_info('redfish_fw_updates', settings)
         node.save()
 
@@ -559,9 +546,6 @@ class RedfishFirmware(base.FirmwareInterface):
             raise exception.RedfishError(error=e)
 
         # Store task monitor URI for periodic task polling
-        # NOTE(janders): Component-specific wait/reboot behavior is now
-        # handled by the update() method and periodic polling, not here
-
         fw_upd['task_monitor'] = task_monitor.task_monitor_uri
         node.set_driver_internal_info('redfish_fw_updates', settings)
 
@@ -572,6 +556,20 @@ class RedfishFirmware(base.FirmwareInterface):
             elif cleanup not in fw_clean:
                 fw_clean.append(cleanup)
             node.set_driver_internal_info('firmware_cleanup', fw_clean)
+
+        # Component-specific monitoring setup
+        # This runs for EACH component update, not just the first one
+        component = fw_upd.get('component', '')
+        component_type = self._get_component_type(component)
+
+        if component_type == 'bmc':
+            self._setup_bmc_update_monitoring(node, fw_upd)
+        elif component_type == 'nic':
+            self._setup_nic_update_monitoring(node)
+        elif component_type == 'bios':
+            self._setup_bios_update_monitoring(node)
+        else:
+            self._setup_default_update_monitoring(node, fw_upd)
 
     def _validate_resources_stability(self, node):
         """Validate that BMC resources are consistently available.
