@@ -117,6 +117,22 @@ _FIRMWARE_UPDATE_ARGS = {
     }}
 
 
+def _is_during_post_error(exception):
+    """Check if a Sushy exception is an 'UnableToModifyDuringSystemPOST' error.
+
+    HPE iLO BMCs reject boot device changes while the system is in POST
+    (Power-On Self-Test), typically after a firmware update or reboot.
+
+    :param exception: A sushy.exceptions.SushyError exception
+    :returns: True if this is a POST-related error, False otherwise
+    """
+    if not isinstance(exception, sushy.exceptions.BadRequestError):
+        return False
+
+    error_str = str(exception)
+    return 'UnableToModifyDuringSystemPOST' in error_str
+
+
 def _set_boot_device(task, system, device, persistent=False,
                      http_boot_url=None):
     """An internal routine to set the boot device.
@@ -162,39 +178,67 @@ def _set_boot_device(task, system, device, persistent=False,
         # NOTE(etingof): this can be racy, esp if BMC is not RESTful
         enabled = (desired_enabled
                    if desired_enabled != current_enabled else None)
-    try:
-        # NOTE(TheJulia): In sushy, it is uri, due to the convention used
-        # in the standard. URL is used internally in ironic.
-        if requires_full_boot_request:
-            # Some vendors require sending all boot parameters every time
-            desired_mode = system.boot.get('mode') \
-                or sushy.BOOT_SOURCE_MODE_UEFI
-            desired_enabled = BOOT_DEVICE_PERSISTENT_MAP_REV[persistent]
-            current_enabled = system.boot.get('enabled') \
-                or sushy.BOOT_SOURCE_ENABLED_ONCE
-            current_target = system.boot.get('target') \
-                or sushy.BOOT_SOURCE_TARGET_NONE
 
-            LOG.debug('Vendor "%(vendor)s" requires full boot settings. '
-                      'Sending: mode=%(mode)s, enabled=%(enabled)s, '
-                      'target=%(target)s for node %(node)s',
-                      {'vendor': vendor, 'mode': desired_mode,
-                       'enabled': current_enabled, 'target': current_target,
-                       'node': task.node.uuid})
+    # Retry delays for UnableToModifyDuringSystemPOST errors (in seconds)
+    # Total: 5 + 10 + 15 + 20 + 30 = 80 seconds max wait time
+    retry_delays = [5, 10, 15, 20, 30]
+    last_exception = None
 
-            system.set_system_boot_options(
-                device,
-                mode=desired_mode,
-                enabled=enabled,
-                http_boot_uri=http_boot_url
-            )
-        else:
-            LOG.debug('Sending minimal Redfish boot device'
-                      ' change for node %(node)s',
-                      {'node': task.node.uuid})
-            system.set_system_boot_options(device, enabled=enabled,
-                                           http_boot_uri=http_boot_url)
-    except sushy.exceptions.SushyError as e:
+    for attempt in range(len(retry_delays) + 1):
+        try:
+            # NOTE(TheJulia): In sushy, it is uri, due to the convention used
+            # in the standard. URL is used internally in ironic.
+            if requires_full_boot_request:
+                # Some vendors require sending all boot parameters every time
+                desired_mode = system.boot.get('mode') \
+                    or sushy.BOOT_SOURCE_MODE_UEFI
+                desired_enabled = BOOT_DEVICE_PERSISTENT_MAP_REV[persistent]
+                current_enabled = system.boot.get('enabled') \
+                    or sushy.BOOT_SOURCE_ENABLED_ONCE
+                current_target = system.boot.get('target') \
+                    or sushy.BOOT_SOURCE_TARGET_NONE
+
+                LOG.debug('Vendor "%(vendor)s" requires full boot settings. '
+                          'Sending: mode=%(mode)s, enabled=%(enabled)s, '
+                          'target=%(target)s for node %(node)s',
+                          {'vendor': vendor, 'mode': desired_mode,
+                           'enabled': current_enabled, 'target': current_target,
+                           'node': task.node.uuid})
+
+                system.set_system_boot_options(
+                    device,
+                    mode=desired_mode,
+                    enabled=enabled,
+                    http_boot_uri=http_boot_url
+                )
+            else:
+                LOG.debug('Sending minimal Redfish boot device'
+                          ' change for node %(node)s',
+                          {'node': task.node.uuid})
+                system.set_system_boot_options(device, enabled=enabled,
+                                               http_boot_uri=http_boot_url)
+            # Success - break out of retry loop
+            break
+
+        except sushy.exceptions.SushyError as e:
+            # Check if this is a "during POST" error that should be retried
+            if _is_during_post_error(e) and attempt < len(retry_delays):
+                delay = retry_delays[attempt]
+                LOG.info('BMC is in POST, unable to modify boot device for '
+                         'node %(node)s. Retrying in %(delay)s seconds '
+                         '(attempt %(attempt)d/%(total)d)',
+                         {'node': task.node.uuid, 'delay': delay,
+                          'attempt': attempt + 1, 'total': len(retry_delays)})
+                time.sleep(delay)
+                continue  # Retry
+
+            # Not a POST error, or out of retries - save and handle below
+            last_exception = e
+            break
+
+    # If we exited the retry loop with an exception, handle it
+    if last_exception:
+        e = last_exception
         if enabled == sushy.BOOT_SOURCE_ENABLED_CONTINUOUS:
             # NOTE(dtantsur): continuous boot device settings have been
             # removed from Redfish, and some vendors stopped supporting
