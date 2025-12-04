@@ -713,6 +713,13 @@ class RedfishFirmware(base.FirmwareInterface):
                          {'node': node.uuid})
                 manager_utils.node_power_action(task, states.REBOOT)
 
+            # Validate BMC is responsive before resuming conductor operations
+            # This is critical after BMC firmware updates where the BMC may
+            # automatically reset itself and be temporarily unresponsive
+            LOG.debug('Validating BMC responsiveness before resuming '
+                      'conductor operations for node %s', node.uuid)
+            self._validate_resources_stability(node)
+
             if task.node.clean_step:
                 manager_utils.notify_conductor_resume_clean(task)
             elif task.node.service_step:
