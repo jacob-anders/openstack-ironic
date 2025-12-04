@@ -110,7 +110,7 @@ opts = [
                       'with no delay.')),
     cfg.IntOpt('firmware_update_resource_validation_timeout',
                min=0,
-               default=300,
+               default=480,
                help=_('Timeout (in seconds) to wait for BMC resources '
                       '(System, Manager, NetworkAdapters) to become stable '
                       'and consistently available after firmware update. '
