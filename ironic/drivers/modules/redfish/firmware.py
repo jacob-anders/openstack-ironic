@@ -259,9 +259,9 @@ class RedfishFirmware(base.FirmwareInterface):
             'bmc_fw_check_start_time',
             str(timeutils.utcnow().isoformat()))
 
-        LOG.info('BMC firmware update for node %(node)s. '
-                 'Will monitor BMC version and skip reboot if version '
-                 'changes.', {'node': node.uuid})
+        LOG.info('BMC firmware update for node %(node)s. Monitoring BMC '
+                 'version instead of immediate reboot.',
+                 {'node': node.uuid})
 
         # Use wait_interval or default reboot delay
         wait_interval = fw_upd.get('wait')
@@ -740,7 +740,32 @@ class RedfishFirmware(base.FirmwareInterface):
                                           update_service,
                                           settings)
             node.save()
-            manager_utils.node_power_action(task, states.REBOOT)
+
+            # Only reboot if the component-specific code requested it.
+            # Component-specific setup methods (_setup_bmc_update_monitoring,
+            # _setup_bios_update_monitoring, etc.) set the reboot flag via
+            # deploy_utils.set_async_step_flags() to indicate their preferred
+            # reboot strategy. BMC monitoring sets reboot=False to handle
+            # reboot decision later based on version changes.
+            # The field name depends on the step type (clean/service/deploy).
+            if task.node.clean_step:
+                reboot_field = 'cleaning_reboot'
+            elif task.node.service_step:
+                reboot_field = 'servicing_reboot'
+            elif task.node.deploy_step:
+                reboot_field = 'deployment_reboot'
+            else:
+                reboot_field = None
+
+            # Default to reboot=True for backward compatibility
+            should_reboot = node.driver_internal_info.get(reboot_field, True) if reboot_field else True
+
+            if should_reboot:
+                manager_utils.node_power_action(task, states.REBOOT)
+            else:
+                LOG.debug('Component requested no immediate reboot for node '
+                          '%(node)s, continuing with async polling',
+                          {'node': node.uuid})
 
     def _clear_updates(self, node):
         """Clears firmware updates artifacts
