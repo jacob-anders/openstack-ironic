@@ -1106,10 +1106,42 @@ class RedfishFirmware(base.FirmwareInterface):
             self._handle_bmc_update_completion(
                 task, update_service, settings, current_update)
         elif current_update.get('component_type') == 'bmc':
-            # BMC update timeout expired while task monitor was checking
+            # BMC update wait expired - check if task is still running
+            # before transitioning to version checking
+            task_still_running = False
+            try:
+                task_monitor = redfish_utils.get_task_monitor(
+                    node, current_update['task_monitor'])
+                if task_monitor.is_processing:
+                    task_still_running = True
+                    LOG.debug('BMC firmware update wait expired but task still '
+                              'processing for node %(node)s. Continuing to '
+                              'monitor task completion.',
+                              {'node': node.uuid})
+            except exception.RedfishConnectionError as e:
+                LOG.debug('Unable to communicate with task monitor for node '
+                          '%(node)s during wait completion: %(error)s. '
+                          'BMC may be resetting, will transition to version '
+                          'checking.',
+                          {'node': node.uuid, 'error': e})
+            except exception.RedfishError as e:
+                LOG.debug('Task monitor unavailable for node %(node)s: '
+                          '%(error)s. Task may have completed, transitioning '
+                          'to version checking.',
+                          {'node': node.uuid, 'error': e})
+
+            if task_still_running:
+                # Task still processing - continue monitoring
+                # Don't transition to version checking yet
+                node.set_driver_internal_info('redfish_fw_updates', settings)
+                node.save()
+                return
+
+            # Task completed, deleted, or BMC unavailable
             # Transition to version checking mode
             LOG.info('BMC firmware update wait expired for node %(node)s. '
-                     'Transitioning to version checking mode.',
+                     'Task completed or unavailable. Transitioning to version '
+                     'checking mode.',
                      {'node': node.uuid})
             task.upgrade_lock()
             self._handle_bmc_update_completion(
