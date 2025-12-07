@@ -1293,7 +1293,19 @@ class RedfishFirmware(base.FirmwareInterface):
                 sushy_task.parse_messages()
 
             if sushy_task.messages is not None:
-                messages = [m.message for m in sushy_task.messages]
+                # Build message list, preferring message text but falling back
+                # to message_id if message is empty or if parse_messages()
+                # failed to fetch the message registry (some BMCs like HPE iLO
+                # only provide message_id for certain errors, and return HTTP
+                # 406 when trying to fetch message registries)
+                for m in sushy_task.messages:
+                    msg = m.message
+                    # If message is empty or indicates parse failure, use
+                    # message_id instead
+                    if not msg or msg.lower() in ['unknown', 'unknown error']:
+                        msg = m.message_id
+                    if msg:
+                        messages.append(msg)
 
             task.upgrade_lock()
             self._handle_task_completion(task, sushy_task, messages,
