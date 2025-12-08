@@ -641,7 +641,7 @@ class RedfishFirmware(base.FirmwareInterface):
 
             except (exception.RedfishError,
                     exception.RedfishConnectionError,
-                    sushy.exceptions.BadRequestError) as e:
+                    sushy.exceptions.SushyError) as e:
                 # Resource not available yet, reset counter
                 if consecutive_successes > 0:
                     LOG.debug('Resource validation interrupted for node '
