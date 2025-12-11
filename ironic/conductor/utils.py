@@ -1928,7 +1928,35 @@ def node_cache_firmware_components(task):
     try:
         LOG.debug('Getting Firmware Components for node %s', task.node.uuid)
         task.driver.firmware.validate(task)
+
+        # Check if NIC firmware was updated in this session
+        # If so, validate that resources are ready (OS fully booted) before
+        # attempting to cache firmware. This is critical for PLDM-based NICs.
+        nic_fw_updated = task.node.driver_internal_info.get(
+            'nic_fw_updated', False)
+        if nic_fw_updated:
+            LOG.debug('NIC firmware was updated for node %(node)s. '
+                      'Validating resources are ready before caching firmware.',
+                      {'node': task.node.uuid})
+            # Call the firmware driver's resource validation if available
+            # This ensures the OS is fully booted and NIC firmware data
+            # can be retrieved
+            if hasattr(task.driver.firmware, '_validate_resources_stability'):
+                task.driver.firmware._validate_resources_stability(
+                    task.node, require_nic_data=True)
+                LOG.debug('Resources validated successfully for node %(node)s, '
+                          'proceeding with firmware caching.',
+                          {'node': task.node.uuid})
+
         task.driver.firmware.cache_firmware_components(task)
+
+        # Clear the nic_fw_updated flag after successful firmware caching
+        if nic_fw_updated:
+            task.node.del_driver_internal_info('nic_fw_updated')
+            task.node.save()
+            LOG.debug('Cleared nic_fw_updated flag for node %(node)s after '
+                      'successful firmware caching.',
+                      {'node': task.node.uuid})
     except exception.UnsupportedDriverExtension:
         LOG.warning('Firmware Components are not supported for node %s, '
                     'skipping', task.node.uuid)
