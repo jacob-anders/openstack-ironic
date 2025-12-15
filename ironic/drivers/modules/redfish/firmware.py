@@ -609,6 +609,38 @@ class RedfishFirmware(base.FirmwareInterface):
                     'update on node %(node)s', {'node': node.uuid})
             self._validate_nic_pldm_readiness(node, update_service)
 
+            # HPE-specific: NIC firmware updates require node to be powered on
+            # with OS running before calling SimpleUpdate
+            try:
+                system = redfish_utils.get_system(node)
+                if system.manufacturer and 'HPE' in system.manufacturer.upper():
+                    LOG.info('HPE system detected for NIC firmware update on node '
+                            '%(node)s. Ensuring node is powered on with OS running.',
+                            {'node': node.uuid})
+
+                    # Check current power state
+                    if system.power_state != sushy.POWER_STATE_ON:
+                        LOG.info('Node %(node)s is not powered on (current state: '
+                                '%(state)s). Powering on for HPE NIC firmware update.',
+                                {'node': node.uuid, 'state': system.power_state})
+                        # Power on the node
+                        system.reset_system(sushy.RESET_ON)
+                        # Wait a moment for the power-on command to take effect
+                        time.sleep(5)
+
+                    # Validate that OS is running and NIC data is accessible
+                    # This is critical for HPE PLDM-based NIC updates
+                    LOG.info('Validating OS is running and resources are stable '
+                            'before HPE NIC firmware update on node %(node)s',
+                            {'node': node.uuid})
+                    self._validate_resources_stability(node, require_nic_data=True)
+                    LOG.info('Node %(node)s is ready for HPE NIC firmware update',
+                            {'node': node.uuid})
+            except Exception as e:
+                LOG.warning('Unable to perform HPE-specific NIC update pre-checks '
+                           'for node %(node)s: %(error)s. Proceeding with update.',
+                           {'node': node.uuid, 'error': e})
+
         component_url, cleanup = self._stage_firmware_file(node, fw_upd)
 
         LOG.debug('Applying new firmware %(url)s for %(component)s on node '
