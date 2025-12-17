@@ -293,6 +293,19 @@ def do_next_clean_step(task, step_index, disable_ramdisk=None):
     node.clean_step = None
     utils.wipe_cleaning_internal_info(task)
     node.save()
+
+    # If firmware was updated during cleaning, cache firmware BEFORE
+    # tear_down_cleaning while the node is still powered on with OS running.
+    # This is critical for PLDM-based NICs which require OS to be fully
+    # booted to retrieve firmware data.
+    nic_fw_updated = node.driver_internal_info.get('nic_fw_updated', False)
+    if nic_fw_updated:
+        LOG.debug('Firmware was updated during cleaning for node %(node)s. '
+                  'Caching firmware before tear down to ensure node is still '
+                  'powered on with OS running.',
+                  {'node': node.uuid})
+        utils.node_cache_firmware_components(task)
+
     if not disable_ramdisk:
         try:
             task.driver.deploy.tear_down_cleaning(task)
@@ -303,6 +316,11 @@ def do_next_clean_step(task, step_index, disable_ramdisk=None):
             return utils.cleaning_error_handler(task, msg,
                                                 traceback=True,
                                                 tear_down_cleaning=False)
+
+    # Cache firmware again after tear down if it wasn't already cached
+    # (for vendor, BIOS settings, boot mode, etc.)
+    # If firmware was already cached above, this is a no-op for firmware
+    # components but will still cache other data like vendor and BIOS settings.
     utils.node_update_cache(task)
     LOG.info('Node %s cleaning complete', node.uuid)
 
