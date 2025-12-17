@@ -577,6 +577,23 @@ class HeartbeatMixin(object):
                     task, use_existing_steps=use_existing_steps)
                 cleaning.continue_node_clean(task)
             else:
+                # Check if we're waiting for IPA heartbeat after post-firmware-
+                # update reboot (set by firmware.py after completing post-update
+                # reboot in cleaning mode)
+                if node.driver_internal_info.get(
+                        'firmware_post_update_wait_for_ipa_cleaning'):
+                    LOG.info('IPA heartbeat received for node %(node)s after '
+                             'post-firmware-update reboot. Resuming cleaning.',
+                             {'node': node.uuid})
+                    node.del_driver_internal_info(
+                        'firmware_post_update_wait_for_ipa_cleaning')
+                    node.save()
+                    msg = _('Node failed to resume cleaning after firmware update')
+                    # Transition from 'clean wait' to 'cleaning' before continuing
+                    task.resume_cleaning()
+                    cleaning.continue_node_clean(task)
+                    return
+
                 msg = _('Node failed to check cleaning progress')
                 # Check if the driver is polling for completion of a step,
                 # via the 'cleaning_polling' flag.

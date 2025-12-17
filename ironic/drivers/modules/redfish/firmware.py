@@ -1517,7 +1517,12 @@ class RedfishFirmware(base.FirmwareInterface):
                 LOG.info('Firmware updates completed for node %(node)s',
                          {'node': node.uuid})
 
-                # Notify conductor to resume (firmware caching will happen now)
+                # Resource validation has confirmed BMC is responsive and all
+                # firmware data is accessible (including NIC firmware for PLDM
+                # devices if nic_fw_updated=True). We can proceed immediately
+                # without waiting for IPA heartbeat. The only thing lost is
+                # post-update ramdisk log collection, but the relevant logs for
+                # debugging firmware updates are from before the reboot anyway.
                 task.upgrade_lock()
                 if task.node.clean_step:
                     manager_utils.notify_conductor_resume_clean(task)
