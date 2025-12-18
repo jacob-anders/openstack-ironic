@@ -1508,6 +1508,26 @@ class RedfishFirmware(base.FirmwareInterface):
                          'resources are stable.',
                          {'node': node.uuid})
 
+                # Cache firmware components now while OS is still running
+                # and PLDM channels are active. This is critical for NIC
+                # firmware updates where the OS must be booted for the BMC
+                # to access NIC firmware data via PLDM/MCTP.
+                # If we defer caching to cleaning teardown, IPA may have
+                # already timed out and the node will power off before
+                # firmware caching can succeed.
+                LOG.info('Caching firmware components for node %(node)s '
+                         'while OS is running',
+                         {'node': node.uuid})
+                try:
+                    manager_utils.node_cache_firmware_components(task)
+                except exception.IronicException as e:
+                    # Log the error but continue - this is not a fatal error
+                    # The firmware update was successful, we just couldn't
+                    # cache the new version. This can happen on some hardware.
+                    LOG.warning('Failed to cache firmware components for node '
+                                '%(node)s after firmware update: %(error)s',
+                                {'node': node.uuid, 'error': e})
+
                 # Clear the post-update reboot flag and clear all updates
                 node.del_driver_internal_info('firmware_post_update_reboot')
                 node.del_driver_internal_info('firmware_reboot_start_time')
@@ -1613,7 +1633,8 @@ class RedfishFirmware(base.FirmwareInterface):
 
         # Check if task is in a terminal state (completed, failed, etc.)
         # If so, proceed directly to completion handling
-        if task_state not in [sushy.TASK_STATE_RUNNING,
+        if task_state not in [sushy.TASK_STATE_NEW,
+                              sushy.TASK_STATE_RUNNING,
                               sushy.TASK_STATE_STARTING,
                               sushy.TASK_STATE_PENDING]:
             # Task is done (COMPLETED, EXCEPTION, KILLED, CANCELLED, etc.)
@@ -1648,7 +1669,7 @@ class RedfishFirmware(base.FirmwareInterface):
                                          current_update)
             return
 
-        # Task is still in progress (RUNNING, STARTING, or PENDING)
+        # Task is still in progress (NEW, RUNNING, STARTING, or PENDING)
         # Do component-specific monitoring
         component = current_update.get('component', '')
         component_type = self._get_component_type(component)
