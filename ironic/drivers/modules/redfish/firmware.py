@@ -447,6 +447,22 @@ class RedfishFirmware(base.FirmwareInterface):
                     {'node': node.uuid})
                 # Set flag to indicate reboot completed, ready to continue
                 current_update['bmc_update_completed'] = True
+
+                # Check if next component is NIC - if so, we need to validate
+                # resource stability after the reboot to ensure the NIC firmware
+                # update subsystem is fully ready. This is particularly important
+                # for Dell iDRAC where the FirmwareInventory Updateable flag may
+                # report true before the system is actually ready to handle NIC
+                # firmware updates, leading to "internal error" failures.
+                if len(settings) > 1:
+                    next_component = settings[1].get('component', '')
+                    next_component_type = self._get_component_type(next_component)
+                    if next_component_type == 'nic':
+                        current_update['validate_stability_after_bmc_reboot'] = True
+                        LOG.info('Next component is NIC - will validate resource '
+                                 'stability after reboot for node %(node)s',
+                                 {'node': node.uuid})
+
                 node.set_driver_internal_info('redfish_fw_updates', settings)
                 node.save()
 
@@ -1426,13 +1442,39 @@ class RedfishFirmware(base.FirmwareInterface):
         if current_update.get('bmc_update_completed'):
             LOG.info(
                 'BMC firmware update completed and node %(node)s has '
-                'rebooted. Continuing with next component.',
+                'rebooted.',
                 {'node': node.uuid})
+
+            # Check if we need to validate resource stability before continuing
+            # to NIC firmware update. This ensures the NIC firmware update
+            # subsystem is fully ready after the post-BMC-update reboot.
+            if current_update.get('validate_stability_after_bmc_reboot'):
+                LOG.info('Validating resource stability before continuing to '
+                         'NIC firmware update for node %(node)s',
+                         {'node': node.uuid})
+                try:
+                    self._validate_resources_stability(node,
+                                                       require_nic_data=True)
+                    LOG.info('Resource stability validation passed for node '
+                             '%(node)s. Continuing to NIC firmware update.',
+                             {'node': node.uuid})
+                except exception.RedfishError as e:
+                    LOG.error('Resource stability validation failed for node '
+                              '%(node)s: %(error)s. Will retry.',
+                              {'node': node.uuid, 'error': e})
+                    # Don't pop the flags - let it retry on next poll
+                    return
+
+                # Validation passed, clear the flag
+                current_update.pop('validate_stability_after_bmc_reboot')
+
             current_update.pop('bmc_update_completed')
             node.set_driver_internal_info('redfish_fw_updates', settings)
             node.save()
 
             task.upgrade_lock()
+            LOG.info('Continuing with next component for node %(node)s',
+                     {'node': node.uuid})
             self._continue_updates(task, update_service, settings)
             return
 
