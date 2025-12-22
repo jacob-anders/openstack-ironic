@@ -263,10 +263,12 @@ class RedfishFirmware(base.FirmwareInterface):
                  'version instead of immediate reboot.',
                  {'node': node.uuid})
 
-        # Use wait_interval or default reboot delay
+        # Use wait_interval or default power timeout (from fw_upd, set by
+        # _execute_firmware_update)
         wait_interval = fw_upd.get('wait')
         if wait_interval is None:
-            wait_interval = CONF.redfish.firmware_update_reboot_delay
+            timeout = fw_upd.get('power_timeout', 0)
+            wait_interval = timeout
         fw_upd['wait'] = wait_interval
         # Set wait_start_time so polling can detect when task monitor
         # becomes unresponsive and transition to version checking
@@ -467,7 +469,9 @@ class RedfishFirmware(base.FirmwareInterface):
                 node.save()
 
                 task.upgrade_lock()
-                manager_utils.node_power_action(task, states.REBOOT)
+                power_timeout = current_update.get('power_timeout', 0)
+                manager_utils.node_power_action(task, states.REBOOT,
+                                                power_timeout)
                 return
             else:
                 # Last component - no reboot needed
@@ -487,8 +491,9 @@ class RedfishFirmware(base.FirmwareInterface):
         if check_start_time:
             check_start = timeutils.parse_isotime(check_start_time)
             elapsed_time = timeutils.utcnow(True) - check_start
+            # Use wait from current_update, fall back to power_timeout
             timeout = current_update.get(
-                'wait', CONF.redfish.firmware_update_reboot_delay)
+                'wait', current_update.get('power_timeout', 0))
             if elapsed_time.seconds >= timeout:
                 # Timeout: version didn't change or BMC unresponsive
                 if (current_version is not None
@@ -598,6 +603,10 @@ class RedfishFirmware(base.FirmwareInterface):
             to be executed.
         """
         fw_upd = settings[0]
+
+        # Store power timeout for use by reboot operations
+        fw_upd['power_timeout'] = getattr(
+            CONF.redfish, 'firmware_update_power_timeout', 0)
         # NOTE(janders) try to get the collection of Systems on the BMC
         # to determine if there may be more than one System
         try:
@@ -979,7 +988,9 @@ class RedfishFirmware(base.FirmwareInterface):
             should_reboot = node.driver_internal_info.get(reboot_field, True) if reboot_field else True
 
             if should_reboot:
-                manager_utils.node_power_action(task, states.REBOOT)
+                power_timeout = settings[0].get('power_timeout', 0)
+                manager_utils.node_power_action(task, states.REBOOT,
+                                                power_timeout)
             else:
                 LOG.debug('Component requested no immediate reboot for node '
                           '%(node)s, continuing with async polling',
@@ -1135,7 +1146,9 @@ class RedfishFirmware(base.FirmwareInterface):
                     node.set_driver_internal_info(
                         'redfish_fw_updates', settings)
                     node.save()
-                    manager_utils.node_power_action(task, states.REBOOT)
+                    power_timeout = current_update.get('power_timeout', 0)
+                    manager_utils.node_power_action(task, states.REBOOT,
+                                                    power_timeout)
                     return
                 else:
                     # Reboot was already triggered when task started,
@@ -1265,7 +1278,9 @@ class RedfishFirmware(base.FirmwareInterface):
                 task.upgrade_lock()
 
                 # Trigger the reboot to start update
-                manager_utils.node_power_action(task, states.REBOOT)
+                power_timeout = current_update.get('power_timeout', 0)
+                manager_utils.node_power_action(task, states.REBOOT,
+                                                power_timeout)
 
                 LOG.info('Reboot initiated for node %(node)s to start '
                          'NIC firmware update', {'node': node.uuid})
@@ -1327,7 +1342,9 @@ class RedfishFirmware(base.FirmwareInterface):
                 task.upgrade_lock()
 
                 # Trigger the reboot
-                manager_utils.node_power_action(task, states.REBOOT)
+                power_timeout = current_update.get('power_timeout', 0)
+                manager_utils.node_power_action(task, states.REBOOT,
+                                                power_timeout)
 
                 LOG.info('Reboot initiated for node %(node)s to apply '
                          'BIOS firmware update',

@@ -116,12 +116,12 @@ opts = [
                       'and consistently available after firmware update. '
                       'Set to 0 to disable post-upgrade validation '
                       'entirely.')),
-    cfg.IntOpt('firmware_update_bmc_timeout',
+    cfg.IntOpt('firmware_update_power_timeout',
                min=0,
                default=300,
-               help=_('Timeout (in seconds) for BMC firmware updates. '
-                      'BMC firmware updates may need extended time to handle '
-                      'BMC transitional states during the firmware update '
+               help=_('Timeout (in seconds) for power operations during '
+                      'firmware updates. Firmware updates may need extended '
+                      'time to handle transitional states during the update '
                       'process.')),
     cfg.IntOpt('firmware_update_reboot_delay',
                min=0,
