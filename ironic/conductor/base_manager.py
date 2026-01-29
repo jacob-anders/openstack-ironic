@@ -559,6 +559,46 @@ class BaseConductorManager(object):
 
         return self.host in ring.get_nodes(node_uuid.encode('utf-8'))
 
+
+    def _step_requires_ramdisk(self, task, step):
+        """Check if a step requires the ramdisk agent.
+
+        :param task: a TaskManager instance
+        :param step: the step dict from node.service_step or node.clean_step
+        :returns: True if step requires ramdisk, False otherwise
+        """
+        # Check if step explicitly has requires_ramdisk field
+        requires_ramdisk = step.get('requires_ramdisk')
+        if requires_ramdisk is not None:
+            return requires_ramdisk
+
+        # Try to look it up from the driver interface
+        try:
+            interface_name = step.get('interface')
+            step_name = step.get('step')
+            if not (interface_name and step_name):
+                return True  # Safe default
+
+            iface = getattr(task.driver, interface_name, None)
+            if not iface:
+                return True  # Safe default
+
+            # Get steps based on provision state
+            prov_state = task.node.provision_state
+            if prov_state == states.SERVICEWAIT:
+                steps_list = iface.get_service_steps(task)
+            else:  # CLEANWAIT
+                steps_list = iface.get_clean_steps(task)
+
+            # Find matching step
+            for step_dict in steps_list:
+                if step_dict.get('step') == step_name:
+                    return step_dict.get('requires_ramdisk', True)
+        except Exception:
+            pass  # If we can't determine, default to True (safe)
+
+        return True  # Safe default
+
     def _fail_if_in_state(self, context, filters, provision_state,
                           sort_key, callback_method=None,
                           err_handler=None, last_error=None,
@@ -614,6 +654,27 @@ class BaseConductorManager(object):
                         continue
 
                     if task.node.provision_state not in provision_state:
+                        continue
+
+                    # For SERVICEWAIT and CLEANWAIT, check if the current
+                    # step requires ramdisk. Steps with requires_ramdisk=False
+                    # (like Redfish firmware updates) should not timeout
+                    # based on heartbeat since they operate independently
+                    # of the ramdisk agent.
+                    step = None
+                    prov_state = task.node.provision_state
+                    if prov_state == states.SERVICEWAIT:
+                        step = task.node.service_step
+                    elif prov_state == states.CLEANWAIT:
+                        step = task.node.clean_step
+
+                    if step and not self._step_requires_ramdisk(task, step):
+                        LOG.debug(
+                            'Skipping heartbeat timeout check for node '
+                            '%(node)s: step %(step)s does not require '
+                            'ramdisk',
+                            {'node': task.node.uuid,
+                             'step': step.get('step')})
                         continue
 
                     target_state = (None if not keep_target_state else
