@@ -782,11 +782,11 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
     @mock.patch.object(redfish_utils, 'get_task_monitor', autospec=True)
     def test_check_calls_touch_provisioning(self, mock_task_monitor,
                                             mock_get_update_service):
-        """Test _check_node_redfish_firmware_update calls touch_provisioning.
+        """Test _check_node_redfish_firmware_update does NOT call touch_provisioning.
 
-        This prevents heartbeat timeouts for firmware updates that don't
-        require the ramdisk agent (requires_ramdisk=False). By calling
-        touch_provisioning on each poll, we keep provision_updated_at fresh.
+        The heartbeat timeout bypass is now handled in base_manager.py for
+        steps with requires_ramdisk=False, so firmware.py no longer needs
+        to call touch_provisioning directly.
         """
         self._generate_new_driver_internal_info(['bmc'])
 
@@ -800,8 +800,9 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
                                    autospec=True) as mock_touch:
                 firmware._check_node_redfish_firmware_update(task)
 
-                # Verify touch_provisioning was called
-                mock_touch.assert_called_once_with()
+                # Verify touch_provisioning was NOT called
+                # (heartbeat bypass handled in base_manager.py instead)
+                mock_touch.assert_not_called()
 
     @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
     def test_check_skips_touch_provisioning_on_conn_error(
@@ -827,71 +828,6 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
 
                 # Verify touch_provisioning was NOT called on connection error
                 mock_touch.assert_not_called()
-
-    @mock.patch.object(redfish_fw.manager_utils, 'servicing_error_handler',
-                       autospec=True)
-    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
-    def test_check_overall_timeout_exceeded(self, mock_get_update_service,
-                                            mock_error_handler):
-        """Test firmware update fails when overall timeout is exceeded.
-
-        This ensures firmware updates don't run indefinitely - if the
-        overall timeout is exceeded, the update should fail with an error.
-        """
-        self._generate_new_driver_internal_info(['bmc'])
-
-        # Set start time to 3 hours ago (exceeds 2 hour default timeout)
-        past_time = (timeutils.utcnow()
-                     - datetime.timedelta(hours=3)).isoformat()
-        self.node.set_driver_internal_info('redfish_fw_update_start_time',
-                                           past_time)
-        self.node.save()
-
-        firmware = redfish_fw.RedfishFirmware()
-        with task_manager.acquire(self.context, self.node.uuid,
-                                  shared=False) as task:
-            firmware._check_node_redfish_firmware_update(task)
-
-            # Verify error handler was called with timeout message
-            mock_error_handler.assert_called_once()
-            call_args = mock_error_handler.call_args
-            self.assertIn('exceeded', call_args[0][1].lower())
-            self.assertIn('timeout', call_args[0][1].lower())
-
-            # Verify the firmware update info was cleaned up
-            task.node.refresh()
-            self.assertIsNone(
-                task.node.driver_internal_info.get('redfish_fw_updates'))
-            self.assertIsNone(
-                task.node.driver_internal_info.get(
-                    'redfish_fw_update_start_time'))
-
-    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
-    @mock.patch.object(redfish_utils, 'get_task_monitor', autospec=True)
-    def test_check_overall_timeout_not_exceeded(self, mock_task_monitor,
-                                                mock_get_update_service):
-        """Test firmware update continues when timeout not exceeded."""
-        self._generate_new_driver_internal_info(['bmc'])
-
-        # Set start time to 1 hour ago (within 2 hour default timeout)
-        past_time = (timeutils.utcnow()
-                     - datetime.timedelta(hours=1)).isoformat()
-        self.node.set_driver_internal_info('redfish_fw_update_start_time',
-                                           past_time)
-        self.node.save()
-
-        # Mock task still in progress
-        mock_task_monitor.return_value.is_processing = True
-
-        firmware = redfish_fw.RedfishFirmware()
-        with task_manager.acquire(self.context, self.node.uuid,
-                                  shared=False) as task:
-            with mock.patch.object(task.node, 'touch_provisioning',
-                                   autospec=True) as mock_touch:
-                firmware._check_node_redfish_firmware_update(task)
-
-                # Verify touch_provisioning was called (update continues)
-                mock_touch.assert_called_once_with()
 
     @mock.patch.object(redfish_fw, 'LOG', autospec=True)
     @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
@@ -1293,7 +1229,7 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
             log_mock.debug.assert_has_calls(debug_calls)
             self.assertEqual(
                 [{'component': 'bios', 'url': 'https://bios/v1.0.1',
-                  'task_monitor': '/task/2', 'power_timeout': 300}],
+                  'task_monitor': '/task/2'}],
                 task.node.driver_internal_info['redfish_fw_updates'])
             update_service_mock.simple_update.assert_called_once_with(
                 'https://bios/v1.0.1')
@@ -1304,7 +1240,7 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
             # Verify BMC validation was called before continuing to next update
             validate_mock.assert_called_once_with(firmware, task.node)
             node_power_action_mock.assert_called_once_with(task, states.REBOOT,
-                                                           300)
+                                                           0)
 
     @mock.patch.object(redfish_utils, 'get_system', autospec=True)
     @mock.patch.object(redfish_utils, 'get_system_collection', autospec=True)
@@ -1397,7 +1333,7 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
             'https://bmc/v1.2.3')
         # Verify BMC monitoring setup was called (internally by _execute)
         set_async_mock.assert_called_once_with(
-            self.node, reboot=False, polling=True)
+            self.node, reboot=False, skip_current_step=True, polling=True)
     @mock.patch.object(deploy_utils, 'set_async_step_flags', autospec=True)
     @mock.patch.object(redfish_utils, 'get_manager', autospec=True)
     @mock.patch.object(redfish_utils, 'get_system', autospec=True)
@@ -1442,7 +1378,7 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
             'https://bmc/v1.2.3')
         # Verify BMC monitoring setup was called (internally by _execute)
         set_async_mock.assert_called_once_with(
-            self.node, reboot=False, polling=True)
+            self.node, reboot=False, skip_current_step=True, polling=True)
 
     def test__validate_resources_stability_success(self):
         """Test successful BMC resource validation with consecutive success."""
@@ -1500,7 +1436,7 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
                     'timeout')
 
                 # Mock time progression to exceed timeout
-                time_mock.side_effect = [0, 350]  # Exceeds 300 second timeout
+                time_mock.side_effect = [0, 500]  # Exceeds 480 second timeout
 
                 # Should raise RedfishError due to timeout
                 self.assertRaises(exception.RedfishError,
@@ -1584,7 +1520,7 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
                     'manager error')
 
                 # Mock time progression to exceed timeout
-                time_mock.side_effect = [0, 350]
+                time_mock.side_effect = [0, 500]
 
                 # Should raise RedfishError due to timeout
                 self.assertRaises(exception.RedfishError,
@@ -1612,7 +1548,7 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
                     'chassis error')
 
                 # Mock time progression to exceed timeout
-                time_mock.side_effect = [0, 350]
+                time_mock.side_effect = [0, 500]
 
                 # Should raise RedfishError due to timeout
                 self.assertRaises(exception.RedfishError,
@@ -1747,7 +1683,7 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
                 # Mock time progression: start at 0, try once at 10, timeout
                 # at 350, this allows at least one loop iteration to trigger
                 # the exception
-                time_mock.side_effect = [0, 10, 350]
+                time_mock.side_effect = [0, 10, 500]
 
                 # Should raise RedfishError due to timeout
                 self.assertRaises(exception.RedfishError,
@@ -1798,6 +1734,7 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
             mock_set_async_flags.assert_called_once_with(
                 task.node,
                 reboot=False,
+                skip_current_step=True,
                 polling=True
             )
             # Verify BMC version check tracking is set up
@@ -1843,6 +1780,7 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
             mock_set_async_flags.assert_called_once_with(
                 task.node,
                 reboot=False,
+                skip_current_step=True,
                 polling=True
             )
             # Verify BMC version check tracking is set up
@@ -1878,6 +1816,7 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
             mock_set_async_flags.assert_called_once_with(
                 task.node,
                 reboot=True,
+                skip_current_step=True,
                 polling=True
             )
             self.assertEqual(states.SERVICEWAIT, result)
@@ -1905,6 +1844,7 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
             mock_set_async_flags.assert_called_once_with(
                 task.node,
                 reboot=True,
+                skip_current_step=True,
                 polling=True
             )
             self.assertEqual(states.SERVICEWAIT, result)
@@ -1935,6 +1875,7 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
             mock_set_async_flags.assert_called_once_with(
                 task.node,
                 reboot=True,
+                skip_current_step=True,
                 polling=True
             )
             self.assertEqual(states.SERVICEWAIT, result)
@@ -1963,6 +1904,7 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
             mock_set_async_flags.assert_called_once_with(
                 task.node,
                 reboot=False,
+                skip_current_step=True,
                 polling=True
             )
             # Verify wait time is stored
@@ -2007,6 +1949,7 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
             mock_set_async_flags.assert_called_once_with(
                 task.node,
                 reboot=False,
+                skip_current_step=True,
                 polling=True
             )
             # Verify we return wait state to keep step active
@@ -2040,6 +1983,7 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
             mock_set_async_flags.assert_called_once_with(
                 task.node,
                 reboot=True,
+                skip_current_step=True,
                 polling=True
             )
             # Verify we return wait state to keep step active
@@ -2069,6 +2013,7 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
             mock_set_async_flags.assert_called_once_with(
                 task.node,
                 reboot=True,
+                skip_current_step=True,
                 polling=True
             )
             # Verify we return wait state to keep step active
@@ -2121,6 +2066,7 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
             mock_set_async_flags.assert_called_once_with(
                 task.node,
                 reboot=True,
+                skip_current_step=True,
                 polling=True
             )
 

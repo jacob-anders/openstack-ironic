@@ -559,7 +559,6 @@ class BaseConductorManager(object):
 
         return self.host in ring.get_nodes(node_uuid.encode('utf-8'))
 
-
     def _step_requires_ramdisk(self, task, step):
         """Check if a step requires the ramdisk agent.
 
