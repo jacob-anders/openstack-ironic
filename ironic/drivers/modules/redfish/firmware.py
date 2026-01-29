@@ -235,11 +235,9 @@ class RedfishFirmware(base.FirmwareInterface):
                   {'node_uuid': node.uuid, 'settings': settings})
         self._execute_firmware_update(node, update_service, settings)
 
-        # Store updated settings and start time for overall timeout tracking
+        # Store updated settings - component-specific setup is now done
+        # in _execute_firmware_update() for each component
         node.set_driver_internal_info('redfish_fw_updates', settings)
-        node.set_driver_internal_info(
-            'redfish_fw_update_start_time',
-            timeutils.utcnow().isoformat())
         node.save()
 
         # Return wait state to keep the step active and let polling handle
@@ -848,7 +846,6 @@ class RedfishFirmware(base.FirmwareInterface):
         """
         firmware_utils.cleanup(node)
         node.del_driver_internal_info('redfish_fw_updates')
-        node.del_driver_internal_info('redfish_fw_update_start_time')
         node.del_driver_internal_info('firmware_cleanup')
         node.del_driver_internal_info('firmware_reboot_requested')
         node.save()
@@ -1231,49 +1228,11 @@ class RedfishFirmware(base.FirmwareInterface):
             # Continue with updates
             self._continue_updates(task, update_service, settings)
 
-    def _check_overall_timeout(self, task):
-        """Check if firmware update has exceeded overall timeout.
-
-        :param task: A TaskManager instance
-        :returns: True if timeout exceeded and error was handled,
-                  False otherwise
-        """
-        node = task.node
-        overall_timeout = CONF.redfish.firmware_update_overall_timeout
-        if overall_timeout <= 0:
-            return False
-
-        start_time_str = node.driver_internal_info.get(
-            'redfish_fw_update_start_time')
-        if not start_time_str:
-            return False
-
-        start_time = timeutils.parse_isotime(start_time_str)
-        elapsed = timeutils.utcnow(True) - start_time
-        if elapsed.total_seconds() < overall_timeout:
-            return False
-
-        msg = (_('Firmware update on node %(node)s has exceeded '
-                 'the overall timeout of %(timeout)s seconds. '
-                 'Elapsed time: %(elapsed)s seconds.')
-               % {'node': node.uuid,
-                  'timeout': overall_timeout,
-                  'elapsed': int(elapsed.total_seconds())})
-        LOG.error(msg)
-        task.upgrade_lock()
-        self._clear_updates(node)
-        manager_utils.servicing_error_handler(task, msg, traceback=False)
-        return True
-
     @METRICS.timer('RedfishFirmware._check_node_redfish_firmware_update')
     def _check_node_redfish_firmware_update(self, task):
         """Check the progress of running firmware update on a node."""
 
         node = task.node
-
-        # Check overall timeout for firmware update operation
-        if self._check_overall_timeout(task):
-            return
 
         settings = node.driver_internal_info['redfish_fw_updates']
         current_update = settings[0]
