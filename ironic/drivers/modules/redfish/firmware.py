@@ -565,8 +565,6 @@ class RedfishFirmware(base.FirmwareInterface):
             to be executed.
         """
         fw_upd = settings[0]
-        # Store power timeout to use on reboot operations
-        fw_upd['power_timeout'] = CONF.redfish.firmware_update_reboot_delay
         # NOTE(janders) try to get the collection of Systems on the BMC
         # to determine if there may be more than one System
         try:

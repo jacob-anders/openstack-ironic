@@ -202,7 +202,8 @@ def _set_boot_device(task, system, device, persistent=False,
                           'Sending: mode=%(mode)s, enabled=%(enabled)s, '
                           'target=%(target)s for node %(node)s',
                           {'vendor': vendor, 'mode': desired_mode,
-                           'enabled': current_enabled, 'target': current_target,
+                           'enabled': current_enabled,
+                           'target': current_target,
                            'node': task.node.uuid})
 
                 system.set_system_boot_options(
