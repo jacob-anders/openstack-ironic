@@ -51,6 +51,22 @@ TARGET_STATE_MAP = {
 }
 
 
+def _is_reset_transient_error(exception):
+    """Check if a system reset failure is a transient BMC error.
+
+    Some BMCs (particularly Dell iDRAC) may temporarily reject reset
+    commands with HTTP 500 errors immediately after firmware updates,
+    while the BMC is still stabilizing or processing the update.
+
+    :param exception: A sushy.exceptions.SushyError exception
+    :returns: True if this is a transient error that should be retried
+    """
+    # Check for HTTP 500 (ServerSideError) from Dell iDRAC
+    if isinstance(exception, sushy.exceptions.ServerSideError):
+        return True
+    return False
+
+
 def _set_power_state(task, system, power_state, timeout=None):
     """An internal helper to set a power state on the system.
 
@@ -62,7 +78,36 @@ def _set_power_state(task, system, power_state, timeout=None):
     :raises: RedfishConnectionError when it fails to connect to Redfish
     :raises: RedfishError on an error from the Sushy library
     """
-    system.reset_system(SET_POWER_STATE_MAP.get(power_state))
+    # Retry delays for transient BMC errors (in seconds)
+    # Total: 5 + 10 + 15 + 20 = 50 seconds max wait time
+    retry_delays = [5, 10, 15, 20]
+    last_exception = None
+
+    for attempt in range(len(retry_delays) + 1):
+        try:
+            system.reset_system(SET_POWER_STATE_MAP.get(power_state))
+            break  # Success - exit retry loop
+        except sushy.exceptions.SushyError as e:
+            # Check if this is a transient error that should be retried
+            if _is_reset_transient_error(e) and attempt < len(retry_delays):
+                delay = retry_delays[attempt]
+                LOG.info('BMC returned transient error for system reset on '
+                         'node %(node)s. Retrying in %(delay)s seconds '
+                         '(attempt %(attempt)d/%(total)d). Error: %(error)s',
+                         {'node': task.node.uuid, 'delay': delay,
+                          'attempt': attempt + 1, 'total': len(retry_delays),
+                          'error': e})
+                time.sleep(delay)
+                continue  # Retry
+
+            # Not a transient error, or out of retries
+            last_exception = e
+            break
+
+    # If we exited with an exception, re-raise it
+    if last_exception:
+        raise last_exception
+
     target_state = TARGET_STATE_MAP.get(power_state, power_state)
     if power_state == states.REBOOT:
         LOG.debug('Waiting 15 seconds to give the node %s a chance to power '
