@@ -288,7 +288,7 @@ class RedfishFirmware(base.FirmwareInterface):
         # becomes unresponsive and transition to version checking
         fw_upd['wait_start_time'] = str(timeutils.utcnow().isoformat())
         # Mark this as a BMC update so we can handle timeouts properly
-        fw_upd['component_type'] = redfish_utils.BMC
+        fw_upd['component_type'] = 'bmc'
 
         # BMC: Set async flags without immediate reboot
         deploy_utils.set_async_step_flags(
@@ -370,6 +370,26 @@ class RedfishFirmware(base.FirmwareInterface):
             polling=True
         )
 
+    def _get_component_type(self, component):
+        """Determine the type of firmware component.
+
+        Note: This helper exists primarily to handle NIC components which use
+        a prefix pattern (e.g., 'nic:BCM57414', 'nic:adapter1') rather than
+        exact string matches. This centralizes the component type detection
+        logic that is used in multiple places (update initiation, task
+        monitoring, completion handling) and provides a single source of truth
+        for component type classification.
+
+        :param component: The component name from settings
+        :returns: One of 'bios', 'bmc', 'nic', or None
+        """
+        if component == redfish_utils.BIOS:
+            return 'bios'
+        elif component == redfish_utils.BMC:
+            return 'bmc'
+        elif component.startswith(redfish_utils.NIC_COMPONENT_PREFIX):
+            return 'nic'
+        return None
 
     def _get_current_bmc_version(self, node):
         """Get current BMC firmware version.
@@ -603,13 +623,13 @@ class RedfishFirmware(base.FirmwareInterface):
             node.set_driver_internal_info('firmware_cleanup', fw_clean)
 
         component = fw_upd.get('component', '')
-        component_type = redfish_utils.get_component_type(component)
+        component_type = self._get_component_type(component)
 
-        if component_type == redfish_utils.BMC:
+        if component_type == 'bmc':
             self._setup_bmc_update_monitoring(node, fw_upd)
-        elif component_type == redfish_utils.NIC:
+        elif component_type == 'nic':
             self._setup_nic_update_monitoring(node)
-        elif component_type == redfish_utils.BIOS:
+        elif component_type == 'bios':
             self._setup_bios_update_monitoring(node)
         else:
             self._setup_default_update_monitoring(node, fw_upd)
@@ -893,17 +913,17 @@ class RedfishFirmware(base.FirmwareInterface):
 
             # Component-specific post-update handling
             component = current_update.get('component', '')
-            component_type = redfish_utils.get_component_type(component)
+            component_type = self._get_component_type(component)
 
-            if component_type == redfish_utils.BMC:
+            if component_type == 'bmc':
                 # BMC: Start version checking instead of immediate reboot
                 self._handle_bmc_update_completion(
                     task, update_service, settings, current_update)
-            elif component_type == redfish_utils.NIC:
+            elif component_type == 'nic':
                 # NIC: Handle completion with appropriate reboot behavior
                 self._handle_nic_update_completion(
                     task, update_service, settings, current_update)
-            elif component_type == redfish_utils.BIOS:
+            elif component_type == 'bios':
                 # BIOS: Check if reboot was actually triggered
                 # Some BMCs (e.g., HPE iLO) complete the BIOS firmware task
                 # very quickly (staging the firmware) before Ironic can poll
@@ -1157,7 +1177,7 @@ class RedfishFirmware(base.FirmwareInterface):
             # Continue BMC version checking
             self._handle_bmc_update_completion(
                 task, update_service, settings, current_update)
-        elif current_update.get('component_type') == redfish_utils.BMC:
+        elif current_update.get('component_type') == 'bmc':
             # BMC update wait expired - check if task is still running
             # before transitioning to version checking
             task_still_running = False
@@ -1202,7 +1222,7 @@ class RedfishFirmware(base.FirmwareInterface):
             # task starts, so they won't use this path.
             if len(settings) == 1:
                 component = current_update.get('component', '')
-                component_type = redfish_utils.get_component_type(component)
+                component_type = self._get_component_type(component)
                 # For default/unknown components, reboot may be needed
                 if component_type is None:
                     node.set_driver_internal_info(
@@ -1320,9 +1340,9 @@ class RedfishFirmware(base.FirmwareInterface):
 
         # Special handling for BIOS and NIC updates
         component = current_update.get('component', '')
-        component_type = redfish_utils.get_component_type(component)
+        component_type = self._get_component_type(component)
 
-        if task_monitor.is_processing and component_type == redfish_utils.BIOS:
+        if task_monitor.is_processing and component_type == 'bios':
             # For BIOS, check if task has reached STARTING state
             # and trigger reboot immediately
             if self._handle_bios_task_starting(task, task_monitor, settings,
@@ -1331,7 +1351,7 @@ class RedfishFirmware(base.FirmwareInterface):
             # Task is still processing, keep polling
             return
 
-        if task_monitor.is_processing and component_type == redfish_utils.NIC:
+        if task_monitor.is_processing and component_type == 'nic':
             # For NIC, wait 30s to see if hardware needs reboot
             if self._handle_nic_task_starting(task, task_monitor, settings,
                                               current_update):
