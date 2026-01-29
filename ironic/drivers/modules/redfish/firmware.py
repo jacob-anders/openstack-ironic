@@ -294,6 +294,7 @@ class RedfishFirmware(base.FirmwareInterface):
         deploy_utils.set_async_step_flags(
             node,
             reboot=False,
+            skip_current_step=True,
             polling=True
         )
 
@@ -315,6 +316,7 @@ class RedfishFirmware(base.FirmwareInterface):
         deploy_utils.set_async_step_flags(
             node,
             reboot=True,
+            skip_current_step=True,
             polling=True
         )
 
@@ -334,6 +336,7 @@ class RedfishFirmware(base.FirmwareInterface):
         deploy_utils.set_async_step_flags(
             node,
             reboot=True,
+            skip_current_step=True,
             polling=True
         )
 
@@ -363,6 +366,7 @@ class RedfishFirmware(base.FirmwareInterface):
         deploy_utils.set_async_step_flags(
             node,
             reboot=True,
+            skip_current_step=True,
             polling=True
         )
 
@@ -464,6 +468,7 @@ class RedfishFirmware(base.FirmwareInterface):
                     deploy_utils.set_async_step_flags(
                         node,
                         reboot=True,
+                        skip_current_step=True,
                         polling=True
                     )
 
