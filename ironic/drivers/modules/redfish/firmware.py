@@ -1269,13 +1269,6 @@ class RedfishFirmware(base.FirmwareInterface):
                         {'node': node.uuid, 'error': e})
             return
 
-        # Touch provisioning to indicate progress is being monitored.
-        # This prevents heartbeat timeout from triggering for steps that
-        # don't require the ramdisk agent (requires_ramdisk=False).
-        # Note: Only touch after successful BMC communication to ensure
-        # the process eventually times out if the BMC is unresponsive.
-        node.touch_provisioning()
-
         wait_start_time = current_update.get('wait_start_time')
         if wait_start_time:
             wait_start = timeutils.parse_isotime(wait_start_time)
