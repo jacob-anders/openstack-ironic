@@ -318,6 +318,53 @@ class RedfishBiosTestCase(db_base.DbTestCase):
             self.assertNotIn('requested_bios_attrs', info)
         mock_servicing_error_handler.assert_not_called()
 
+    @mock.patch.object(manager_utils, 'node_power_action', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_system', autospec=True)
+    @mock.patch.object(objects, 'BIOSSettingList', autospec=True)
+    def test_pre_configuration_firmware_updated_recaches_settings(
+            self, mock_setting_list, mock_get_system, mock_power_action):
+        data = [{'name': 'ProcTurboMode', 'value': 'Disabled'}]
+        self.node.service_step = {'priority': 100, 'interface': 'bios',
+                                  'step': 'apply_configuration',
+                                  'argsinfo': {'settings': data}}
+        self.node.provision_state = states.SERVICING
+        node = self.node
+        driver_internal_info = node.driver_internal_info
+        driver_internal_info['firmware_updated_in_current_service'] = True
+        node.driver_internal_info = driver_internal_info
+        node.save()
+        mock_setting_list.sync_node_setting.return_value = (
+            [], [], [], [])
+        mock_bios = mock.Mock()
+        mock_bios.attributes = {'ProcTurboMode': 'Enabled'}
+        mock_bios.get_attribute_registry.return_value = None
+        mock_bios.supported_apply_times = []
+        mock_system = mock.Mock()
+        mock_system.bios = mock_bios
+        mock_get_system.return_value = mock_system
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            task.driver.bios.apply_configuration(task, data)
+            info = task.node.driver_internal_info
+            self.assertNotIn('firmware_updated_in_current_service', info)
+            # Called twice: once by pre_configuration re-cache, once by
+            # the @cache_bios_settings decorator on apply_configuration
+            self.assertEqual(2, mock_setting_list.sync_node_setting.call_count)
+            bios = mock_get_system.return_value.bios
+            bios.set_attributes.assert_called_once()
+
+    def test_pre_configuration_no_firmware_update_is_noop(self):
+        data = [{'name': 'ProcTurboMode', 'value': 'Disabled'}]
+        self.node.service_step = {'priority': 100, 'interface': 'bios',
+                                  'step': 'apply_configuration',
+                                  'argsinfo': {'settings': data}}
+        self.node.provision_state = states.SERVICING
+        self.node.save()
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            result = task.driver.bios.pre_configuration(task, data)
+            self.assertIsNone(result)
+
     @mock.patch.object(redfish_utils, 'get_system', autospec=True)
     def _test_step_post_reboot(self, mock_get_system,
                                attributes_after_reboot=None):

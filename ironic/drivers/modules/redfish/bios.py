@@ -187,6 +187,36 @@ class RedfishBIOS(base.BIOSInterface):
                       {'node_uuid': node.uuid, 'attrs': current_attrs})
             self._clear_reboot_requested(task)
 
+    def pre_configuration(self, task, settings):
+        """Hook called before applying BIOS settings.
+
+        Extension point to allow vendor implementations to extend this class
+        and override this method to perform pre-configuration checks (e.g.,
+        verifying no pending configuration jobs exist on the BMC).
+
+        The default implementation checks whether a firmware update was
+        performed earlier in the same service operation and, if so,
+        re-caches the BIOS registry since new firmware may change available
+        attributes, allowable values, or defaults.
+
+        :param task: a TaskManager instance containing the node to act on.
+        :param settings: a list of BIOS settings to be applied.
+        :returns: a wait state if needed by a subclass, otherwise None.
+        """
+        node = task.node
+        if not node.driver_internal_info.get(
+                'firmware_updated_in_current_service'):
+            return None
+
+        node.del_driver_internal_info('firmware_updated_in_current_service')
+        node.save()
+        LOG.info('Firmware was updated for node %(node)s in this service '
+                 'operation. Refreshing BIOS settings cache before '
+                 'applying configuration.',
+                 {'node': node.uuid})
+        self.cache_bios_settings(task)
+        return None
+
     @base.service_step(priority=0, argsinfo=_APPLY_CONFIGURATION_ARGSINFO,
                        requires_ramdisk=False)
     @base.clean_step(priority=0, argsinfo=_APPLY_CONFIGURATION_ARGSINFO)
@@ -200,6 +230,9 @@ class RedfishBIOS(base.BIOSInterface):
         :raises: RedfishConnectionError when it fails to connect to Redfish
         :raises: RedfishError on an error from the Sushy library
         """
+        pre_result = self.pre_configuration(task, settings)
+        if pre_result is not None:
+            return pre_result
 
         system = redfish_utils.get_system(task.node)
         try:

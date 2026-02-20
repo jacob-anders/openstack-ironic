@@ -709,6 +709,7 @@ def wipe_service_internal_info(task):
     node.del_driver_internal_info('image_source')
     # Remove agent start attempt tracking since servicing is complete/aborted
     node.del_driver_internal_info('agent_start_attempted')
+    node.del_driver_internal_info('firmware_updated_in_current_service')
     async_steps.remove_node_flags(node)
 
 

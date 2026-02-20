@@ -1,0 +1,12 @@
+---
+features:
+  - |
+    When firmware update and BIOS settings steps are both present in the same
+    service operation, Ironic now refreshes the cached BIOS registry before
+    applying settings. A firmware update may change available BIOS attributes,
+    allowable values, or reset settings to factory defaults, so re-caching
+    ensures settings are applied against up-to-date attribute metadata.
+  - |
+    Adds a ``pre_configuration`` extension point to the Redfish BIOS interface
+    that vendor subclasses can override to perform pre-configuration checks
+    such as verifying no pending configuration jobs exist on the BMC.

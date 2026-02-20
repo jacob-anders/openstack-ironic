@@ -806,6 +806,10 @@ class RedfishFirmware(base.FirmwareInterface):
                          {'node': node.uuid})
                 manager_utils.node_power_action(task, states.REBOOT)
 
+            node.set_driver_internal_info(
+                'firmware_updated_in_current_service', True)
+            node.save()
+
             LOG.debug('Validating BMC responsiveness before resuming '
                       'conductor operations for node %(node)s',
                       {'node': node.uuid})
