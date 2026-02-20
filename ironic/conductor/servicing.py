@@ -125,6 +125,13 @@ def do_next_service_step(task, step_index, disable_ramdisk=None):
     :param disable_ramdisk: Whether to skip booting ramdisk for service.
     """
     node = task.node
+
+    # DEBUG/TEST ONLY: Force immediate servicing failure for abort testing.
+    # Remove this block before production use.
+    raise exception.IronicException(
+        _('INJECTED FAULT: Servicing intentionally failed for testing '
+          'service-abort functionality on node %s') % node.uuid)
+
     # For manual cleaning, the target provision state is MANAGEABLE,
     # whereas for automated cleaning, it is AVAILABLE.
     if step_index is None:
