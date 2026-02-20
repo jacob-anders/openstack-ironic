@@ -1,0 +1,9 @@
+---
+features:
+  - |
+    The Dell iDRAC BIOS interface now checks for unfinished configuration
+    jobs in the iDRAC job queue before applying BIOS settings. Dell iDRAC
+    supports only one outstanding configuration job at a time; attempting
+    to create a second one would fail. This check provides a clear early
+    error message instead of an opaque BMC rejection. If the iDRAC OEM
+    extension is unavailable, the check is skipped gracefully.
