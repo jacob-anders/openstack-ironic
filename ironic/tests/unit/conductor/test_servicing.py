@@ -1318,3 +1318,58 @@ class DoNodeCleanTestChildNodes(db_base.DbTestCase):
         self.assertEqual(0, mock_pv.call_count)
         mock_sps.assert_has_calls([
             mock.call(mock.ANY, mock.ANY, 'power on', timeout=None)])
+
+
+class WarnBiosBeforeFirmwareTestCase(db_base.DbTestCase):
+
+    def setUp(self):
+        super(WarnBiosBeforeFirmwareTestCase, self).setUp()
+        self.node = obj_utils.create_test_node(self.context,
+                                               driver='fake-hardware')
+
+    @mock.patch.object(servicing, 'LOG', autospec=True)
+    def test_warns_when_bios_before_firmware(self, mock_log):
+        steps = [
+            {'interface': 'bios', 'step': 'apply_configuration',
+             'priority': 200},
+            {'interface': 'firmware', 'step': 'update',
+             'priority': 100},
+        ]
+        servicing._warn_bios_before_firmware(self.node, steps)
+        mock_log.warning.assert_called_once()
+        self.assertIn('bios.apply_configuration',
+                      mock_log.warning.call_args[0][0])
+
+    @mock.patch.object(servicing, 'LOG', autospec=True)
+    def test_no_warning_when_firmware_before_bios(self, mock_log):
+        steps = [
+            {'interface': 'firmware', 'step': 'update',
+             'priority': 200},
+            {'interface': 'bios', 'step': 'apply_configuration',
+             'priority': 100},
+        ]
+        servicing._warn_bios_before_firmware(self.node, steps)
+        mock_log.warning.assert_not_called()
+
+    @mock.patch.object(servicing, 'LOG', autospec=True)
+    def test_no_warning_when_only_bios(self, mock_log):
+        steps = [
+            {'interface': 'bios', 'step': 'apply_configuration',
+             'priority': 100},
+        ]
+        servicing._warn_bios_before_firmware(self.node, steps)
+        mock_log.warning.assert_not_called()
+
+    @mock.patch.object(servicing, 'LOG', autospec=True)
+    def test_no_warning_when_only_firmware(self, mock_log):
+        steps = [
+            {'interface': 'firmware', 'step': 'update',
+             'priority': 100},
+        ]
+        servicing._warn_bios_before_firmware(self.node, steps)
+        mock_log.warning.assert_not_called()
+
+    @mock.patch.object(servicing, 'LOG', autospec=True)
+    def test_no_warning_when_no_steps(self, mock_log):
+        servicing._warn_bios_before_firmware(self.node, [])
+        mock_log.warning.assert_not_called()

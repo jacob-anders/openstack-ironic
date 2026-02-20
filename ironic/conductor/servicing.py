@@ -28,6 +28,42 @@ from ironic import objects
 LOG = log.getLogger(__name__)
 
 
+def _warn_bios_before_firmware(node, steps):
+    """Log a warning if BIOS settings are ordered before firmware update.
+
+    A BIOS firmware update may change available attributes or reset settings
+    to factory defaults. Applying BIOS settings before the firmware update
+    risks the settings being silently lost.  We honour the requested ordering
+    (the operator/BMO is responsible) but emit a warning so the situation is
+    visible in the logs.
+
+    :param node: a Node object
+    :param steps: ordered list of service step dicts
+    """
+    fw_index = None
+    bios_index = None
+    for i, step in enumerate(steps):
+        if (step.get('interface') == 'firmware'
+                and step.get('step') == 'update'):
+            if fw_index is None:
+                fw_index = i
+        elif (step.get('interface') == 'bios'
+                and step.get('step') == 'apply_configuration'):
+            if bios_index is None:
+                bios_index = i
+
+    if (fw_index is not None and bios_index is not None
+            and bios_index < fw_index):
+        LOG.warning('Node %(node)s: bios.apply_configuration (step %(bios)d) '
+                    'is ordered before firmware.update (step %(fw)d). BIOS '
+                    'settings applied before a firmware update may be lost if '
+                    'the firmware update resets BIOS to factory defaults or '
+                    'changes available attributes. Consider reordering so '
+                    'firmware updates run first.',
+                    {'node': node.uuid, 'bios': bios_index,
+                     'fw': fw_index})
+
+
 @task_manager.require_exclusive_lock
 def do_node_service(task, service_steps=None, disable_ramdisk=False):
     """Internal RPC method to perform servicing of a node.
@@ -76,6 +112,8 @@ def do_node_service(task, service_steps=None, disable_ramdisk=False):
         return utils.servicing_error_handler(task, msg)
 
     steps = node.driver_internal_info.get('service_steps', [])
+
+    _warn_bios_before_firmware(node, steps)
 
     utils.log_step_flow_history(
         node=node, flow=utils.StepFlow.SERVICING,
