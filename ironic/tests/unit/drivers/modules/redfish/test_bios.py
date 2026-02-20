@@ -250,6 +250,74 @@ class RedfishBiosTestCase(db_base.DbTestCase):
         self.node.save()
         self._test_step_pre_reboot(fast_track=True)
 
+    @mock.patch.object(redfish_boot.RedfishVirtualMediaBoot, 'prepare_ramdisk',
+                       spec_set=True, autospec=True)
+    @mock.patch.object(deploy_utils, 'build_agent_options', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_system', autospec=True)
+    @mock.patch.object(manager_utils, 'node_power_action', autospec=True)
+    def test_apply_conf_step_pre_reboot_servicing(self, mock_power_action,
+                                                  mock_get_system,
+                                                  mock_build_agent_options,
+                                                  mock_prepare):
+        data = [{'name': 'ProcTurboMode', 'value': 'Disabled'},
+                {'name': 'NicBoot1', 'value': 'NetworkBoot'}]
+        self.node.service_step = {'priority': 100, 'interface': 'bios',
+                                  'step': 'apply_configuration',
+                                  'argsinfo': {'settings': data}}
+        self.node.provision_state = states.SERVICING
+        self.node.save()
+        attributes = {s['name']: s['value'] for s in data}
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            bios = mock_get_system(task.node).bios
+            bios.supported_apply_times = []
+            ret = task.driver.bios.apply_configuration(task, data)
+            mock_get_system.assert_called_with(task.node)
+            mock_power_action.assert_called_once_with(
+                task, states.REBOOT, None)
+            bios.set_attributes.assert_called_once_with(
+                attributes, apply_time=None)
+            mock_build_agent_options.assert_not_called()
+            mock_prepare.assert_not_called()
+            self.assertEqual(states.SERVICEWAIT, ret)
+            info = task.node.driver_internal_info
+            self.assertIn('post_bios_reboot_requested', info)
+            self.assertIn('servicing_reboot', info)
+            self.assertIn('skip_current_service_step', info)
+
+    @mock.patch.object(manager_utils, 'servicing_error_handler', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_system', autospec=True)
+    def test_apply_conf_post_reboot_servicing(self,
+                                              mock_get_system,
+                                              mock_servicing_error_handler):
+        data = [{'name': 'ProcTurboMode', 'value': 'Enabled'},
+                {'name': 'NicBoot1', 'value': 'NetworkBoot'}]
+        self.node.service_step = {'priority': 100, 'interface': 'bios',
+                                  'step': 'apply_configuration',
+                                  'argsinfo': {'settings': data}}
+        requested_attrs = {'ProcTurboMode': 'Enabled',
+                           'NicBoot1': 'NetworkBoot'}
+        node = self.node
+        driver_internal_info = node.driver_internal_info
+        driver_internal_info['post_bios_reboot_requested'] = True
+        driver_internal_info['requested_bios_attrs'] = requested_attrs
+        self.node.driver_internal_info = driver_internal_info
+        self.node.save()
+        mock_bios = mock.Mock()
+        mock_bios.attributes = requested_attrs
+        mock_bios.get_attribute_registry = []
+        mock_system = mock.Mock()
+        mock_system.bios = mock_bios
+        mock_get_system.return_value = mock_system
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            task.driver.bios.apply_configuration(task, data)
+            mock_get_system.assert_called_with(task.node)
+            info = task.node.driver_internal_info
+            self.assertNotIn('post_bios_reboot_requested', info)
+            self.assertNotIn('requested_bios_attrs', info)
+        mock_servicing_error_handler.assert_not_called()
+
     @mock.patch.object(redfish_utils, 'get_system', autospec=True)
     def _test_step_post_reboot(self, mock_get_system,
                                attributes_after_reboot=None):

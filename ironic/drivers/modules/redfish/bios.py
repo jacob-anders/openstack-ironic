@@ -18,6 +18,7 @@ import sushy
 from ironic.common import exception
 from ironic.common.i18n import _
 from ironic.common import metrics_utils
+from ironic.common import states
 from ironic.drivers import base
 from ironic.drivers.modules import deploy_utils
 from ironic.drivers.modules.redfish import utils as redfish_utils
@@ -186,7 +187,8 @@ class RedfishBIOS(base.BIOSInterface):
                       {'node_uuid': node.uuid, 'attrs': current_attrs})
             self._clear_reboot_requested(task)
 
-    @base.service_step(priority=0, argsinfo=_APPLY_CONFIGURATION_ARGSINFO)
+    @base.service_step(priority=0, argsinfo=_APPLY_CONFIGURATION_ARGSINFO,
+                       requires_ramdisk=False)
     @base.clean_step(priority=0, argsinfo=_APPLY_CONFIGURATION_ARGSINFO)
     @base.deploy_step(priority=0, argsinfo=_APPLY_CONFIGURATION_ARGSINFO)
     @base.cache_bios_settings
@@ -252,6 +254,10 @@ class RedfishBIOS(base.BIOSInterface):
             self._clear_reboot_requested(task)
             self._check_bios_attrs(task, current_attrs, requested_attrs)
 
+    def _is_servicing(self, task):
+        return task.node.provision_state in (
+            states.SERVICING, states.SERVICEWAIT)
+
     def post_reset(self, task):
         """Perform post reset action to apply the BIOS factory reset.
 
@@ -262,7 +268,9 @@ class RedfishBIOS(base.BIOSInterface):
 
         :param task: a TaskManager instance containing the node to act on.
         """
-        return deploy_utils.reboot_to_finish_step(task)
+        disable_ramdisk = True if self._is_servicing(task) else None
+        return deploy_utils.reboot_to_finish_step(
+            task, disable_ramdisk=disable_ramdisk)
 
     def post_configuration(self, task, settings):
         """Perform post configuration action to store the BIOS settings.
@@ -275,7 +283,9 @@ class RedfishBIOS(base.BIOSInterface):
         :param task: a TaskManager instance containing the node to act on.
         :param settings: a list of BIOS settings to be updated.
         """
-        return deploy_utils.reboot_to_finish_step(task)
+        disable_ramdisk = True if self._is_servicing(task) else None
+        return deploy_utils.reboot_to_finish_step(
+            task, disable_ramdisk=disable_ramdisk)
 
     def get_properties(self):
         """Return the properties of the interface.

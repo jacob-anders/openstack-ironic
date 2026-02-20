@@ -1,0 +1,7 @@
+---
+fixes:
+  - |
+    When applying BIOS settings via servicing, Ironic no longer boots the IPA
+    ramdisk before rebooting the node. Since BIOS configuration is performed
+    entirely out-of-band via Redfish, the IPA ramdisk is not needed, saving
+    one full reboot cycle.
