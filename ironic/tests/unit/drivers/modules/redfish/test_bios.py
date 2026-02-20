@@ -658,6 +658,133 @@ class RedfishBiosTestCase(db_base.DbTestCase):
                 {s['name']: s['value'] for s in settings},
                 apply_time=None)
 
+    def _setup_bios_mock(self, mock_get_system, attrs=None,
+                         apply_times=None):
+        """Helper to set up a BIOS mock with proper cache_bios_settings compat.
+
+        :returns: (mock_bios, mock_system) tuple
+        """
+        mock_bios = mock.Mock()
+        mock_bios.attributes = attrs or {}
+        mock_bios.supported_apply_times = apply_times or []
+        mock_bios.get_attribute_registry.return_value = None
+        mock_system = mock.Mock()
+        mock_system.bios = mock_bios
+        mock_get_system.return_value = mock_system
+        return mock_bios, mock_system
+
+    @mock.patch.object(objects, 'BIOSSettingList', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_system', autospec=True)
+    @mock.patch.object(manager_utils, 'node_power_action', autospec=True)
+    def test_apply_configuration_immediate_when_enabled(
+            self, mock_power_action, mock_get_system, mock_setting_list):
+        self.config(bios_apply_immediately=True, group='redfish')
+        settings = [{'name': 'ProcTurboMode', 'value': 'Disabled'}]
+        self.node.service_step = {'priority': 100, 'interface': 'bios',
+                                  'step': 'apply_configuration',
+                                  'argsinfo': {'settings': settings}}
+        self.node.provision_state = states.SERVICING
+        self.node.save()
+        mock_bios_setting = mock.Mock()
+        mock_bios_setting.name = 'ProcTurboMode'
+        mock_bios_setting.reset_required = False
+        mock_setting_list.get_by_node_id.return_value = [mock_bios_setting]
+        mock_setting_list.sync_node_setting.return_value = ([], [], [], [])
+        mock_bios, _ = self._setup_bios_mock(
+            mock_get_system,
+            attrs={'ProcTurboMode': 'Disabled'},
+            apply_times=[sushy.APPLY_TIME_IMMEDIATE])
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            ret = task.driver.bios.apply_configuration(task, settings)
+            self.assertIsNone(ret)
+            mock_bios.set_attributes.assert_called_once_with(
+                {'ProcTurboMode': 'Disabled'},
+                apply_time=sushy.APPLY_TIME_IMMEDIATE)
+            mock_power_action.assert_not_called()
+
+    @mock.patch.object(objects, 'BIOSSettingList', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_system', autospec=True)
+    @mock.patch.object(manager_utils, 'node_power_action', autospec=True)
+    def test_apply_configuration_immediate_fallback_reset_required(
+            self, mock_power_action, mock_get_system, mock_setting_list):
+        self.config(bios_apply_immediately=True, group='redfish')
+        settings = [{'name': 'ProcTurboMode', 'value': 'Disabled'},
+                    {'name': 'BootDelay', 'value': '10'}]
+        self.node.service_step = {'priority': 100, 'interface': 'bios',
+                                  'step': 'apply_configuration',
+                                  'argsinfo': {'settings': settings}}
+        self.node.provision_state = states.SERVICING
+        self.node.save()
+        setting_turbo = mock.Mock()
+        setting_turbo.name = 'ProcTurboMode'
+        setting_turbo.reset_required = False
+        setting_delay = mock.Mock()
+        setting_delay.name = 'BootDelay'
+        setting_delay.reset_required = True
+        mock_setting_list.get_by_node_id.return_value = [
+            setting_turbo, setting_delay]
+        mock_setting_list.sync_node_setting.return_value = ([], [], [], [])
+        mock_bios, _ = self._setup_bios_mock(
+            mock_get_system,
+            apply_times=[sushy.APPLY_TIME_IMMEDIATE,
+                         sushy.APPLY_TIME_ON_RESET])
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            ret = task.driver.bios.apply_configuration(task, settings)
+            self.assertEqual(states.SERVICEWAIT, ret)
+            mock_bios.set_attributes.assert_called_once_with(
+                {'ProcTurboMode': 'Disabled', 'BootDelay': '10'},
+                apply_time=sushy.APPLY_TIME_ON_RESET)
+
+    @mock.patch.object(objects, 'BIOSSettingList', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_system', autospec=True)
+    @mock.patch.object(manager_utils, 'node_power_action', autospec=True)
+    def test_apply_configuration_immediate_disabled_by_default(
+            self, mock_power_action, mock_get_system, mock_setting_list):
+        settings = [{'name': 'ProcTurboMode', 'value': 'Disabled'}]
+        self.node.service_step = {'priority': 100, 'interface': 'bios',
+                                  'step': 'apply_configuration',
+                                  'argsinfo': {'settings': settings}}
+        self.node.provision_state = states.SERVICING
+        self.node.save()
+        mock_setting_list.sync_node_setting.return_value = ([], [], [], [])
+        mock_bios, _ = self._setup_bios_mock(
+            mock_get_system,
+            apply_times=[sushy.APPLY_TIME_IMMEDIATE,
+                         sushy.APPLY_TIME_ON_RESET])
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            ret = task.driver.bios.apply_configuration(task, settings)
+            self.assertEqual(states.SERVICEWAIT, ret)
+            mock_bios.set_attributes.assert_called_once_with(
+                {'ProcTurboMode': 'Disabled'},
+                apply_time=sushy.APPLY_TIME_ON_RESET)
+
+    @mock.patch.object(objects, 'BIOSSettingList', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_system', autospec=True)
+    @mock.patch.object(manager_utils, 'node_power_action', autospec=True)
+    def test_apply_configuration_immediate_fallback_no_bmc_support(
+            self, mock_power_action, mock_get_system, mock_setting_list):
+        self.config(bios_apply_immediately=True, group='redfish')
+        settings = [{'name': 'ProcTurboMode', 'value': 'Disabled'}]
+        self.node.service_step = {'priority': 100, 'interface': 'bios',
+                                  'step': 'apply_configuration',
+                                  'argsinfo': {'settings': settings}}
+        self.node.provision_state = states.SERVICING
+        self.node.save()
+        mock_setting_list.sync_node_setting.return_value = ([], [], [], [])
+        mock_bios, _ = self._setup_bios_mock(
+            mock_get_system,
+            apply_times=[sushy.APPLY_TIME_ON_RESET])
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            ret = task.driver.bios.apply_configuration(task, settings)
+            self.assertEqual(states.SERVICEWAIT, ret)
+            mock_bios.set_attributes.assert_called_once_with(
+                {'ProcTurboMode': 'Disabled'},
+                apply_time=sushy.APPLY_TIME_ON_RESET)
+
 
 class RedfishBiosRegistryTestCase(db_base.DbTestCase):
 

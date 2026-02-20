@@ -1,0 +1,11 @@
+---
+features:
+  - |
+    Adds a new ``[redfish]bios_apply_immediately`` configuration option
+    (default: False) that, when enabled, allows Ironic to apply BIOS settings
+    without a reboot. This is only attempted when all settings in the batch
+    have ``reset_required=False`` in the BIOS registry and the BMC reports
+    support for ``APPLY_TIME_IMMEDIATE``. When either condition is not met,
+    Ironic falls back to the standard ``APPLY_TIME_ON_RESET`` path with a
+    reboot. Enable this option only after validating that your hardware
+    correctly honours immediate apply.

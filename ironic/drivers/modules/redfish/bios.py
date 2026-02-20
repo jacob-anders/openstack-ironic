@@ -19,6 +19,7 @@ from ironic.common import exception
 from ironic.common.i18n import _
 from ironic.common import metrics_utils
 from ironic.common import states
+from ironic.conf import CONF
 from ironic.drivers import base
 from ironic.drivers.modules import deploy_utils
 from ironic.drivers.modules.redfish import utils as redfish_utils
@@ -255,16 +256,22 @@ class RedfishBIOS(base.BIOSInterface):
             LOG.debug('Apply BIOS configuration for node %(node_uuid)s: '
                       '%(settings)r', {'node_uuid': task.node.uuid,
                                        'settings': settings})
+
+            use_immediate = self._can_apply_immediately(task, bios, settings)
+
             apply_time = None
-            try:
-                if bios.supported_apply_times and (
-                        sushy.APPLY_TIME_ON_RESET in
-                        bios.supported_apply_times):
-                    apply_time = sushy.APPLY_TIME_ON_RESET
-            except AttributeError:
-                LOG.warning('SupportedApplyTimes attribute missing for BIOS'
-                            ' configuration on node %(node_uuid)s: ',
-                            {'node_uuid': task.node.uuid})
+            if use_immediate:
+                apply_time = sushy.APPLY_TIME_IMMEDIATE
+            else:
+                try:
+                    if bios.supported_apply_times and (
+                            sushy.APPLY_TIME_ON_RESET in
+                            bios.supported_apply_times):
+                        apply_time = sushy.APPLY_TIME_ON_RESET
+                except AttributeError:
+                    LOG.warning('SupportedApplyTimes attribute missing for '
+                                'BIOS configuration on node %(node_uuid)s: ',
+                                {'node_uuid': task.node.uuid})
 
             try:
                 bios.set_attributes(attributes, apply_time=apply_time)
@@ -274,6 +281,12 @@ class RedfishBIOS(base.BIOSInterface):
                              {'node': task.node.uuid, 'error': e})
                 LOG.error(error_msg)
                 raise exception.RedfishError(error=error_msg)
+
+            if use_immediate:
+                # Verify settings were applied immediately
+                current_attrs = bios.attributes
+                self._check_bios_attrs(task, current_attrs, attributes)
+                return None
 
             self._set_reboot_requested(task, attributes)
             return self.post_configuration(task, settings)
@@ -286,6 +299,65 @@ class RedfishBIOS(base.BIOSInterface):
                                     'attrs': requested_attrs})
             self._clear_reboot_requested(task)
             self._check_bios_attrs(task, current_attrs, requested_attrs)
+
+    def _can_apply_immediately(self, task, bios, settings):
+        """Check if BIOS settings can be applied without a reboot.
+
+        Requires all three conditions:
+        1. bios_apply_immediately config option is enabled
+        2. BMC supports APPLY_TIME_IMMEDIATE
+        3. All settings in the batch have reset_required=False in the
+           BIOS registry (missing/None is treated as True conservatively)
+
+        :param task: a TaskManager instance
+        :param bios: the Redfish BIOS resource
+        :param settings: list of setting dicts with 'name' and 'value'
+        :returns: True if immediate apply is possible, False otherwise
+        """
+        if not CONF.redfish.bios_apply_immediately:
+            return False
+
+        try:
+            if not (bios.supported_apply_times
+                    and sushy.APPLY_TIME_IMMEDIATE
+                    in bios.supported_apply_times):
+                LOG.debug('BMC for node %(node)s does not support '
+                          'APPLY_TIME_IMMEDIATE.',
+                          {'node': task.node.uuid})
+                return False
+        except AttributeError:
+            return False
+
+        setting_names = [s['name'] for s in settings]
+        try:
+            cached = objects.BIOSSettingList.get_by_node_id(
+                task.context, task.node.id)
+        except Exception:
+            LOG.debug('Cannot query cached BIOS settings for node %(node)s, '
+                      'falling back to reboot path.',
+                      {'node': task.node.uuid})
+            return False
+
+        cached_map = {s.name: s for s in cached}
+        for name in setting_names:
+            cached_setting = cached_map.get(name)
+            if cached_setting is None:
+                LOG.debug('BIOS setting %(setting)s not found in cache for '
+                          'node %(node)s, falling back to reboot path.',
+                          {'setting': name, 'node': task.node.uuid})
+                return False
+            if cached_setting.reset_required is not False:
+                LOG.debug('BIOS setting %(setting)s requires reset for '
+                          'node %(node)s (reset_required=%(val)s).',
+                          {'setting': name, 'node': task.node.uuid,
+                           'val': cached_setting.reset_required})
+                return False
+
+        LOG.info('All %(count)d BIOS settings for node %(node)s have '
+                 'reset_required=False and BMC supports APPLY_TIME_IMMEDIATE.'
+                 ' Applying without reboot.',
+                 {'count': len(setting_names), 'node': task.node.uuid})
+        return True
 
     def _is_servicing(self, task):
         return task.node.provision_state in (

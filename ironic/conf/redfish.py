@@ -153,6 +153,17 @@ opts = [
                       'a safety net for firmware updates that get stuck. '
                       'Set to 0 to disable this timeout (not recommended). '
                       'Default is 7200 seconds (2 hours).')),
+    cfg.BoolOpt('bios_apply_immediately',
+                default=False,
+                mutable=True,
+                help=_('When True, attempt to apply BIOS settings without a '
+                       'reboot by using APPLY_TIME_IMMEDIATE, provided all '
+                       'settings in the batch have reset_required=False in '
+                       'the BIOS registry and the BMC reports support for '
+                       'APPLY_TIME_IMMEDIATE. Enable only after validating '
+                       'that your hardware correctly honours immediate apply. '
+                       'When False (default), settings are always applied '
+                       'with APPLY_TIME_ON_RESET requiring a reboot.')),
     cfg.StrOpt('firmware_source',
                choices=[('http', _('If firmware source URL is also HTTP, then '
                                    'serve from original location, otherwise '
