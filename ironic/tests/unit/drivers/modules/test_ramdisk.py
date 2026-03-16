@@ -20,6 +20,7 @@ from oslo_config import cfg
 from ironic.common import boot_devices
 from ironic.common import dhcp_factory
 from ironic.common import exception
+from ironic.common import image_service
 from ironic.common import pxe_utils
 from ironic.common import states
 from ironic.conductor import task_manager
@@ -60,7 +61,8 @@ class RamdiskDeployTestCase(db_base.DbTestCase):
             self.config(**config_kwarg)
         self.config(enabled_hardware_types=['fake-hardware'])
         instance_info = {'kernel': 'kernelUUID',
-                         'ramdisk': 'ramdiskUUID'}
+                         'ramdisk': 'ramdiskUUID',
+                         'ironic_ramdisk_deploy': 'True'}
         self.node = obj_utils.create_test_node(
             self.context,
             driver='fake-hardware',
@@ -287,6 +289,89 @@ class RamdiskDeployTestCase(db_base.DbTestCase):
             self.assertIs(result, mock_execute_step.return_value)
             mock_execute_step.assert_called_once_with(task, step, 'clean')
 
+    @mock.patch.object(pxe.PXEBoot, 'prepare_instance', autospec=True)
+    @mock.patch.object(image_service, 'get_image_service', autospec=True)
+    def test_prepare_resolves_glance_boot_iso(
+            self, mock_image_service, mock_prepare_instance):
+        """Ramdisk prepare resolves boot_iso from Glance."""
+        mock_show = mock.MagicMock()
+        mock_show.return_value = {
+            'properties': {'boot_iso_id': 'glance-iso-uuid'}
+        }
+        mock_image_service.return_value.show = mock_show
+
+        self.node.provision_state = states.DEPLOYING
+        self.node.instance_info = {
+            'image_source': 'glance://image-uuid',
+        }
+        self.node.save()
+        with task_manager.acquire(self.context, self.node.uuid) as task:
+            task.driver.deploy.prepare(task)
+            self.assertEqual(
+                'glance-iso-uuid',
+                task.node.instance_info['boot_iso'])
+        self.assertFalse(mock_prepare_instance.called)
+
+    @mock.patch.object(pxe.PXEBoot, 'prepare_instance', autospec=True)
+    @mock.patch.object(image_service, 'get_image_service', autospec=True)
+    def test_prepare_resolves_glance_kernel_ramdisk(
+            self, mock_image_service, mock_prepare_instance):
+        """Ramdisk prepare resolves kernel/ramdisk from Glance."""
+        mock_show = mock.MagicMock()
+        mock_show.return_value = {
+            'properties': {
+                'kernel_id': 'glance-kernel-uuid',
+                'ramdisk_id': 'glance-ramdisk-uuid',
+            }
+        }
+        mock_image_service.return_value.show = mock_show
+
+        self.node.provision_state = states.DEPLOYING
+        self.node.instance_info = {
+            'image_source': 'glance://image-uuid',
+        }
+        self.node.save()
+        with task_manager.acquire(self.context, self.node.uuid) as task:
+            task.driver.deploy.prepare(task)
+            self.assertEqual(
+                'glance-kernel-uuid',
+                task.node.instance_info['kernel'])
+            self.assertEqual(
+                'glance-ramdisk-uuid',
+                task.node.instance_info['ramdisk'])
+        self.assertFalse(mock_prepare_instance.called)
+
+    @mock.patch.object(pxe.PXEBoot, 'prepare_instance', autospec=True)
+    @mock.patch.object(image_service, 'get_image_service', autospec=True)
+    def test_prepare_skips_glance_when_kernel_set(
+            self, mock_image_service, mock_prepare_instance):
+        """Ramdisk prepare skips Glance when kernel already set."""
+        self.node.provision_state = states.DEPLOYING
+        self.node.instance_info = {
+            'kernel': 'http://kernel',
+            'ramdisk': 'http://ramdisk',
+        }
+        self.node.save()
+        with task_manager.acquire(self.context, self.node.uuid) as task:
+            task.driver.deploy.prepare(task)
+        mock_image_service.assert_not_called()
+        self.assertFalse(mock_prepare_instance.called)
+
+    @mock.patch.object(pxe.PXEBoot, 'prepare_instance', autospec=True)
+    @mock.patch.object(image_service, 'get_image_service', autospec=True)
+    def test_prepare_skips_glance_when_not_glance_image(
+            self, mock_image_service, mock_prepare_instance):
+        """Ramdisk prepare skips Glance for non-Glance image sources."""
+        self.node.provision_state = states.DEPLOYING
+        self.node.instance_info = {
+            'image_source': 'http://example.com/image',
+        }
+        self.node.save()
+        with task_manager.acquire(self.context, self.node.uuid) as task:
+            task.driver.deploy.prepare(task)
+        mock_image_service.assert_not_called()
+        self.assertFalse(mock_prepare_instance.called)
+
     @mock.patch.object(deploy_utils, 'prepare_inband_cleaning', autospec=True)
     def test_prepare_cleaning(self, prepare_inband_cleaning_mock):
         prepare_inband_cleaning_mock.return_value = states.CLEANWAIT
@@ -303,3 +388,133 @@ class RamdiskDeployTestCase(db_base.DbTestCase):
             task.driver.deploy.tear_down_cleaning(task)
             tear_down_cleaning_mock.assert_called_once_with(
                 task, manage_boot=True)
+
+    def test_supports_deploy_kernel_ramdisk(self):
+        """Returns True when kernel and ramdisk are set."""
+        with task_manager.acquire(self.context, self.node.uuid) as task:
+            self.assertTrue(
+                task.driver.deploy.supports_deploy(task))
+
+    def test_supports_deploy_boot_iso(self):
+        """Returns True when boot_iso is set."""
+        self.node.instance_info = {'boot_iso': 'bootISOUUID',
+                                   'ironic_ramdisk_deploy': True}
+        self.node.save()
+        with task_manager.acquire(self.context, self.node.uuid) as task:
+            self.assertTrue(
+                task.driver.deploy.supports_deploy(task))
+
+    def test_supports_deploy_kernel_ramdisk_with_image_source(self):
+        """Returns True when kernel and ramdisk are set with image."""
+        self.node.instance_info = {
+            'kernel': 'kernelUUID',
+            'ramdisk': 'ramdiskUUID',
+            'image_source': 'glance://image-uuid',
+            'ironic_ramdisk_deploy': True,
+        }
+        self.node.save()
+        with task_manager.acquire(self.context, self.node.uuid) as task:
+            self.assertTrue(
+                task.driver.deploy.supports_deploy(task))
+
+    def test_supports_deploy_empty(self):
+        """Returns False when nothing relevant is set."""
+        self.node.instance_info = {}
+        self.node.save()
+        with task_manager.acquire(self.context, self.node.uuid) as task:
+            self.assertFalse(
+                task.driver.deploy.supports_deploy(task))
+
+    @mock.patch.object(deploy_utils, 'get_image_properties',
+                       autospec=True)
+    def test_supports_deploy_glance_image_source(
+            self, mock_get_props):
+        """Returns True when Glance image has kernel/ramdisk/sentinel."""
+        mock_get_props.return_value = {
+            'kernel_id': 'kernel-uuid',
+            'ramdisk_id': 'ramdisk-uuid',
+            'ironic_ramdisk_deploy': 'True',
+        }
+        self.node.instance_info = {
+            'image_source': 'glance://image-uuid',
+        }
+        self.node.save()
+        with task_manager.acquire(self.context, self.node.uuid) as task:
+            self.assertTrue(
+                task.driver.deploy.supports_deploy(task))
+
+    @mock.patch.object(deploy_utils, 'get_image_properties',
+                       autospec=True)
+    def test_supports_deploy_glance_boot_iso_id(
+            self, mock_get_props):
+        """Returns True when Glance image has boot_iso_id."""
+        mock_get_props.return_value = {
+            'boot_iso_id': 'boot-iso-uuid',
+            'ironic_ramdisk_deploy': True,
+        }
+        self.node.instance_info = {
+            'image_source': 'glance://image-uuid',
+        }
+        self.node.save()
+        with task_manager.acquire(self.context, self.node.uuid) as task:
+            self.assertTrue(
+                task.driver.deploy.supports_deploy(task))
+
+    @mock.patch.object(deploy_utils, 'get_image_properties',
+                       autospec=True)
+    def test_supports_deploy_glance_with_sentinel(
+            self, mock_get_props):
+        """Returns True with kernel/ramdisk and sentinel property."""
+        mock_get_props.return_value = {
+            'kernel_id': 'kernel-uuid',
+            'ramdisk_id': 'ramdisk-uuid',
+            'ironic_ramdisk_deploy': 'True',
+        }
+        self.node.instance_info = {
+            'image_source': 'glance://image-uuid',
+        }
+        self.node.save()
+        with task_manager.acquire(self.context, self.node.uuid) as task:
+            self.assertTrue(
+                task.driver.deploy.supports_deploy(task))
+
+    @mock.patch.object(deploy_utils, 'get_image_properties',
+                       autospec=True)
+    def test_supports_deploy_glance_kernel_ramdisk_no_sentinel(
+            self, mock_get_props):
+        """Returns False with kernel/ramdisk but no sentinel."""
+        mock_get_props.return_value = {
+            'kernel_id': 'kernel-uuid',
+            'ramdisk_id': 'ramdisk-uuid',
+        }
+        self.node.instance_info = {
+            'image_source': 'glance://image-uuid',
+        }
+        self.node.save()
+        with task_manager.acquire(self.context, self.node.uuid) as task:
+            self.assertFalse(
+                task.driver.deploy.supports_deploy(task))
+
+    @mock.patch.object(deploy_utils, 'get_image_properties',
+                       autospec=True)
+    def test_supports_deploy_glance_no_kernel_ramdisk(
+            self, mock_get_props):
+        """Returns False when Glance image lacks kernel/ramdisk."""
+        mock_get_props.return_value = {}
+        self.node.instance_info = {
+            'image_source': 'glance://image-uuid',
+        }
+        self.node.save()
+        with task_manager.acquire(self.context, self.node.uuid) as task:
+            self.assertFalse(
+                task.driver.deploy.supports_deploy(task))
+
+    def test_supports_deploy_http_image_source(self):
+        """Returns False for non-Glance image_source."""
+        self.node.instance_info = {
+            'image_source': 'http://example.com/image',
+        }
+        self.node.save()
+        with task_manager.acquire(self.context, self.node.uuid) as task:
+            self.assertFalse(
+                task.driver.deploy.supports_deploy(task))
