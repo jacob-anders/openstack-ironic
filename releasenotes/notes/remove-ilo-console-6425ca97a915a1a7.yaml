@@ -1,6 +1,8 @@
 ---
 upgrade:
   - |
-    Removes the ilo console interface. ilo console functionality relied on
-    shellinabox which has also been removed. Therefore the ilo driver has
-    removed ilo console support.
+    Removes the ``ilo`` hardware interface ``console`` interface.
+    The driver's console functionality relied on shellinabox which
+    has also been removed. Therefore the ilo driver has removed ilo
+    console support. The ``console_interface`` will need to be unset
+    if explicitly set to on nodes utilizing the ``ilo`` hardware type.

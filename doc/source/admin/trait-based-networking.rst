@@ -9,22 +9,51 @@ Trait Based Networking, or TBN for short, is an Ironic feature that allows an
 Openstack installation utilizing Ironic, Neutron, and Nova to dynamically
 configure port scheduling for Ironic nodes.
 
-Configure
----------
+Enable and Configure
+--------------------
 
 To configure and enable TBN for your Ironic installation please see
 :doc:`/install/configure-trait-based-networking`
-variable_name: /[a-z]+\.[a-z\_]+/
 
-Available Actions
------------------
+Terminology
+-----------
 
-Attach port - Attach one or more ports belonging to a node to a network
-              (aka vif)
-Attach portgroup - Attach one or more portgroups belonging to a node to a
-                   network (aka vif)
+First some terms:
 
-Future actions are coming.
+- Node: An Ironic node.
+- Trait: A set of actions referred to by a name.
+- Action or Trait Action: A defined operation to apply to a node if
+  the action's Filter Expression matches network objects associated
+  with a node.
+- Filter Expression: A boolean expression which filters for specific network
+  objects like a port, portgroup or network.
+- Port: A network interface.
+- Portgroup: A set of ports, grouped together.
+- Dynamic Portgroup: An ephemeral portgroup that is created by a trait's action
+  and is subsequently destroyed once detached.
+- Network (aka VIF): A neutron network.
+
+
+Trait Actions
+-------------
+
+The core of TBN functionality lies in actions that each trait defines. Each
+action allows the operator to define how exactly TBN will setup networking for
+the node.
+
+The following actions are available:
+
+- Attach port: Attach one or more ports belonging to a node to a network
+  (aka vif).
+- Attach portgroup: Attach one or more portgroups belonging to a node to a
+  network (aka vif).
+- Group and attach ports: Create a dynamic portgroup and attach it to a
+  network.
+
+In the future more actions may be added.
+
+See :doc:`/references/trait-based-networking/tbn-config-file` for more
+information on configuring and applying trait actions.
 
 Filter Expression Primer
 ------------------------
@@ -64,7 +93,7 @@ Like so:
 
      port.vendor == "purple" && port.category != "privatenet"
 
-Again in plain English this could be read as: 'filter for ports with vendor
+Again, in plain English this could be read as: 'filter for ports with vendor
 that is exactly equal to the string "purple" and whose category field is not
 "privatenet"'.
 

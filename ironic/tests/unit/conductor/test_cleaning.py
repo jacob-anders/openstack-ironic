@@ -439,8 +439,15 @@ class DoNodeCleanTestCase(db_base.DbTestCase):
         node.refresh()
         self.assertEqual(states.CLEANFAIL, node.provision_state)
         self.assertEqual(tgt_prov_state, node.target_provision_state)
-        mock_steps.assert_called_once_with(mock.ANY, disable_ramdisk=False,
-                                           use_existing_steps=mock.ANY)
+        if clean_steps and invalid_exc:
+            # Early validation catches InvalidParameterValue for manual
+            # cleaning (expecting IPA may provide steps later), then late
+            # validation raises it again.
+            self.assertEqual(2, mock_steps.call_count)
+        else:
+            mock_steps.assert_called_once_with(
+                mock.ANY, disable_ramdisk=False,
+                use_existing_steps=mock.ANY)
         self.assertFalse(node.maintenance)
         self.assertIsNone(node.fault)
 
@@ -553,6 +560,105 @@ class DoNodeCleanTestCase(db_base.DbTestCase):
     def test__do_node_clean_manual_disable_ramdisk(self):
         self.__do_node_clean(clean_steps=[self.deploy_raid],
                              disable_ramdisk=True)
+
+    @mock.patch('ironic.drivers.modules.fake.FakeDeploy.prepare_cleaning',
+                autospec=True)
+    @mock.patch.object(conductor_steps, '_get_cleaning_steps', autospec=True)
+    @mock.patch.object(conductor_steps, 'set_node_cleaning_steps',
+                       autospec=True)
+    @mock.patch.object(cleaning, 'do_next_clean_step', autospec=True)
+    @mock.patch('ironic.drivers.modules.network.flat.FlatNetwork.validate',
+                autospec=True)
+    @mock.patch('ironic.drivers.modules.fake.FakePower.validate',
+                autospec=True)
+    def test__do_node_clean_manual_auto_disable_ramdisk(
+            self, mock_power_valid, mock_network_valid,
+            mock_next_step, mock_steps, mock_get_steps, mock_prepare):
+        bios_step = {
+            'step': 'apply_configuration', 'priority': 0,
+            'interface': 'bios',
+            'args': {'settings': [{'name': 'foo', 'value': 'bar'}]}
+        }
+        driver_bios_step = {
+            'step': 'apply_configuration', 'priority': 0,
+            'interface': 'bios', 'abortable': False,
+            'argsinfo': mock.ANY,
+            'requires_ramdisk': False,
+        }
+
+        def enrich_steps(task, disable_ramdisk=None,
+                         use_existing_steps=None):
+            dii = task.node.driver_internal_info
+            dii['clean_steps'] = [
+                dict(bios_step, abortable=False)
+            ]
+            task.node.driver_internal_info = dii
+            task.node.save()
+
+        mock_steps.side_effect = enrich_steps
+        mock_get_steps.return_value = [driver_bios_step]
+
+        node = obj_utils.create_test_node(
+            self.context, driver='fake-hardware',
+            provision_state=states.CLEANING,
+            target_provision_state=states.MANAGEABLE,
+            last_error=None,
+            power_state=states.POWER_OFF)
+
+        with task_manager.acquire(
+                self.context, node.uuid, shared=False) as task:
+            cleaning.do_node_clean(task, clean_steps=[bios_step])
+
+            node.refresh()
+
+            mock_power_valid.assert_called_once_with(mock.ANY, task)
+            mock_network_valid.assert_called_once_with(mock.ANY, task)
+            mock_steps.assert_called_once_with(
+                task, disable_ramdisk=False, use_existing_steps=True)
+            mock_get_steps.assert_called_once_with(
+                task, enabled=False, sort=False)
+            mock_next_step.assert_called_once_with(
+                task, 0, disable_ramdisk=True)
+            mock_prepare.assert_not_called()
+            self.assertTrue(
+                node.driver_internal_info['cleaning_disable_ramdisk'])
+
+    @mock.patch('ironic.drivers.modules.fake.FakeDeploy.prepare_cleaning',
+                autospec=True)
+    @mock.patch.object(conductor_steps, 'set_node_cleaning_steps',
+                       autospec=True)
+    @mock.patch.object(cleaning, 'do_next_clean_step', autospec=True)
+    @mock.patch('ironic.drivers.modules.network.flat.FlatNetwork.validate',
+                autospec=True)
+    @mock.patch('ironic.drivers.modules.fake.FakePower.validate',
+                autospec=True)
+    def test__do_node_clean_manual_early_validation_fails(
+            self, mock_power_valid, mock_network_valid,
+            mock_next_step, mock_steps, mock_prepare):
+        """When early validation fails, IPA boots and late validation runs."""
+        mock_steps.side_effect = [
+            exception.InvalidParameterValue('unknown step'),
+            None,
+        ]
+        mock_prepare.return_value = None
+
+        node = obj_utils.create_test_node(
+            self.context, driver='fake-hardware',
+            provision_state=states.CLEANING,
+            target_provision_state=states.MANAGEABLE,
+            last_error=None,
+            power_state=states.POWER_OFF)
+
+        with task_manager.acquire(
+                self.context, node.uuid, shared=False) as task:
+            cleaning.do_node_clean(task, clean_steps=[self.deploy_raid])
+
+            node.refresh()
+
+            self.assertEqual(2, mock_steps.call_count)
+            mock_prepare.assert_called_once_with(mock.ANY, task)
+            mock_next_step.assert_called_once_with(
+                task, 0, disable_ramdisk=False)
 
     @mock.patch('ironic.drivers.modules.fake.FakeDeploy.execute_clean_step',
                 autospec=True)

@@ -140,7 +140,7 @@ driver_opts = [
     cfg.StrOpt('default_deploy_interface',
                help=_DEFAULT_IFACE_HELP.format('deploy')),
     cfg.ListOpt('autodetect_deploy_interfaces',
-                default=['bootc', 'direct'],
+                default=['ramdisk', 'bootc', 'direct'],
                 help=_('List of deploy interfaces that the '
                        'autodetect deploy interface is allowed to '
                        'switch to. The order of interfaces in the list '
@@ -148,10 +148,10 @@ driver_opts = [
                        'with the first interface having the highest '
                        'priority. The last interface in the list will be '
                        'chosen if no interfaces are detected as supported. '
-                       '"bootc" has detection support and '
-                       '"direct" is an appropriate fallback for most cases. '
-                       'All interfaces listed here must also be in '
-                       '"enabled_deploy_interfaces".')),
+                       '"ramdisk" and "bootc" have detection support '
+                       'and "direct" is an appropriate fallback for '
+                       'most cases. All interfaces listed here must '
+                       'also be in "enabled_deploy_interfaces".')),
     cfg.ListOpt('enabled_firmware_interfaces',
                 default=['no-firmware'],
                 help=_ENABLED_IFACE_HELP.format('firmware')),

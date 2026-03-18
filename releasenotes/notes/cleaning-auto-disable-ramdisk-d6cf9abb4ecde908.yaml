@@ -1,0 +1,20 @@
+---
+features:
+  - |
+    Cleaning flows that use explicit steps, such as manual cleaning or
+    automated cleaning via runbook will now auto-detect whether the
+    ramdisk (IPA) is needed by inspecting the ``requires_ramdisk``
+    attribute of each requested step. When every step declares
+    ``requires_ramdisk=False`` (e.g. Redfish BIOS
+    ``apply_configuration`` and ``factory_reset``), IPA boot is skipped
+    automatically without requiring the caller to pass ``disable_ramdisk``.
+    This mirrors the existing behaviour in the servicing flow.
+  - |
+    The Redfish BIOS ``factory_reset`` step is now registered as a service
+    step (``@service_step``) with ``requires_ramdisk=False``, matching the
+    existing ``apply_configuration`` step.
+upgrade:
+  - |
+    The helper code in ``conductor/steps.py`` now copies
+    ``requires_ramdisk`` from the driver step to the validated user step.
+    Out-of-tree code that inspects validated step dicts may see the new key.

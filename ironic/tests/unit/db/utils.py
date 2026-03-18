@@ -162,8 +162,8 @@ def get_test_snmp_info(**kw):
 def get_test_node(**kw):
     properties = {
         "cpu_arch": "x86_64",
-        "local_gb": "10",
-        "memory_mb": "4096",
+        "local_gb": 10,
+        "memory_mb": '4096',
     }
     # NOTE(tenbrae): API unit tests confirm that sensitive fields in
     #                instance_info and driver_info will get scrubbed

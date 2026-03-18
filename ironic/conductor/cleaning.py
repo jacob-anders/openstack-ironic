@@ -33,6 +33,47 @@ def get_cleaning_flow(manual_clean=False):
             else utils.StepFlow.CLEANING_AUTO)
 
 
+def _validate_clean_steps_early(task, disable_ramdisk):
+    """Try to validate manual clean steps before booting IPA.
+
+    For out-of-band steps (e.g. Redfish BIOS) this succeeds without IPA
+    and lets us auto-detect whether the ramdisk is actually needed.
+    For in-band steps the driver may not yet know about them, so
+    validation can fail — in that case the caller should fall through to
+    boot IPA normally (the heartbeat handler re-validates after IPA is up).
+
+    :param task: a TaskManager instance with an exclusive lock on its node
+    :param disable_ramdisk: current disable_ramdisk value
+    :returns: tuple (steps_validated, disable_ramdisk) — the possibly
+              updated disable_ramdisk flag.
+    :raises: Exception on non-recoverable step validation errors
+             (anything other than InvalidParameterValue).
+    """
+    node = task.node
+    try:
+        conductor_steps.set_node_cleaning_steps(
+            task, disable_ramdisk=disable_ramdisk,
+            use_existing_steps=True,
+        )
+    except exception.InvalidParameterValue:
+        LOG.debug('Unable to compose list of clean steps for node '
+                  '%(node)s, will retry once ramdisk is booted.',
+                  {'node': node.uuid})
+        return False, disable_ramdisk
+
+    steps = node.driver_internal_info.get('clean_steps', [])
+    if steps and conductor_steps.all_steps_disable_ramdisk(task, steps):
+        LOG.info('All clean steps for node %(node)s can run '
+                 'without the ramdisk, skipping IPA boot.',
+                 {'node': node.uuid})
+        disable_ramdisk = True
+        node.set_driver_internal_info(
+            'cleaning_disable_ramdisk', True)
+        node.save()
+
+    return True, disable_ramdisk
+
+
 @task_manager.require_exclusive_lock
 def do_node_clean(task, clean_steps=None, disable_ramdisk=False,
                   automated_with_steps=False):
@@ -99,6 +140,20 @@ def do_node_clean(task, clean_steps=None, disable_ramdisk=False,
 
     utils.node_update_cache(task)
 
+    # For manual cleaning, validate steps before booting IPA so we can
+    # auto-detect whether the ramdisk is needed.  Automated cleaning
+    # needs IPA to discover all available steps, so it skips this.
+    steps_validated = False
+    if clean_steps and not disable_ramdisk:
+        try:
+            steps_validated, disable_ramdisk = (
+                _validate_clean_steps_early(task, disable_ramdisk)
+            )
+        except Exception as e:
+            msg = (_('Cannot clean node %(node)s: %(msg)s')
+                   % {'node': node.uuid, 'msg': e})
+            return utils.cleaning_error_handler(task, msg)
+
     # Allow the deploy driver to set up the ramdisk again (necessary for
     # IPA cleaning)
     try:
@@ -132,17 +187,19 @@ def do_node_clean(task, clean_steps=None, disable_ramdisk=False,
         task.process_event('wait', target_state=target_state)
         return
 
-    try:
-        conductor_steps.set_node_cleaning_steps(
-            task, disable_ramdisk=disable_ramdisk,
-            use_existing_steps=bool(clean_steps)
-        )
-    except Exception as e:
-        # Catch all exceptions and follow the error handling
-        # path so things are cleaned up properly.
-        msg = (_('Cannot clean node %(node)s: %(msg)s')
-               % {'node': node.uuid, 'msg': e})
-        return utils.cleaning_error_handler(task, msg)
+    # For automated cleaning and for manual cleaning where early
+    # validation was not possible (in-band steps need IPA), validate
+    # steps now that IPA is available (fast-track or already running).
+    if not steps_validated:
+        try:
+            conductor_steps.set_node_cleaning_steps(
+                task, disable_ramdisk=disable_ramdisk,
+                use_existing_steps=bool(clean_steps)
+            )
+        except Exception as e:
+            msg = (_('Cannot clean node %(node)s: %(msg)s')
+                   % {'node': node.uuid, 'msg': e})
+            return utils.cleaning_error_handler(task, msg)
 
     steps = node.driver_internal_info.get('clean_steps', [])
 

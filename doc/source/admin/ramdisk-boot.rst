@@ -196,7 +196,7 @@ ISO stored in Glance via the ``boot_iso_id`` property:
    .. code-block:: shell
 
       openstack image create my-ramdisk-boot-iso --public \
-        --disk-format raw --container-format bare \
+        --disk-format iso --container-format bare \
         --file my-ramdisk.iso
 
    Store the image UUID as ``MY_BOOT_ISO_UUID``.

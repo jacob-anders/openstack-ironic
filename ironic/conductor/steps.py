@@ -228,6 +228,31 @@ def _get_cleaning_steps(task, enabled=False, sort=True):
     return cleaning_steps
 
 
+def all_steps_disable_ramdisk(task, user_steps):
+    """Check whether every user-requested clean step can run without ramdisk.
+
+    :param task: A TaskManager object
+    :param user_steps: list of user-specified clean step dicts, each with
+        at least 'interface' and 'step' keys.
+    :returns: True if all steps declare requires_ramdisk=False, else False.
+    """
+    driver_steps = {step_id(s): s for s in
+                    _get_cleaning_steps(task, enabled=False, sort=False)}
+    for user_step in user_steps:
+        if user_step.get('execute_on_child_nodes'):
+            continue
+        if user_step.get('step') in ['power_on', 'power_off', 'reboot',
+                                     'hold', 'wait']:
+            continue
+        sid = step_id(user_step)
+        driver_step = driver_steps.get(sid)
+        if driver_step is None:
+            return False
+        if driver_step.get('requires_ramdisk', True):
+            return False
+    return True
+
+
 def _get_deployment_steps(task, enabled=False, sort=True):
     """Get deployment steps for task.node.
 

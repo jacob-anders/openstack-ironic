@@ -641,7 +641,7 @@ class TestNeutronNetworkActions(db_base.DbTestCase):
         self.assertEqual('255.255.255.0', netmask)
 
     def test__uncidr_ipv6(self):
-        network, netmask = neutron._uncidr('::1/64', ipv6=True)
+        network, netmask = neutron._uncidr('::1/64')
         self.assertEqual('::', network)
         self.assertEqual('ffff:ffff:ffff:ffff::', netmask)
 

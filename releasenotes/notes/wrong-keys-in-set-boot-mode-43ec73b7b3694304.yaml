@@ -1,0 +1,7 @@
+---
+fixes:
+  - |
+    Fixes a case where lookups for boot mode for vendors requiring
+    full boot requests always returned ``None`` due to invalid keys,
+    causing the fallback defaults (``ONCE`` and ``PXE``) to be sent to the BMC
+    regardless of actual state whenever a boot mode change was requested.

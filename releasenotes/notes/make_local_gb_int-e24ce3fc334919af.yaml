@@ -1,0 +1,5 @@
+---
+other:
+  - |
+    For consistency with the `memory_mb` property, the `local_gb` property
+    is now set as an integer.

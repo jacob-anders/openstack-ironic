@@ -19,7 +19,7 @@ Below is a valid YAML example trait:
     CUSTOM_TRAIT_NAME:
       order: 1
       actions:
-        - action: bond_ports
+        - action: group_and_attach_ports
           filter: port.vendor == 'vendor_string'
           min_count: 2
         - action: attach_port
@@ -59,6 +59,11 @@ The following actions are currently available:
   filter expression.
 * ``attach_portgroup`` - Attach (portgroup, network) pairs that pass this
   action's filter expression.
+* ``group_and_attach_ports`` - Select a set of ports. Create a dynamic
+  portgroup comprised of the set of ports. Then attach the newly created
+  dynamic portgroup to a suitable network. This action must set a
+  ``min_count`` of at least 2. Also note that all ports selected for the
+  portgroup must have the same ``physical_network``.
 
 Future actions are planned. This document will be updated as they become
 available.

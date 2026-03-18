@@ -520,11 +520,10 @@ def remove_neutron_ports(task, params):
              {'node_uuid': node_uuid})
 
 
-def _uncidr(cidr, ipv6=False):
+def _uncidr(cidr):
     """Convert CIDR network representation into network/netmask form
 
     :param cidr: network in CIDR form
-    :param ipv6: if `True`, consider `cidr` being IPv6
     :returns: a tuple of network/host number in dotted
         decimal notation, netmask in dotted decimal notation
 
@@ -658,8 +657,7 @@ def get_neutron_port_data(port_id, vif_id, client=None, context=None,
 
         subnet_config = subnets_config[subnet_id]
 
-        subnet_network, netmask = _uncidr(
-            subnet_config.cidr, subnet_config.ip_version == 6)
+        subnet_network, netmask = _uncidr(subnet_config.cidr)
 
         network = {
             'id': fixed_ip['subnet_id'],
@@ -690,8 +688,7 @@ def get_neutron_port_data(port_id, vif_id, client=None, context=None,
 
         for host_config in subnet_config['host_routes']:
             subnet_network, netmask = _uncidr(
-                host_config['destination'],
-                subnet_config['ip_version'] == 6)
+                host_config['destination'])
 
             route = {
                 'network': subnet_network,

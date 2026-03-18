@@ -8,8 +8,8 @@ upgrade:
     secure hash algorithms instead of MD5-only validation.
 security:
   - |
-    Image downloads now support secure hash validation direct from the sdk
-    library using SHA256, SHA512, and other secure hash algorithms via the
+    Glance Image downloads now support secure hash validation direct from the
+    sdk library using SHA256, SHA512, and other secure hash algorithms via the
     ``os_hash_algo`` and ``os_hash_value`` metadata fields, instead of
     Ironic having to perform these checks outside of sdk code.
     [Bug `2130662 <https://bugs.launchpad.net/openstacksdk/+bug/2130662>`_]

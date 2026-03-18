@@ -1,0 +1,9 @@
+---
+features:
+  - |
+    The Redfish BIOS interface now includes an idempotency check in
+    ``apply_configuration``. When all requested settings already match the
+    current BMC attributes and no conflicting pending changes exist, the
+    step returns immediately without issuing a PATCH or reboot. This
+    avoids unnecessary reboot cycles when a declarative caller (e.g. Bare
+    Metal Operator) re-sends the same BIOS settings request.

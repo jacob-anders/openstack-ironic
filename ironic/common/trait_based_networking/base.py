@@ -565,7 +565,7 @@ class NoMatch(RenderedAction):
     def __str__(self):
         return _(f"No match found for action under trait "
                  f"'{self.trait_action.trait_name}' "
-                 f"on node '{self.node_uuid}': {self._reason}")
+                 f"on node '{self.node_uuid}': {self.reason}")
 
 
 @dataclass(frozen=True)

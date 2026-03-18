@@ -1,0 +1,6 @@
+---
+fixes:
+  - |
+    Fixes misleading debug log and removed unused variables and a no-op bare
+    expression in ``_set_boot_device`` so the log now reflects the values
+    actually sent to the BMC.
