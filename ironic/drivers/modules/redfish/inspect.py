@@ -121,13 +121,13 @@ class RedfishInspect(base.InspectInterface):
         local_gb = self._detect_local_gb(task, system)
 
         if local_gb:
-            inspected_properties['local_gb'] = str(local_gb)
+            inspected_properties['local_gb'] = local_gb
 
         else:
             LOG.warning("Could not provide a valid storage size configured "
                         "for node %(node)s. Assuming this is a disk-less node",
                         {'node': task.node.uuid})
-            inspected_properties['local_gb'] = '0'
+            inspected_properties['local_gb'] = 0
 
         if storages := system.storage or system.simple_storage:
             disks = list()

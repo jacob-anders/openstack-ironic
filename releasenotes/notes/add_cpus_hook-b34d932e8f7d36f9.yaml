@@ -2,7 +2,7 @@
 features:
   - |
     Implements `cpus` inspection hook which used to be part of the standard
-    hooks in the ironic-inpsector.
+    hooks in the ironic-inspector.
 fixes:
   - |
     Updates slightly incorrect docs for Migration from Inspector.

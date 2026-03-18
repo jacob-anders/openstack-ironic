@@ -550,7 +550,7 @@ class TestNodeObject(db_base.DbTestCase, obj_utils.SchemasTestMixIn):
             values = self.fake_node
             expect = {
                 'cpu_arch': 'x86_64',
-                "local_gb": '10',
+                "local_gb": 10,
                 "memory_mb": '4096',
             }
             node._validate_property_values(values['properties'])

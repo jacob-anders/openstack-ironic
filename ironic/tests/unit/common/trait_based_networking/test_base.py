@@ -405,3 +405,21 @@ class TraitBasedNetworkingBaseTestCase(base.TestCase):
                          "greater or equal to it's min_count. min_count "
                          f"is '{gaps.min_count}' while max_count is "
                          f"'{gaps.max_count}'.")
+
+    def test_actions_to_str(self):
+        trait_action = tbn.TraitAction(
+            "CUSTOM_TRAIT",
+            tbn.Actions.GROUP_AND_ATTACH_PORTS,
+            tbn.FilterExpression.parse("port.vendor == 'cogwork'"),
+            0, 2)
+        actions = [
+            tbn.AttachPort(trait_action, "fake_node_uuid", "fake_port_uuid",
+                           "fake_net_id"),
+            tbn.AttachPortgroup(trait_action, "fake_node_uuid",
+                                "fake_port_uuid", "fake_net_id"),
+            tbn.GroupAndAttachPorts(trait_action, "fake_node_uuid",
+                                    ['port1', 'port2'], "fake_net_id"),
+            tbn.NoMatch(trait_action, "fake_node_uuid", "no match!")
+        ]
+        for action in actions:
+            self.assertIsNotNone(str(action))

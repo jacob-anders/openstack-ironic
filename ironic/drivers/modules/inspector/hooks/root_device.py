@@ -105,5 +105,5 @@ class RootDeviceHook(base.InspectionHook):
                      'diskless.', task.node.uuid)
 
         plugin_data['local_gb'] = local_gb
-        task.node.set_property('local_gb', str(local_gb))
+        task.node.set_property('local_gb', local_gb)
         task.node.save()

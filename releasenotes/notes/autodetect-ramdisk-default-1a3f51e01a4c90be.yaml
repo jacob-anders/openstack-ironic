@@ -1,0 +1,10 @@
+---
+upgrade:
+  - |
+    The ``ramdisk`` deploy interface is now included in the default
+    value of ``autodetect_deploy_interfaces``. The new default is
+    ``['ramdisk', 'bootc', 'direct']``. Operators who have not
+    explicitly set ``autodetect_deploy_interfaces`` will now have
+    ramdisk deploy auto-selected when using an ``image_source``
+    from glance with properly configured metadata.
+

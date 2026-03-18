@@ -64,7 +64,7 @@ class IloInspectTestCase(test_common.BaseIloTest):
                                   create_port_mock,
                                   get_capabilities_mock):
         ilo_object_mock = get_ilo_object_mock.return_value
-        properties = {'memory_mb': '512', 'local_gb': '10',
+        properties = {'memory_mb': '512', 'local_gb': 10,
                       'cpu_arch': 'x86_64'}
         macs = {'Port 1': 'aa:aa:aa:aa:aa:aa', 'Port 2': 'bb:bb:bb:bb:bb:bb'}
         capabilities = {}
@@ -239,7 +239,7 @@ class IloInspectTestCase(test_common.BaseIloTest):
                                             create_port_mock,
                                             get_capabilities_mock):
         ilo_object_mock = get_ilo_object_mock.return_value
-        properties = {'memory_mb': '512', 'local_gb': '10',
+        properties = {'memory_mb': '512', 'local_gb': 10,
                       'cpu_arch': 'x86_64'}
         macs = {'Port 1': 'aa:aa:aa:aa:aa:aa', 'Port 2': 'bb:bb:bb:bb:bb:bb'}
         capabilities = {}
@@ -276,7 +276,7 @@ class IloInspectTestCase(test_common.BaseIloTest):
                                                create_port_mock,
                                                get_capabilities_mock):
         ilo_object_mock = get_ilo_object_mock.return_value
-        properties = {'memory_mb': '512', 'local_gb': '10',
+        properties = {'memory_mb': '512', 'local_gb': 10,
                       'cpu_arch': 'x86_64'}
         macs = {'Port 1': 'aa:aa:aa:aa:aa:aa', 'Port 2': 'bb:bb:bb:bb:bb:bb'}
         capability_str = 'sriov_enabled:true'
@@ -288,7 +288,7 @@ class IloInspectTestCase(test_common.BaseIloTest):
         with task_manager.acquire(self.context, self.node.uuid,
                                   shared=False) as task:
             task.driver.inspect.inspect_hardware(task)
-            expected_properties = {'memory_mb': '512', 'local_gb': '10',
+            expected_properties = {'memory_mb': '512', 'local_gb': 10,
                                    'cpu_arch': 'x86_64',
                                    'capabilities': capability_str}
             self.assertEqual(expected_properties, task.node.properties)
@@ -316,7 +316,7 @@ class IloInspectTestCase(test_common.BaseIloTest):
                                                      create_port_mock,
                                                      get_capabilities_mock):
         ilo_object_mock = get_ilo_object_mock.return_value
-        properties = {'memory_mb': '512', 'local_gb': '10',
+        properties = {'memory_mb': '512', 'local_gb': 10,
                       'cpu_arch': 'x86_64', 'somekey': 'somevalue'}
         macs = {'Port 1': 'aa:aa:aa:aa:aa:aa', 'Port 2': 'bb:bb:bb:bb:bb:bb'}
         result = {'properties': properties, 'macs': macs}
@@ -334,7 +334,7 @@ class IloInspectTestCase(test_common.BaseIloTest):
             end_capabilities = task.node.properties['capabilities']
             set2 = set(end_capabilities.split(','))
             self.assertEqual(set1, set2)
-            expected_properties = {'memory_mb': '512', 'local_gb': '10',
+            expected_properties = {'memory_mb': '512', 'local_gb': 10,
                                    'cpu_arch': 'x86_64',
                                    'capabilities': end_capabilities}
             power_mock.assert_called_once_with(mock.ANY, task)
@@ -351,7 +351,7 @@ class TestInspectPrivateMethods(test_common.BaseIloTest):
 
     def test__get_essential_properties_ok(self):
         ilo_mock = mock.MagicMock(spec=['get_essential_properties'])
-        properties = {'memory_mb': '512', 'local_gb': '10',
+        properties = {'memory_mb': '512', 'local_gb': 10,
                       'cpu_arch': 'x86_64'}
         macs = {'Port 1': 'aa:aa:aa:aa:aa:aa', 'Port 2': 'bb:bb:bb:bb:bb:bb'}
         result = {'properties': properties, 'macs': macs}
@@ -364,7 +364,7 @@ class TestInspectPrivateMethods(test_common.BaseIloTest):
         ilo_mock = mock.MagicMock(
             spec=['get_additional_capabilities', 'get_essential_properties'])
         # Missing key: cpu_arch
-        properties = {'memory_mb': '512', 'local_gb': '10'}
+        properties = {'memory_mb': '512', 'local_gb': 10}
         macs = {'Port 1': 'aa:aa:aa:aa:aa:aa', 'Port 2': 'bb:bb:bb:bb:bb:bb'}
         result = {'properties': properties, 'macs': macs}
         ilo_mock.get_essential_properties.return_value = result
@@ -381,7 +381,7 @@ class TestInspectPrivateMethods(test_common.BaseIloTest):
         ilo_mock = mock.MagicMock(
             spec=['get_additional_capabilities', 'get_essential_properties'])
         # Not a dict
-        properties = ['memory_mb', '512', 'local_gb', '10']
+        properties = ['memory_mb', '512', 'local_gb', 10]
         macs = ['aa:aa:aa:aa:aa:aa', 'bb:bb:bb:bb:bb:bb']
         capabilities = ''
         result = {'properties': properties, 'macs': macs}
@@ -393,7 +393,7 @@ class TestInspectPrivateMethods(test_common.BaseIloTest):
 
     def test__get_essential_properties_fail_mac_invalid_format(self):
         ilo_mock = mock.MagicMock(spec=['get_essential_properties'])
-        properties = {'memory_mb': '512', 'local_gb': '10',
+        properties = {'memory_mb': '512', 'local_gb': 10,
                       'cpu_arch': 'x86_64'}
         # Not a dict
         macs = 'aa:aa:aa:aa:aa:aa'
@@ -406,7 +406,7 @@ class TestInspectPrivateMethods(test_common.BaseIloTest):
     def test__get_essential_properties_hardware_port_empty(self):
         ilo_mock = mock.MagicMock(
             spec=['get_additional_capabilities', 'get_essential_properties'])
-        properties = {'memory_mb': '512', 'local_gb': '10',
+        properties = {'memory_mb': '512', 'local_gb': 10,
                       'cpu_arch': 'x86_64'}
         # Not a dictionary
         macs = None
@@ -420,7 +420,7 @@ class TestInspectPrivateMethods(test_common.BaseIloTest):
 
     def test__get_essential_properties_hardware_port_not_dict(self):
         ilo_mock = mock.MagicMock(spec=['get_essential_properties'])
-        properties = {'memory_mb': '512', 'local_gb': '10',
+        properties = {'memory_mb': '512', 'local_gb': 10,
                       'cpu_arch': 'x86_64'}
         # Not a dict
         macs = 'aa:bb:cc:dd:ee:ff'
@@ -440,7 +440,7 @@ class TestInspectPrivateMethods(test_common.BaseIloTest):
         self.assertEqual(cap, capabilities)
 
     def test__validate_ok(self):
-        properties = {'memory_mb': '512', 'local_gb': '10',
+        properties = {'memory_mb': '512', 'local_gb': 10,
                       'cpu_arch': 'x86_arch'}
         macs = {'Port 1': 'aa:aa:aa:aa:aa:aa'}
         data = {'properties': properties, 'macs': macs}
@@ -449,7 +449,7 @@ class TestInspectPrivateMethods(test_common.BaseIloTest):
         self.assertEqual(sorted(set(properties)), sorted(valid_keys))
 
     def test__validate_essential_keys_fail_missing_key(self):
-        properties = {'memory_mb': '512', 'local_gb': '10'}
+        properties = {'memory_mb': '512', 'local_gb': 10}
         macs = {'Port 1': 'aa:aa:aa:aa:aa:aa'}
         data = {'properties': properties, 'macs': macs}
         self.assertRaises(exception.HardwareInspectionFailure,

@@ -46,7 +46,7 @@ class RootDeviceTestCase(db_base.DbTestCase):
                                                        self.plugin_data)
             self.assertNotIn('root_disk', self.plugin_data)
             self.assertEqual(self.plugin_data['local_gb'], 0)
-            self.assertEqual(task.node.properties.get('local_gb'), '0')
+            self.assertEqual(task.node.properties.get('local_gb'), 0)
 
     def test_root_device_skip_list(self):
         with task_manager.acquire(self.context, self.node.id) as task:
@@ -61,7 +61,7 @@ class RootDeviceTestCase(db_base.DbTestCase):
             self.assertNotIn('root_disk', self.plugin_data)
             self.assertNotIn('local_gb', self.plugin_data)
             # The default value of the `local_gb` property is left unchanged
-            self.assertEqual(task.node.properties.get('local_gb'), '10')
+            self.assertEqual(task.node.properties.get('local_gb'), 10)
 
     def test_first_match_on_skip_list_use_second(self):
         with task_manager.acquire(self.context, self.node.id) as task:
@@ -80,7 +80,7 @@ class RootDeviceTestCase(db_base.DbTestCase):
             self.assertEqual(self.plugin_data['local_gb'],
                              expected_local_gb)
             self.assertEqual(task.node.properties.get('local_gb'),
-                             str(expected_local_gb))
+                             expected_local_gb)
 
     def test_one_matches(self):
         with task_manager.acquire(self.context, self.node.id) as task:
@@ -94,7 +94,7 @@ class RootDeviceTestCase(db_base.DbTestCase):
             self.assertEqual(self.plugin_data['root_disk'],
                              self.inventory['disks'][0])
             self.assertEqual(self.plugin_data['local_gb'], 999)
-            self.assertEqual(task.node.properties.get('local_gb'), '999')
+            self.assertEqual(task.node.properties.get('local_gb'), 999)
 
     def test_local_gb_without_spacing(self):
         CONF.set_override('disk_partitioning_spacing', False, 'inspector')
@@ -108,7 +108,7 @@ class RootDeviceTestCase(db_base.DbTestCase):
             self.assertEqual(self.plugin_data['root_disk'],
                              self.inventory['disks'][0])
             self.assertEqual(self.plugin_data['local_gb'], 1000)
-            self.assertEqual(task.node.properties.get('local_gb'), '1000')
+            self.assertEqual(task.node.properties.get('local_gb'), 1000)
 
     def test_zero_size(self):
         with task_manager.acquire(self.context, self.node.id) as task:
@@ -120,7 +120,7 @@ class RootDeviceTestCase(db_base.DbTestCase):
             self.assertEqual(self.plugin_data['root_disk'],
                              self.inventory['disks'][3])
             self.assertEqual(self.plugin_data['local_gb'], 0)
-            self.assertEqual(task.node.properties.get('local_gb'), '0')
+            self.assertEqual(task.node.properties.get('local_gb'), 0)
 
     def test_all_match(self):
         with task_manager.acquire(self.context, self.node.id) as task:
@@ -133,7 +133,7 @@ class RootDeviceTestCase(db_base.DbTestCase):
             self.assertEqual(self.plugin_data['root_disk'],
                              self.inventory['disks'][2])
             self.assertEqual(self.plugin_data['local_gb'], 19)
-            self.assertEqual(task.node.properties.get('local_gb'), '19')
+            self.assertEqual(task.node.properties.get('local_gb'), 19)
 
     def test_incorrect_hint(self):
         with task_manager.acquire(self.context, self.node.id) as task:
@@ -147,7 +147,7 @@ class RootDeviceTestCase(db_base.DbTestCase):
             self.assertNotIn('root_disk', self.plugin_data)
             self.assertNotIn('local_gb', self.plugin_data)
             # The default value of the `local_gb` property is unchanged
-            self.assertEqual(task.node.properties.get('local_gb'), '10')
+            self.assertEqual(task.node.properties.get('local_gb'), 10)
 
     def test_size_string(self):
         with task_manager.acquire(self.context, self.node.id) as task:
@@ -159,7 +159,7 @@ class RootDeviceTestCase(db_base.DbTestCase):
             self.assertEqual(self.plugin_data['root_disk'],
                              self.inventory['disks'][2])
             self.assertEqual(self.plugin_data['local_gb'], 19)
-            self.assertEqual(task.node.properties.get('local_gb'), '19')
+            self.assertEqual(task.node.properties.get('local_gb'), 19)
 
     def test_size_invalid(self):
         with task_manager.acquire(self.context, self.node.id) as task:
@@ -175,4 +175,4 @@ class RootDeviceTestCase(db_base.DbTestCase):
                 self.assertNotIn('local_gb', self.plugin_data)
                 # The default value of the `local_gb` property is left
                 # unchanged
-                self.assertEqual(task.node.properties.get('local_gb'), '10')
+                self.assertEqual(task.node.properties.get('local_gb'), 10)

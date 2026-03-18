@@ -214,7 +214,7 @@ class RedfishInspectTestCase(db_base.DbTestCase):
         expected_properties = {
             'capabilities': 'boot_mode:uefi',
             'cpu_arch': 'x86_64',
-            'local_gb': '3', 'memory_mb': 2048,
+            'local_gb': 3, 'memory_mb': 2048,
         }
         self.init_system_mock(mock_get_system.return_value)
 
@@ -322,7 +322,7 @@ class RedfishInspectTestCase(db_base.DbTestCase):
 
         expected_properties = {
             'capabilities': 'boot_mode:uefi',
-            'cpu_arch': 'x86_64', 'local_gb': '3', 'memory_mb': 2048
+            'cpu_arch': 'x86_64', 'local_gb': 3, 'memory_mb': 2048
         }
 
         with task_manager.acquire(self.context, self.node.uuid,
@@ -348,7 +348,7 @@ class RedfishInspectTestCase(db_base.DbTestCase):
         expected_properties = {
             'capabilities': 'boot_mode:uefi',
             'cpu_arch': 'x86_64',
-            'local_gb': '3', 'memory_mb': 2048
+            'local_gb': 3, 'memory_mb': 2048
         }
 
         with task_manager.acquire(self.context, self.node.uuid,
@@ -373,7 +373,7 @@ class RedfishInspectTestCase(db_base.DbTestCase):
         expected_properties = {
             'capabilities': 'boot_mode:uefi',
             'cpu_arch': 'x86_64',
-            'local_gb': '3', 'memory_mb': 2048
+            'local_gb': 3, 'memory_mb': 2048
         }
 
         with task_manager.acquire(self.context, self.node.uuid,
@@ -398,7 +398,7 @@ class RedfishInspectTestCase(db_base.DbTestCase):
         expected_properties = {
             'capabilities': 'boot_mode:uefi',
             'cpu_arch': '',
-            'local_gb': '3', 'memory_mb': 2048
+            'local_gb': 3, 'memory_mb': 2048
         }
 
         with task_manager.acquire(self.context, self.node.uuid,
@@ -424,7 +424,7 @@ class RedfishInspectTestCase(db_base.DbTestCase):
         expected_properties = {
             'capabilities': 'boot_mode:uefi',
             'cpu_arch': 'x86_64',
-            'local_gb': '0', 'memory_mb': 2048
+            'local_gb': 0, 'memory_mb': 2048
         }
 
         with task_manager.acquire(self.context, self.node.uuid,
@@ -445,7 +445,7 @@ class RedfishInspectTestCase(db_base.DbTestCase):
         expected_properties = {
             'capabilities': 'boot_mode:uefi',
             'cpu_arch': 'x86_64',
-            'local_gb': '0', 'memory_mb': 2048
+            'local_gb': 0, 'memory_mb': 2048
         }
 
         with task_manager.acquire(self.context, self.node.uuid,
@@ -469,7 +469,7 @@ class RedfishInspectTestCase(db_base.DbTestCase):
         expected_properties = {
             'capabilities': 'boot_mode:uefi',
             'cpu_arch': 'x86_64',
-            'local_gb': '3', 'memory_mb': 2048
+            'local_gb': 3, 'memory_mb': 2048
         }
 
         with task_manager.acquire(self.context, self.node.uuid,
@@ -493,7 +493,7 @@ class RedfishInspectTestCase(db_base.DbTestCase):
         expected_properties = {
             'capabilities': 'boot_mode:uefi',
             'cpu_arch': 'x86_64',
-            'local_gb': '4', 'memory_mb': 2048
+            'local_gb': 4, 'memory_mb': 2048
         }
 
         with task_manager.acquire(self.context, self.node.uuid,
@@ -528,7 +528,7 @@ class RedfishInspectTestCase(db_base.DbTestCase):
         expected_properties = {
             'capabilities': 'boot_mode:uefi',
             'cpu_arch': 'x86_64',
-            'local_gb': '3', 'memory_mb': '4096'
+            'local_gb': 3, 'memory_mb': '4096'
         }
 
         with task_manager.acquire(self.context, self.node.uuid,
@@ -581,7 +581,7 @@ class RedfishInspectTestCase(db_base.DbTestCase):
         expected_properties = {
             'capabilities': 'boot_mode:bios',
             'cpu_arch': 'x86_64',
-            'local_gb': '3', 'memory_mb': 2048
+            'local_gb': 3, 'memory_mb': 2048
         }
 
         with task_manager.acquire(self.context, self.node.uuid,
@@ -612,7 +612,7 @@ class RedfishInspectTestCase(db_base.DbTestCase):
                                   shared=True) as task:
             expected_properties = {
                 'cpu_arch': 'x86_64',
-                'local_gb': '3', 'memory_mb': 2048
+                'local_gb': 3, 'memory_mb': 2048
             }
             task.driver.inspect.inspect_hardware(task)
 

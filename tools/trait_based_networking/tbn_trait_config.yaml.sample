@@ -1,5 +1,5 @@
 CUSTOM_TRAIT_NAME:
-  - action: bond_ports
+  - action: group_and_attach_ports
     filter: port.vendor == 'clover'
     min_count: 2
 CUSTOM_DIRECT_ATTACH_A_PURPLE_TO_STORAGE:

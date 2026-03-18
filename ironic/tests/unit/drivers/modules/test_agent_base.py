@@ -753,7 +753,7 @@ class PostStepHooksTest(AgentDeployMixinBaseTest):
             agent_base._post_step_reboot(task, 'clean')
             self.assertTrue(mock_build_opt.called)
             self.assertTrue(mock_prepare.called)
-            mock_reboot.assert_called_once_with(task, states.REBOOT, None)
+            mock_reboot.assert_called_once_with(task, states.REBOOT)
             self.assertTrue(task.node.driver_internal_info['cleaning_reboot'])
             self.assertNotIn('agent_secret_token',
                              task.node.driver_internal_info)
@@ -774,7 +774,7 @@ class PostStepHooksTest(AgentDeployMixinBaseTest):
             agent_base._post_step_reboot(task, 'deploy')
             self.assertTrue(mock_build_opt.called)
             self.assertTrue(mock_prepare.called)
-            mock_reboot.assert_called_once_with(task, states.REBOOT, None)
+            mock_reboot.assert_called_once_with(task, states.REBOOT)
             self.assertTrue(
                 task.node.driver_internal_info['deployment_reboot'])
             self.assertNotIn('agent_secret_token',
@@ -797,7 +797,7 @@ class PostStepHooksTest(AgentDeployMixinBaseTest):
             agent_base._post_step_reboot(task, 'clean')
             self.assertTrue(mock_build_opt.called)
             self.assertTrue(mock_prepare.called)
-            mock_reboot.assert_called_once_with(task, states.REBOOT, None)
+            mock_reboot.assert_called_once_with(task, states.REBOOT)
             self.assertIn('agent_secret_token',
                           task.node.driver_internal_info)
 
@@ -813,7 +813,7 @@ class PostStepHooksTest(AgentDeployMixinBaseTest):
         with task_manager.acquire(self.context, self.node['uuid'],
                                   shared=False) as task:
             agent_base._post_step_reboot(task, 'clean')
-            mock_reboot.assert_called_once_with(task, states.REBOOT, None)
+            mock_reboot.assert_called_once_with(task, states.REBOOT)
             mock_handler.assert_called_once_with(task, mock.ANY,
                                                  traceback=True)
             self.assertNotIn('cleaning_reboot',
@@ -831,7 +831,7 @@ class PostStepHooksTest(AgentDeployMixinBaseTest):
         with task_manager.acquire(self.context, self.node['uuid'],
                                   shared=False) as task:
             agent_base._post_step_reboot(task, 'deploy')
-            mock_reboot.assert_called_once_with(task, states.REBOOT, None)
+            mock_reboot.assert_called_once_with(task, states.REBOOT)
             mock_handler.assert_called_once_with(task, mock.ANY,
                                                  traceback=True)
             self.assertNotIn('deployment_reboot',
@@ -850,7 +850,7 @@ class PostStepHooksTest(AgentDeployMixinBaseTest):
         with task_manager.acquire(self.context, self.node['uuid'],
                                   shared=False) as task:
             agent_base._post_step_reboot(task, 'service')
-            mock_reboot.assert_called_once_with(task, states.REBOOT, None)
+            mock_reboot.assert_called_once_with(task, states.REBOOT)
             mock_handler.assert_called_once_with(task, mock.ANY,
                                                  traceback=True)
             self.assertNotIn('servicing_reboot',
@@ -993,7 +993,7 @@ class ContinueCleaningTest(AgentDeployMixinBaseTest):
         with task_manager.acquire(self.context, self.node['uuid'],
                                   shared=False) as task:
             self.deploy.continue_cleaning(task)
-            reboot_mock.assert_called_once_with(task, states.REBOOT, None)
+            reboot_mock.assert_called_once_with(task, states.REBOOT)
 
     @mock.patch.object(cleaning, 'continue_node_clean', autospec=True)
     @mock.patch.object(agent_client.AgentClient, 'get_commands_status',
@@ -1347,7 +1347,7 @@ class ContinueServiceTest(AgentDeployMixinBaseTest):
         with task_manager.acquire(self.context, self.node['uuid'],
                                   shared=False) as task:
             self.deploy.continue_servicing(task)
-            reboot_mock.assert_called_once_with(task, states.REBOOT, None)
+            reboot_mock.assert_called_once_with(task, states.REBOOT)
 
     @mock.patch.object(servicing, 'continue_node_service', autospec=True)
     @mock.patch.object(agent_client.AgentClient, 'get_commands_status',
@@ -1497,7 +1497,11 @@ class TestRefreshCleanSteps(AgentDeployMixinBaseTest):
                              task.node.driver_internal_info)
             self.assertIsNone(task.node.driver_internal_info.get(
                 'agent_cached_deploy_steps'))
-            log_mock.assert_not_called()
+            log_mock.assert_called_once_with(
+                'Agent running on node %(node)s does not support '
+                'in-band deploy steps: %(err)s. Support for old '
+                'agents will be removed in the V release.',
+                {'node': task.node.uuid, 'err': mock.ANY})
 
     @mock.patch.object(agent_client.AgentClient, 'get_clean_steps',
                        autospec=True)

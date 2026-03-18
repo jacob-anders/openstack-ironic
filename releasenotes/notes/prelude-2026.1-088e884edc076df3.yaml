@@ -1,0 +1,36 @@
+prelude: |
+    Welcome to Ironic 35.0, presented as part of the integrated OpenStack
+    2026.1 release. Please be sure to read the upgrade section for any
+    required actions to upgrade your cloud. As a reminder. OpenStack 2026.1
+    is a SLURP (Skip-Level Upgrade Release), and Ironic fully supports
+    upgrades direct from OpenStack 2025.1 (Ironic 29.0).
+
+    Major networking enhancements for OpenStack-integrated Ironic include:
+
+    - Native support for VXLAN configuration of Ironic nodes and
+      switches in deployments utilizing Neutron. Support for multiple
+      physical switches is included in this release.
+    - Trait-based port scheduling, enabling dynamic selection of
+      which Ironic ports and portgroups are used for network attachment,
+      including dynamically creating portgroups on the fly, rather than
+      relying on static physical network mappings.
+
+    Ironic standalone users also received a major networking feature,
+    the introduction of the ``ironic-networking`` service to
+    enable basic VLAN configuration on remote switches with only the
+    use of Ironic services. This new service uses
+    ``networking-generic-switch`` to configure networks based on static
+    metadata on the node.
+
+    Other interesting additions include:
+
+    - Autodetect deploy_interface, permitting deployment methods to change
+      on-the-fly based on image metadata. Deployment methods this can detect
+      at release are direct, bootc, and ramdisk.
+    - Support for Redfish virtual media for SMB/CIFS and NFS protocols.
+    - Redfish inspection has reached parity with in-band inspection methods.
+    - Firmware updates via Redfish no longer require booting an in-band agent
+      afterwards.
+
+    The Ironic community is thrilled for you to run this release! Thank you
+    for using open source.

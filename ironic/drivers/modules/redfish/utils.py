@@ -262,7 +262,7 @@ class SessionCache(object):
         pw_hash = hashlib.pbkdf2_hmac(
             'sha512',
             password.encode('utf-8'),
-            str(driver_info.get('address') * 4).encode('utf-8'), 40)
+            str(driver_info.get('address') * 4).encode('utf-8'), 600000)
         self._driver_info = driver_info
         # Assemble the session key and append the hashed password to it,
         # which forces new sessions to be established when the saved password

@@ -215,18 +215,13 @@ def _set_boot_device(task, system, device, persistent=False,
             # Some vendors require sending all boot parameters every time
             desired_mode = system.boot.get('mode') \
                 or sushy.BOOT_SOURCE_MODE_UEFI
-            BOOT_DEVICE_PERSISTENT_MAP_REV[persistent]
-            current_enabled = system.boot.get('enabled') \
-                or sushy.BOOT_SOURCE_ENABLED_ONCE
-            current_target = system.boot.get('target') \
-                or sushy.BOOT_SOURCE_TARGET_NONE
 
             LOG.debug('Vendor "%(vendor)s" requires full boot settings. '
                       'Sending: mode=%(mode)s, enabled=%(enabled)s, '
                       'target=%(target)s for node %(node)s',
                       {'vendor': vendor, 'mode': desired_mode,
-                       'enabled': current_enabled,
-                       'target': current_target, 'node': task.node.uuid})
+                       'enabled': desired_enabled,
+                       'target': device, 'node': task.node.uuid})
             system.set_system_boot_options(
                 device,
                 mode=desired_mode,
@@ -453,9 +448,9 @@ class RedfishManagement(base.ManagementInterface):
         try:
 
             if requires_full_boot_request:
-                current_enabled = system.boot.get('enable') \
+                current_enabled = system.boot.get('enabled') \
                     or sushy.BOOT_SOURCE_ENABLED_ONCE
-                current_target = system.boot.get('enable') \
+                current_target = system.boot.get('target') \
                     or sushy.BOOT_SOURCE_TARGET_PXE
 
                 LOG.debug('Vendor "%(vendor)s" requires full boot settings. '

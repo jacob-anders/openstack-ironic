@@ -11,10 +11,6 @@ deprecations:
 
     Since the functionality which was merged into ironic is unsuitable for
     scaled and automated operations it must be removed. API field
-    validation is being kept, and the API version has bee incremented to
+    validation is being kept, while the API version has been incremented to
     ``1.104`` to signify this change, however the passing on Neutron
     Port Binding has been removed.
-
-    Ironic developers are actively working on a performant solution
-    in the short term. We hope to have something else usable before the
-    2026.1 release.

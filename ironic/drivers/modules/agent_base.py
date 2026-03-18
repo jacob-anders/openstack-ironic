@@ -943,8 +943,6 @@ class AgentBaseMixin(object):
             LOG.debug('Agent for node %(node)s is busy with a command, '
                       'will refresh steps on the next heartbeat.',
                       {'node': task.node.uuid})
-            return
-
             # TODO(dtantsur): change to just 'raise'
             if step_type == 'clean':
                 raise

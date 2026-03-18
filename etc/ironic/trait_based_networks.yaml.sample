@@ -1,7 +1,7 @@
 CUSTOM_TRAIT_NAME:
   order: 1
   actions:
-    - action: bond_ports
+    - action: group_and_attach_ports
       filter: port.vendor == 'vendor_string'
       min_count: 2
 CUSTOM_DIRECT_ATTACH_A_PURPLE_TO_STORAGE:

@@ -1571,10 +1571,10 @@ class Connection(object, metaclass=abc.ABCMeta):
         """
 
     @abc.abstractmethod
-    def destroy_node_inventory_by_node_id(self, inventory_node_id):
+    def destroy_node_inventory_by_node_id(self, node_id):
         """Destroy a inventory record.
 
-        :param inventory_uuid: The uuid of a inventory record
+        :param node_id: The node id value for records to be removed.
         """
 
     @abc.abstractmethod
