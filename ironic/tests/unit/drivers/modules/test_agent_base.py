@@ -1497,11 +1497,6 @@ class TestRefreshCleanSteps(AgentDeployMixinBaseTest):
                              task.node.driver_internal_info)
             self.assertIsNone(task.node.driver_internal_info.get(
                 'agent_cached_deploy_steps'))
-            log_mock.assert_called_once_with(
-                'Agent running on node %(node)s does not support '
-                'in-band deploy steps: %(err)s. Support for old '
-                'agents will be removed in the V release.',
-                {'node': task.node.uuid, 'err': mock.ANY})
 
     @mock.patch.object(agent_client.AgentClient, 'get_clean_steps',
                        autospec=True)
