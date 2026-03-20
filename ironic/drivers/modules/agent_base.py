@@ -939,19 +939,11 @@ class AgentBaseMixin(object):
         call = getattr(client, 'get_%s_steps' % step_type)
         try:
             agent_result = call(node, task.ports).get('command_result', {})
-        except exception.AgentInProgress as exc:
+        except exception.AgentInProgress:
             LOG.debug('Agent for node %(node)s is busy with a command, '
                       'will refresh steps on the next heartbeat.',
                       {'node': task.node.uuid})
-            # TODO(dtantsur): change to just 'raise'
-            if step_type == 'clean':
-                raise
-            else:
-                LOG.warning('Agent running on node %(node)s does not support '
-                            'in-band deploy steps: %(err)s. Support for old '
-                            'agents will be removed in the V release.',
-                            {'node': node.uuid, 'err': exc})
-                return
+            return
 
         missing = set(['%s_steps' % step_type,
                        'hardware_manager_version']).difference(agent_result)

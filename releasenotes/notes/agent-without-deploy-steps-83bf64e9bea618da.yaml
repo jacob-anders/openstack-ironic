@@ -1,0 +1,5 @@
+---
+upgrade:
+  - |
+    Removes compatibility with Ironic Python Agent versions without support
+    for in-band deploy steps (introduced in the Ussuri cycle).
