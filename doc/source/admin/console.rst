@@ -54,7 +54,7 @@ Node serial console
 -------------------
 
 Serial consoles for nodes are implemented using `socat`_. It is supported by
-the ``ipmi``, ``irmc``, and ``redfish`` hardware types.
+the ``ipmi`` and ``redfish`` hardware types.
 
 .. NOTE::
    The use of the ``ipmitool-socat`` console interface on any hardware type

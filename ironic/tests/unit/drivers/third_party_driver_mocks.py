@@ -25,7 +25,6 @@ Current list of mocked libraries:
 
 - proliantutils
 - pysnmp
-- scciclient
 """
 
 import importlib
@@ -94,39 +93,6 @@ if not pysnmp:
 # external library has been mocked
 if 'ironic.drivers.modules.snmp' in sys.modules:
     importlib.reload(sys.modules['ironic.drivers.modules.snmp'])
-
-
-# attempt to load the external 'scciclient' library, which is required by
-# the optional drivers.modules.irmc module
-scciclient = importutils.try_import('scciclient')
-if not scciclient:
-    mock_scciclient = mock.MagicMock(spec_set=mock_specs.SCCICLIENT_SPEC)
-    sys.modules['scciclient'] = mock_scciclient
-    sys.modules['scciclient.irmc'] = mock_scciclient.irmc
-    sys.modules['scciclient.irmc.scci'] = mock.MagicMock(
-        spec_set=mock_specs.SCCICLIENT_IRMC_SCCI_SPEC,
-        POWER_OFF=mock.sentinel.POWER_OFF,
-        POWER_ON=mock.sentinel.POWER_ON,
-        POWER_RESET=mock.sentinel.POWER_RESET,
-        MOUNT_CD=mock.sentinel.MOUNT_CD,
-        UNMOUNT_CD=mock.sentinel.UNMOUNT_CD,
-        MOUNT_FD=mock.sentinel.MOUNT_FD,
-        UNMOUNT_FD=mock.sentinel.UNMOUNT_FD)
-    sys.modules['scciclient.irmc.elcm'] = mock.MagicMock(
-        spec_set=mock_specs.SCCICLIENT_IRMC_ELCM_SPEC)
-
-
-# if anything has loaded the iRMC driver yet, reload it now that the
-# external library has been mocked
-if 'ironic.drivers.modules.irmc' in sys.modules:
-    importlib.reload(sys.modules['ironic.drivers.modules.irmc'])
-
-
-# install mock object to prevent the irmc-virtual-media boot interface from
-# checking whether NFS/CIFS share file system is mounted or not.
-irmc_boot = importutils.import_module(
-    'ironic.drivers.modules.irmc.boot')
-irmc_boot.check_share_fs_mounted_orig = irmc_boot.check_share_fs_mounted
 
 
 # attempt to load the external 'networking_generic_switch' library, which is

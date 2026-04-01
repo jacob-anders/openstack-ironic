@@ -655,14 +655,6 @@ class FileSystemNotSupported(IronicException):
                  "File system %(fs)s is not supported.")
 
 
-class IRMCOperationError(DriverOperationError):
-    _msg_fmt = _('iRMC %(operation)s failed. Reason: %(error)s')
-
-
-class IRMCSharedFileSystemNotMounted(DriverOperationError):
-    _msg_fmt = _("iRMC shared file system '%(share)s' is not mounted.")
-
-
 class HardwareInspectionFailure(IronicException):
     _msg_fmt = _("Failed to inspect hardware. Reason: %(error)s")
 

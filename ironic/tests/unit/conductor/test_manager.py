@@ -63,7 +63,7 @@ from ironic.drivers.modules import image_utils
 from ironic.drivers.modules import inspect_utils
 from ironic.drivers.modules.network import common as n_common
 from ironic.drivers.modules.network import flat as n_flat
-from ironic.drivers.modules import redfish
+from ironic.drivers.modules.redfish import management as redfish_mgmt
 from ironic import objects
 from ironic.objects import base as obj_base
 from ironic.objects import fields as obj_fields
@@ -9535,7 +9535,7 @@ class VirtualMediaTestCase(mgr_utils.ServiceSetUpMixin, db_base.DbTestCase):
             provision_state=states.ACTIVE)
 
     @mock.patch.object(image_utils, 'ISOImageCache', autospec=True)
-    @mock.patch.object(redfish.management.RedfishManagement, 'validate',
+    @mock.patch.object(redfish_mgmt.RedfishManagement, 'validate',
                        autospec=True)
     @mock.patch.object(manager, 'do_attach_virtual_media',
                        autospec=True)
@@ -9552,7 +9552,7 @@ class VirtualMediaTestCase(mgr_utils.ServiceSetUpMixin, db_base.DbTestCase):
         self.node.refresh()
         self.assertIsNone(self.node.last_error)
 
-    @mock.patch.object(redfish.management.RedfishManagement, 'validate',
+    @mock.patch.object(redfish_mgmt.RedfishManagement, 'validate',
                        autospec=True)
     @mock.patch.object(manager, 'do_attach_virtual_media', autospec=True)
     def test_attach_virtual_media_http(self, mock_attach, mock_validate):
@@ -9567,7 +9567,7 @@ class VirtualMediaTestCase(mgr_utils.ServiceSetUpMixin, db_base.DbTestCase):
         self.node.refresh()
         self.assertIsNone(self.node.last_error)
 
-    @mock.patch.object(redfish.management.RedfishManagement,
+    @mock.patch.object(redfish_mgmt.RedfishManagement,
                        'attach_virtual_media', autospec=True)
     @mock.patch.object(image_utils, 'cleanup_remote_image', autospec=True)
     @mock.patch.object(image_utils, 'prepare_remote_image', autospec=True)
@@ -9585,7 +9585,7 @@ class VirtualMediaTestCase(mgr_utils.ServiceSetUpMixin, db_base.DbTestCase):
                 task.driver.management, task, device_type=boot_devices.CDROM,
                 image_url=mock_prepare_image.return_value)
 
-    @mock.patch.object(redfish.management.RedfishManagement,
+    @mock.patch.object(redfish_mgmt.RedfishManagement,
                        'attach_virtual_media', autospec=True)
     @mock.patch.object(image_utils, 'cleanup_remote_image', autospec=True)
     @mock.patch.object(image_utils, 'prepare_remote_image', autospec=True)
@@ -9606,7 +9606,7 @@ class VirtualMediaTestCase(mgr_utils.ServiceSetUpMixin, db_base.DbTestCase):
         self.assertIn("Could not attach device cdrom", self.node.last_error)
         self.assertIn("Invalid image href", self.node.last_error)
 
-    @mock.patch.object(redfish.management.RedfishManagement,
+    @mock.patch.object(redfish_mgmt.RedfishManagement,
                        'attach_virtual_media', autospec=True)
     @mock.patch.object(image_utils, 'cleanup_remote_image', autospec=True)
     @mock.patch.object(image_utils, 'prepare_remote_image', autospec=True)
@@ -9628,7 +9628,7 @@ class VirtualMediaTestCase(mgr_utils.ServiceSetUpMixin, db_base.DbTestCase):
         self.assertIn("Could not attach device cdrom", self.node.last_error)
         self.assertIn("disabled or not implemented", self.node.last_error)
 
-    @mock.patch.object(redfish.management.RedfishManagement, 'validate',
+    @mock.patch.object(redfish_mgmt.RedfishManagement, 'validate',
                        autospec=True)
     def test_attach_virtual_media_power_failure(self, mock_validate):
         CONF.set_override('use_swift', 'false', group='redfish')
@@ -9641,7 +9641,7 @@ class VirtualMediaTestCase(mgr_utils.ServiceSetUpMixin, db_base.DbTestCase):
             boot_devices.CDROM, 'https://url')
         mock_validate.assert_called_once_with(mock.ANY, mock.ANY)
 
-    @mock.patch.object(redfish.management.RedfishManagement, 'validate',
+    @mock.patch.object(redfish_mgmt.RedfishManagement, 'validate',
                        autospec=True)
     def test_detach_virtual_media_power_failure(self, mock_validate):
         CONF.set_override('use_swift', 'false', group='redfish')
@@ -9654,9 +9654,9 @@ class VirtualMediaTestCase(mgr_utils.ServiceSetUpMixin, db_base.DbTestCase):
             boot_devices.CDROM)
         mock_validate.assert_called_once_with(mock.ANY, mock.ANY)
 
-    @mock.patch.object(redfish.management.RedfishManagement,
+    @mock.patch.object(redfish_mgmt.RedfishManagement,
                        'get_virtual_media', autospec=True)
-    @mock.patch.object(redfish.management.RedfishManagement, 'validate',
+    @mock.patch.object(redfish_mgmt.RedfishManagement, 'validate',
                        autospec=True)
     def test_get_virtual_media(self, mock_validate, mock_get):
         mock_get.return_value = [{'media_types': ['CD'], 'inserted': False,
@@ -9666,9 +9666,9 @@ class VirtualMediaTestCase(mgr_utils.ServiceSetUpMixin, db_base.DbTestCase):
         mock_get.assert_called_once_with(mock.ANY, mock.ANY)
         self.assertEqual(mock_get.return_value, result)
 
-    @mock.patch.object(redfish.management.RedfishManagement,
+    @mock.patch.object(redfish_mgmt.RedfishManagement,
                        'get_virtual_media', autospec=True)
-    @mock.patch.object(redfish.management.RedfishManagement, 'validate',
+    @mock.patch.object(redfish_mgmt.RedfishManagement, 'validate',
                        autospec=True)
     def test_get_virtual_media_node_locked(self, mock_validate, mock_get):
         """get_virtual_media uses a shared lock.

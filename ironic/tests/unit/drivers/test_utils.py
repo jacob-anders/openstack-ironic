@@ -557,11 +557,6 @@ class GetVerifyCATestCase(tests_base.TestCase):
                 'driver_info_key': 'redfish_verify_ca',
             },
             {
-                'driver': 'irmc',
-                'config_group': 'irmc',
-                'driver_info_key': 'irmc_verify_ca',
-            },
-            {
                 'driver': 'redfish',
                 'config_group': 'redfish',
                 'driver_info_key': 'redfish_verify_ca',
@@ -587,10 +582,6 @@ class GetVerifyCATestCase(tests_base.TestCase):
             {
                 'driver': 'idrac',
                 'config_group': 'redfish',
-            },
-            {
-                'driver': 'irmc',
-                'config_group': 'irmc',
             },
             {
                 'driver': 'redfish',

@@ -13,7 +13,7 @@ discovered ethernet MACs.
 There are two kinds of inspection supported by Bare Metal service:
 
 #. Out-of-band inspection is currently implemented by several hardware types,
-   including ``redfish``, ``ilo``, ``idrac`` and ``irmc``.
+   including ``redfish``, ``ilo`` and ``idrac``.
 
 #. In-band inspection, also known as Agent inspection
    utilizing Ironic Python Agent to collect information.

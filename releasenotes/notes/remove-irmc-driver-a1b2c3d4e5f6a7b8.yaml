@@ -1,0 +1,6 @@
+---
+upgrade:
+  - |
+    The iRMC hardware type and all its interfaces have been removed.
+    Users of the iRMC driver should migrate to a supported hardware
+    type, preferably ``redfish``.

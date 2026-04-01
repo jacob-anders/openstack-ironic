@@ -42,7 +42,6 @@ _opts = [
     ('inspector', ironic.conf.inspector.opts),
     ('inventory', ironic.conf.inventory.opts),
     ('ipmi', ironic.conf.ipmi.opts),
-    ('irmc', ironic.conf.irmc.opts),
     ('ironic_networking', ironic.conf.ironic_networking.list_opts()),
     # Expose the ironic networking-specific JSON-RPC group for sample configs
     ('ironic_networking_json_rpc', ironic.conf.json_rpc.list_opts()),

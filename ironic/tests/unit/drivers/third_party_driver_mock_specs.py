@@ -30,56 +30,6 @@ PYWSNMP_SPEC = (
     'error',
 )
 
-# scciclient
-SCCICLIENT_SPEC = (
-    'irmc',
-)
-SCCICLIENT_IRMC_SCCI_SPEC = (
-    'POWER_OFF',
-    'POWER_ON',
-    'POWER_RESET',
-    'POWER_SOFT_CYCLE',
-    'POWER_SOFT_OFF',
-    'MOUNT_CD',
-    'POWER_RAISE_NMI',
-    'UNMOUNT_CD',
-    'MOUNT_FD',
-    'UNMOUNT_FD',
-    'SCCIError',
-    'SCCIClientError',
-    'SCCIError',
-    'SCCIInvalidInputError',
-    'get_share_type',
-    'get_client',
-    'get_report',
-    'get_sensor_data',
-    'get_virtual_cd_set_params_cmd',
-    'get_virtual_fd_set_params_cmd',
-    'get_essential_properties',
-    'get_capabilities_properties',
-    'get_irmc_version_str',
-)
-SCCICLIENT_IRMC_ELCM_SPEC = (
-    'backup_bios_config',
-    'elcm_request',
-    'restore_bios_config',
-    'set_secure_boot_mode',
-)
-
-SCCICLIENT_VIOM_SPEC = (
-    'validate_physical_port_id',
-    'VIOMConfiguration',
-)
-
-SCCICLIENT_VIOM_CONF_SPEC = (
-    'set_lan_port',
-    'set_iscsi_volume',
-    'set_fc_volume',
-    'apply',
-    'dump_json',
-    'terminate',
-)
-
 REDFISH_SPEC = (
     'redfish',
 )
