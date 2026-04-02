@@ -267,19 +267,6 @@ class TestLookup(test_api_base.BaseApiTest):
         self.assertEqual(self.node.uuid, data['node']['uuid'])
         self._check_config(data, skip_bmc_detect=True)
 
-    def test_bmc_detect_skip_for_irmc(self):
-        """Test BMC detection skip is enabled for iRMC."""
-        self.node.management_interface = 'irmc'
-        self.node.save()
-        self._set_secret_mock(self.node, 'test-token')
-
-        data = self.get_json(
-            '/lookup?node_uuid=%s' % self.node.uuid,
-            headers={api_base.Version.string: str(api_v1.max_version())})
-
-        self.assertEqual(self.node.uuid, data['node']['uuid'])
-        self._check_config(data, skip_bmc_detect=True)
-
     def test_bmc_detect_not_skipped_for_ipmi(self):
         """Test BMC detection is NOT skipped for IPMI interface."""
         self.node.management_interface = 'ipmitool'

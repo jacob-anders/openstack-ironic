@@ -401,23 +401,6 @@ ipmi:
   min_command_interval = 5
   retry_timeout = 60
 
-irmc:
-  auth_method = basic
-  client_timeout = 60
-  port = 443
-  remote_image_server = None
-  remote_image_share_name = share
-  remote_image_share_root = /remote_image_share_root
-  remote_image_share_type = CIFS
-  remote_image_user_domain =
-  remote_image_user_name = None
-  remote_image_user_password = ***
-  sensor_method = ipmitool
-  snmp_community = public
-  snmp_port = 161
-  snmp_security = None
-  snmp_version = v2c
-
 ironic_lib:
   fatal_exception_format_errors = False
   root_helper = sudo ironic-rootwrap /etc/ironic/rootwrap.conf

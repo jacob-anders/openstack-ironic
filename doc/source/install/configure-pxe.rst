@@ -214,7 +214,7 @@ the PXE UEFI environment.
    boot device is set to network/pxe.
 
    .. note::
-    Some drivers, e.g. ``ilo``, ``irmc`` and ``redfish``, support automatic
+    Some drivers, e.g. ``ilo`` and ``redfish``, support automatic
     setting of the boot mode during deployment. This step is not required
     for them. Please check :doc:`../admin/drivers` for information on whether
     your driver requires manual UEFI configuration.

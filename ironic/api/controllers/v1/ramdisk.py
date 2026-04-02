@@ -53,7 +53,6 @@ def config(token, node=None):
         skip_bmc_detect = mgmt_iface in (
             'redfish', 'idrac-redfish',
             'ilo', 'ilo5', 'ilo6',
-            'irmc'
         )
         if skip_bmc_detect:
             LOG.debug('Skipping BMC detection for node %(node)s with '

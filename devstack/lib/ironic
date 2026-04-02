@@ -155,9 +155,6 @@ IRONIC_NODE_SHARD_NAME=${IRONIC_NODE_SHARD_NAME:-ds_shard_1}
 # idrac:
 #   <BMC address> <MAC address> <BMC username> <BMC password>
 #
-# irmc:
-#   <BMC address> <MAC address> <BMC username> <BMC password>
-#
 IRONIC_HWINFO_FILE=${IRONIC_HWINFO_FILE:-$IRONIC_DATA_DIR/hardware_info}
 
 # Set up defaults for functional / integration testing
@@ -345,7 +342,7 @@ fi
 # are ``ipmi``, ``snmp`` and ``redfish``.
 #
 # Additional valid choices if IRONIC_IS_HARDWARE == true are:
-# ``idrac`` and ``irmc``.
+# ``idrac``.
 IRONIC_DEPLOY_DRIVER=${IRONIC_DEPLOY_DRIVER:-ipmi}
 
 # If present, these files are used as deploy ramdisk/kernel.
@@ -1008,11 +1005,6 @@ function is_deployed_by_redfish {
     return 1
 }
 
-function is_deployed_by_irmc {
-    [[ "$IRONIC_DEPLOY_DRIVER" == irmc ]] && return 0
-    return 1
-}
-
 function is_drac_enabled {
     [[ -z "${IRONIC_ENABLED_HARDWARE_TYPES%%*idrac*}" ]] && return 0
     return 1
@@ -1338,9 +1330,6 @@ function install_ironic {
         pip_install python-dracclient
     fi
 
-    if is_irmc_enabled; then
-        pip_install python-scciclient pysnmp
-    fi
 
     if is_ansible_deploy_enabled; then
         pip_install "$(grep '^ansible' $IRONIC_DIR/driver-requirements.txt | awk '{print $1}')"
@@ -3479,13 +3468,6 @@ function enroll_nodes {
                     --driver-info redfish_password=$bmc_passwd \
                     --driver-info redfish_username=$bmc_username \
                     --driver-info redfish_verify_ca=False"
-            elif is_deployed_by_irmc; then
-                node_options+=" --driver-info irmc_address=$bmc_address \
-                    --driver-info irmc_password=$bmc_passwd \
-                    --driver-info irmc_username=$bmc_username"
-                if [[ -n "$IRONIC_DEPLOY_ISO_ID" ]]; then
-                    node_options+=" --driver-info deploy_iso=$IRONIC_DEPLOY_ISO_ID"
-                fi
             fi
 
             interface_info="${mac_address}"

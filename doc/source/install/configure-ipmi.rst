@@ -77,7 +77,7 @@ Collecting sensor data
 ~~~~~~~~~~~~~~~~~~~~~~
 
 Bare Metal service supports sending IPMI sensor data to Telemetry with
-certain hardware types, such as ``ipmi``, ``ilo`` and ``irmc``.  By default,
+certain hardware types, such as ``ipmi`` and ``ilo``.  By default,
 support for sending IPMI sensor data to Telemetry is disabled. If you want
 to enable it, you should make the following two changes in ``ironic.conf``:
 

@@ -8,8 +8,7 @@ The Bare Metal service delegates actual hardware management to **drivers**.
 *Drivers*, also called *hardware types*, consist of *hardware interfaces*:
 sets of functionality dealing with some aspect of bare metal provisioning
 in a vendor-specific way. There are generic **hardware types** (eg.
-``redfish`` and ``ipmi``), and vendor-specific ones (eg. ``ilo`` and
-``irmc``).
+``redfish`` and ``ipmi``), and vendor-specific one (eg. ``ilo``).
 
 .. note::
    The terminologies *driver*, *dynamic driver*, and *hardware type*
@@ -98,8 +97,8 @@ inspect
     .. code-block:: ini
 
         [DEFAULT]
-        enabled_hardware_types = ipmi,ilo,irmc
-        enabled_inspect_interfaces = ilo,irmc,agent
+        enabled_hardware_types = ipmi,ilo
+        enabled_inspect_interfaces = ilo,agent
 
     See :doc:`/admin/inspection` for more details.
 management
@@ -111,8 +110,8 @@ management
     .. code-block:: ini
 
         [DEFAULT]
-        enabled_hardware_types = ipmi,redfish,ilo,irmc
-        enabled_management_interfaces = ipmitool,redfish,ilo,irmc
+        enabled_hardware_types = ipmi,redfish,ilo
+        enabled_management_interfaces = ipmitool,redfish,ilo
 
     Using ``ipmitool`` requires :doc:`configure-ipmi`. See
     :doc:`/admin/drivers` for the required configuration of each driver.
@@ -127,8 +126,8 @@ power
     .. code-block:: ini
 
         [DEFAULT]
-        enabled_hardware_types = ipmi,redfish,ilo,irmc
-        enabled_power_interfaces = ipmitool,redfish,ilo,irmc
+        enabled_hardware_types = ipmi,redfish,ilo
+        enabled_power_interfaces = ipmitool,redfish,ilo
 
     Using ``ipmitool`` requires :doc:`configure-ipmi`. See
     :doc:`/admin/drivers` for the required configuration of each driver.
@@ -140,7 +139,7 @@ raid
     .. code-block:: ini
 
         [DEFAULT]
-        enabled_hardware_types = ipmi,redfish,ilo,irmc
+        enabled_hardware_types = ipmi,redfish,ilo
         enabled_raid_interfaces = agent,no-raid
 storage
     manages the interaction with a remote storage subsystem, such as the
@@ -158,7 +157,7 @@ storage
     .. code-block:: ini
 
         [DEFAULT]
-        enabled_hardware_types = ipmi,irmc
+        enabled_hardware_types = ipmi
         enabled_storage_interfaces = cinder,noop
 
 vendor
@@ -168,7 +167,7 @@ vendor
     .. code-block:: ini
 
         [DEFAULT]
-        enabled_hardware_types = ipmi,redfish,ilo,irmc
+        enabled_hardware_types = ipmi,redfish,ilo
         enabled_vendor_interfaces = ipmitool,no-vendor
 
 Here is a complete configuration example, enabling two generic protocols,

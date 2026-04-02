@@ -28,7 +28,6 @@ Hardware Types
   drivers/ilo
   drivers/intel-ipmi
   drivers/ipmitool
-  drivers/irmc
   drivers/redfish
   drivers/snmp
   drivers/fake

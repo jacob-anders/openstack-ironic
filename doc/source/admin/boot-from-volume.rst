@@ -24,9 +24,9 @@ the node OR the iPXE boot templates such that the node CAN be booted.
 .. figure:: ./../images/boot-from-volume.svg
    :width: 100%
 
-In this example, the boot interface does the heavy lifting. For drivers the
-``irmc`` and ``ilo`` hardware types with hardware type-specific boot
-interfaces, they are able to signal via an out-of-band mechanism to the
+In this example, the boot interface does the heavy lifting. For the
+``ilo`` hardware type with its hardware type-specific boot
+interface, it is able to signal via an out-of-band mechanism to the
 baremetal node's BMC that the integrated iSCSI initiators are to connect
 to the supplied volume target information.
 

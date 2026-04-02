@@ -1545,19 +1545,6 @@ For example, with iLO drivers...
     $ openstack baremetal node set --driver-info ilo_username=<new_user> --driver-info ilo_password=<new_pass> <node_uuid>
     $ openstack baremetal node maintenance unset <node_uuid>
 
-For example, with iRMC drivers...
-
-.. code-block:: console
-
-    $ openstack baremetal node set --driver-info irmc_username=<new_user> --driver-info irmc_password=<new_pass> <node_uuid>
-    $ openstack baremetal node set --driver-info redfish_username=<new_user> --driver-info redfish_password=<new_pass> <node_uuid>
-    $ openstack baremetal node set --driver-info irmc_snmp_user=<new_user> --driver-info irmc_snmp_auth_password=<new_auth_pass> --driver-info irmc_snmp_priv_password=<new_priv_password> <node_uuid>
-    $ openstack baremetal node maintenance unset <node_uuid>
-
-.. note::
-   iRMC drivers utilize a mix of protocols and can have explicit credentials
-   set for each protocol utilized.
-
 .. note::
    Ironic generally does not manage or rotate the remote BMC credentials due
    to the risk of user lockout if the account is not for the specific use of
