@@ -11,6 +11,8 @@
 #    under the License.
 
 import datetime
+import multiprocessing.reduction
+import pickle
 import time
 from unittest import mock
 
@@ -300,3 +302,85 @@ class TestRPCService(db_base.DbTestCase):
             self.assertFalse(
                 self.rpc_svc._shutdown_timeout_reached(initial_time))
             self.assertEqual(4, mock_drain.call_count)
+
+    @mock.patch('ironic.common.service.prepare_command', autospec=True)
+    def test_pickle_roundtrip(self, mock_prepare):
+        """Test that RPCService can be pickled for oslo.service spawn check.
+
+        oslo.service uses ForkingPickler.dumps() to determine whether
+        to use the spawn or fork multiprocessing context. This test
+        verifies that RPCService survives a pickle roundtrip.
+        """
+        # Verify ForkingPickler.dumps succeeds (this is the exact call
+        # oslo.service makes)
+        data = multiprocessing.reduction.ForkingPickler.dumps(self.rpc_svc)
+        restored = pickle.loads(data)
+        self.assertEqual(self.rpc_svc.host, restored.host)
+        self.assertEqual(self.rpc_svc.topic, restored.topic)
+        self.assertFalse(restored._started)
+        # Manager should survive the roundtrip
+        self.assertEqual(self.rpc_svc.manager.host, restored.manager.host)
+        self.assertEqual(self.rpc_svc.manager.topic, restored.manager.topic)
+        # threading.Event should be recreated as unset
+        self.assertFalse(restored.manager._shutdown.is_set())
+
+    def test_getstate_includes_argv(self):
+        """__getstate__ saves sys.argv so __setstate__ can restore CONF."""
+        import sys
+        state = self.rpc_svc.__getstate__()
+        self.assertIn('_argv', state)
+        self.assertEqual(sys.argv[:], state['_argv'])
+        # tg must be excluded (contains un-picklable threading objects)
+        self.assertNotIn('tg', state)
+
+    @mock.patch('ironic.common.service.prepare_command', autospec=True)
+    def test_setstate_calls_prepare_command(self, mock_prepare):
+        """__setstate__ re-configures CONF when _argv is present.
+
+        In a spawned child process CONF starts empty; BaseRPCService
+        must call prepare_command() with the parent's argv to restore it.
+        """
+        state = self.rpc_svc.__getstate__()
+        state['_argv'] = ['ironic', '--config-file', '/etc/ironic/ironic.conf']
+        new_svc = object.__new__(rpc_service.RPCService)
+        new_svc.__setstate__(state)
+        mock_prepare.assert_called_once_with(
+            ['ironic', '--config-file', '/etc/ironic/ironic.conf'])
+
+    @mock.patch('ironic.common.service.prepare_command', autospec=True)
+    def test_setstate_no_argv_skips_prepare_command(self, mock_prepare):
+        """__setstate__ without _argv does not call prepare_command.
+
+        This covers the non-spawn (fork or in-process) path where CONF
+        is already populated and must not be re-initialised.
+        """
+        state = self.rpc_svc.__getstate__()
+        state.pop('_argv', None)
+        new_svc = object.__new__(rpc_service.RPCService)
+        new_svc.__setstate__(state)
+        mock_prepare.assert_not_called()
+
+    def test_pickle_roundtrip_with_conf(self):
+        """Full oslo.service spawn probe: both service and conf.
+
+        ``_select_service_manager_context()`` probes the service instance
+        **and** ``conf`` in the same try block.  This test verifies that
+        both succeed after the ConfigOpts spawn-safety patch is applied.
+        """
+        ironic_service._make_conf_spawn_safe()
+
+        def _cleanup_patch():
+            for attr in ('__reduce__', '_ironic_spawn_safe'):
+                try:
+                    delattr(cfg.ConfigOpts, attr)
+                except AttributeError:
+                    pass
+        self.addCleanup(_cleanup_patch)
+
+        # Service probe
+        data_svc = multiprocessing.reduction.ForkingPickler.dumps(
+            self.rpc_svc)
+        self.assertIsNotNone(data_svc)
+        # Conf probe
+        data_conf = multiprocessing.reduction.ForkingPickler.dumps(CONF)
+        self.assertIsNotNone(data_conf)

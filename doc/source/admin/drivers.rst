@@ -29,7 +29,6 @@ Hardware Types
   drivers/intel-ipmi
   drivers/ipmitool
   drivers/redfish
-  drivers/snmp
   drivers/fake
 
 Changing Hardware Types and Interfaces

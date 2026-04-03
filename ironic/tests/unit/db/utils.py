@@ -123,32 +123,6 @@ def get_test_agent_driver_internal_info():
     }
 
 
-def get_test_snmp_info(**kw):
-    result = {
-        "snmp_driver": kw.get("snmp_driver", "teltronix"),
-        "snmp_address": kw.get("snmp_address", "1.2.3.4"),
-        "snmp_port": kw.get("snmp_port", "161"),
-        "snmp_outlet": kw.get("snmp_outlet", "1"),
-        "snmp_version": kw.get("snmp_version", "1")
-    }
-    if result["snmp_version"] in ("1", "2c"):
-        result["snmp_community"] = kw.get("snmp_community", "public")
-        if "snmp_community_read" in kw:
-            result["snmp_community_read"] = kw["snmp_community_read"]
-        if "snmp_community_write" in kw:
-            result["snmp_community_write"] = kw["snmp_community_write"]
-    elif result["snmp_version"] == "3":
-        result["snmp_user"] = kw.get(
-            "snmp_user", kw.get("snmp_security", "snmpuser")
-        )
-        for option in ('snmp_auth_protocol', 'snmp_auth_key',
-                       'snmp_priv_protocol', 'snmp_priv_key',
-                       'snmp_context_engine_id', 'snmp_context_name'):
-            if option in kw:
-                result[option] = kw[option]
-    return result
-
-
 def get_test_node(**kw):
     properties = {
         "cpu_arch": "x86_64",

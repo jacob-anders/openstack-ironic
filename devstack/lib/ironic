@@ -44,10 +44,6 @@ GITREPO["virtualbmc"]=${VIRTUALBMC_REPO:-${GIT_BASE}/openstack/virtualbmc.git}
 GITBRANCH["virtualbmc"]=${VIRTUALBMC_BRANCH:-master}
 GITDIR["virtualbmc"]=$DEST/virtualbmc
 
-GITREPO["virtualpdu"]=${VIRTUALPDU_REPO:-${GIT_BASE}/openstack/virtualpdu.git}
-GITBRANCH["virtualpdu"]=${VIRTUALPDU_BRANCH:-master}
-GITDIR["virtualpdu"]=$DEST/virtualpdu
-
 GITREPO["sushy"]=${SUSHY_REPO:-${GIT_BASE}/openstack/sushy.git}
 GITBRANCH["sushy"]=${SUSHY_BRANCH:-master}
 GITDIR["sushy"]=$DEST/sushy
@@ -339,7 +335,7 @@ if [[ ! "$IRONIC_RAMDISK_TYPE" =~ $IRONIC_SUPPORTED_RAMDISK_TYPES_RE ]]; then
 fi
 
 # Which deploy driver to use - valid choices right now
-# are ``ipmi``, ``snmp`` and ``redfish``.
+# are ``ipmi`` and ``redfish``.
 #
 # Additional valid choices if IRONIC_IS_HARDWARE == true are:
 # ``idrac``.
@@ -479,14 +475,6 @@ IRONIC_VBMC_PORT_RANGE_START=${IRONIC_VBMC_PORT_RANGE_START:-6230}
 IRONIC_VBMC_CONFIG_FILE=${IRONIC_VBMC_CONFIG_FILE:-$IRONIC_CONF_DIR/virtualbmc/virtualbmc.conf}
 IRONIC_VBMC_LOGFILE=${IRONIC_VBMC_LOGFILE:-$IRONIC_VM_LOG_DIR/virtualbmc.log}
 IRONIC_VBMC_SYSTEMD_SERVICE=devstack@virtualbmc.service
-
-# Virtual PDU configs
-IRONIC_VPDU_CONFIG_FILE=${IRONIC_VPDU_CONFIG_FILE:-$IRONIC_CONF_DIR/virtualpdu/virtualpdu.conf}
-IRONIC_VPDU_PORT_RANGE_START=${IRONIC_VPDU_PORT_RANGE_START:-1}
-IRONIC_VPDU_LISTEN_PORT=${IRONIC_VPDU_LISTEN_PORT:-1161}
-IRONIC_VPDU_COMMUNITY=${IRONIC_VPDU_COMMUNITY:-private}
-IRONIC_VPDU_SNMPDRIVER=${IRONIC_VPDU_SNMPDRIVER:-apc_rackpdu}
-IRONIC_VPDU_SYSTEMD_SERVICE=devstack@virtualpdu.service
 
 # Redfish configs
 IRONIC_REDFISH_EMULATOR_PORT=${IRONIC_REDFISH_EMULATOR_PORT:-9132}
@@ -995,11 +983,6 @@ function is_deployed_by_drac {
     return 1
 }
 
-function is_deployed_by_snmp {
-    [[ "${IRONIC_DEPLOY_DRIVER}" == snmp ]] && return 0
-    return 1
-}
-
 function is_deployed_by_redfish {
     [[ "$IRONIC_DEPLOY_DRIVER" == redfish ]] && return 0
     return 1
@@ -1136,66 +1119,6 @@ function configure_virtualbmc {
     iniset -sudo $IRONIC_VBMC_CONFIG_FILE log debug True
 }
 
-function start_virtualpdu {
-    start_service $IRONIC_VPDU_SYSTEMD_SERVICE
-}
-
-function stop_virtualpdu {
-    stop_service $IRONIC_VPDU_SYSTEMD_SERVICE
-}
-
-function cleanup_virtualpdu {
-    stop_virtualpdu
-
-    disable_service $IRONIC_VPDU_SYSTEMD_SERVICE
-
-    local unitfile="$SYSTEMD_DIR/$IRONIC_VPDU_SYSTEMD_SERVICE"
-    sudo rm -f $unitfile
-
-    $SYSTEMCTL daemon-reload
-}
-
-function install_virtualpdu {
-    if use_library_from_git "virtualpdu"; then
-        git_clone_by_name "virtualpdu"
-        setup_dev_lib "virtualpdu"
-    else
-        pip_install "virtualpdu"
-    fi
-
-    local cmd
-
-    cmd=$(which virtualpdu)
-    cmd+=" $IRONIC_VPDU_CONFIG_FILE"
-
-    write_user_unit_file $IRONIC_VPDU_SYSTEMD_SERVICE "$cmd" "" "$STACK_USER"
-
-    enable_service $IRONIC_VPDU_SYSTEMD_SERVICE
-}
-
-function configure_virtualpdu {
-    mkdir -p $(dirname $IRONIC_VPDU_CONFIG_FILE)
-
-    iniset -sudo $IRONIC_VPDU_CONFIG_FILE global debug True
-    iniset -sudo $IRONIC_VPDU_CONFIG_FILE global libvirt_uri "qemu:///system"
-    iniset -sudo $IRONIC_VPDU_CONFIG_FILE PDU listen_address ${HOST_IP}
-    iniset -sudo $IRONIC_VPDU_CONFIG_FILE PDU listen_port ${IRONIC_VPDU_LISTEN_PORT}
-    iniset -sudo $IRONIC_VPDU_CONFIG_FILE PDU community ${IRONIC_VPDU_COMMUNITY}
-    iniset -sudo $IRONIC_VPDU_CONFIG_FILE PDU ports $(_generate_pdu_ports)
-    iniset -sudo $IRONIC_VPDU_CONFIG_FILE PDU outlet_default_state "OFF"
-}
-
-# _generate_pdu_ports() - Generates list of port:node_name.
-function _generate_pdu_ports {
-    pdu_port_number=${IRONIC_VPDU_PORT_RANGE_START}
-    port_config=()
-    for vm_name in $(_ironic_bm_vm_names); do
-        port_config+=("${pdu_port_number}:${vm_name}")
-        pdu_port_number=$(( pdu_port_number + 1 ))
-    done
-    echo ${port_config[*]} | tr ' ' ','
-}
-
 function start_redfish {
     start_service $IRONIC_REDFISH_EMULATOR_SYSTEMD_SERVICE
 }
@@ -1317,10 +1240,6 @@ function install_ironic {
             install_virtualbmc
         fi
 
-        if is_deployed_by_snmp; then
-            install_virtualpdu
-        fi
-
         if is_deployed_by_redfish; then
             install_redfish
         fi
@@ -1431,7 +1350,6 @@ function cleanup_ironic {
     _cleanup_ironic_apache_additions
 
     cleanup_virtualbmc
-    cleanup_virtualpdu
     cleanup_redfish
     cleanup_switch_bridges
     # Remove the hook to disable log rotate
@@ -1926,11 +1844,6 @@ EOF
             start_virtualbmc
         fi
 
-        if is_deployed_by_snmp; then
-            configure_virtualpdu
-            start_virtualpdu
-        fi
-
         if is_deployed_by_redfish; then
             configure_redfish
             start_redfish
@@ -2006,10 +1919,6 @@ function configure_ironic_conductor {
 
     if [[ -n "${IRONIC_AUTODETECT_DEPLOY_INTERFACES}" ]]; then
         iniset $IRONIC_CONF_FILE DEFAULT autodetect_deploy_interfaces ${IRONIC_AUTODETECT_DEPLOY_INTERFACES}
-    fi
-
-    if is_deployed_by_snmp; then
-        iniset $IRONIC_CONF_FILE pxe enable_netboot_fallback True
     fi
 
     if is_ansible_deploy_enabled; then
@@ -2524,7 +2433,6 @@ function create_bridge_and_vms {
     fi
 
     local vbmc_port=$IRONIC_VBMC_PORT_RANGE_START
-    local pdu_outlet=$IRONIC_VPDU_PORT_RANGE_START
     local vm_name
     local vm_opts=""
     if [[ -n "$IRONIC_VM_EMULATOR" ]]; then
@@ -2553,7 +2461,7 @@ function create_bridge_and_vms {
         newgrp $LIBVIRT_GROUP <<SUBSHELL
             $IRONIC_SCRIPTS_DIR/create-node.sh -n $vm_name \
                 -c $IRONIC_VM_SPECS_CPU -m $IRONIC_VM_SPECS_RAM -d $IRONIC_VM_SPECS_DISK \
-                -a $IRONIC_HW_ARCH -b $IRONIC_VM_NETWORK_BRIDGE $vm_opts -p $vbmc_port -o $pdu_outlet \
+                -a $IRONIC_HW_ARCH -b $IRONIC_VM_NETWORK_BRIDGE $vm_opts -p $vbmc_port \
                 -i $IRONIC_VM_INTERFACE_COUNT -f $IRONIC_VM_SPECS_DISK_FORMAT -M $PUBLIC_BRIDGE_MTU $log_arg \
                 -v $IRONIC_VM_VOLUME_COUNT -P $LIBVIRT_STORAGE_POOL \
                 -t $IRONIC_MACHINE_TYPE -B $IRONIC_VM_BLOCK_SIZE \
@@ -2568,7 +2476,6 @@ SUBSHELL
         echo " ${bridge_mac} $IRONIC_VM_NETWORK_BRIDGE" >> $IRONIC_VM_MACS_CSV_FILE
 
         vbmc_port=$((vbmc_port+1))
-        pdu_outlet=$((pdu_outlet+1))
         # It is sometimes useful to dump out the VM configuration to validate it.
         sudo virsh dumpxml $vm_name
     done
@@ -3336,13 +3243,6 @@ function enroll_nodes {
                 --driver-info ipmi_address=${HOST_IP} \
                 --driver-info ipmi_username=admin \
                 --driver-info ipmi_password=password"
-        elif is_deployed_by_snmp; then
-            local deploy_options="\
-                --driver-info snmp_driver=${IRONIC_VPDU_SNMPDRIVER} \
-                --driver-info snmp_address=${HOST_IP} \
-                --driver-info snmp_port=${IRONIC_VPDU_LISTEN_PORT} \
-                --driver-info snmp_protocol=2c \
-                --driver-info snmp_community=${IRONIC_VPDU_COMMUNITY}"
         elif is_deployed_by_redfish; then
             local deploy_options="\
                 --driver-info redfish_address=http://${HOST_IP}:${IRONIC_REDFISH_EMULATOR_PORT} \
@@ -3393,10 +3293,6 @@ function enroll_nodes {
                 local vbmc_port
                 vbmc_port=$(echo $hardware_info | awk '{print $2}')
                 node_options+=" --driver-info ipmi_port=$vbmc_port"
-            elif is_deployed_by_snmp; then
-                local pdu_outlet
-                pdu_outlet=$(echo $hardware_info | awk '{print $3}')
-                node_options+=" --driver-info snmp_outlet=$pdu_outlet"
             elif is_deployed_by_redfish; then
                 node_options+=" --driver-info redfish_system_id=/redfish/v1/Systems/$node_name"
             fi
@@ -3406,11 +3302,11 @@ function enroll_nodes {
                 local switch_info
                 local switch_id
                 if [[ "${IRONIC_NETWORK_SIMULATOR:-ovs}" == "ovs" ]]; then
-                    switch_id=$(echo $hardware_info |awk '{print $4}')
+                    switch_id=$(echo $hardware_info |awk '{print $3}')
                     if [[ "$SUBNODE_ID" == "" ]]; then
-                        switch_info=$(echo $hardware_info |awk '{print $5}')
+                        switch_info=$(echo $hardware_info |awk '{print $4}')
                     else
-                        switch_info="sub$SUBNODE_ID$(echo $hardware_info |awk '{print $5}')"
+                        switch_info="sub$SUBNODE_ID$(echo $hardware_info |awk '{print $4}')"
                     fi
                 else
                     switch_id="00:00:00:00:00:00"

@@ -588,10 +588,6 @@ service_catalog:
   keyfile = None
   timeout = None
 
-snmp:
-  power_timeout = 10
-  reboot_delay = 0
-
 swift:
   auth_section = None
   auth_type = password

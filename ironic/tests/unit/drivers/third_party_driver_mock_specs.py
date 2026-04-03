@@ -24,12 +24,6 @@ PROLIANTUTILS_SPEC = (
     'utils',
 )
 
-# pywsnmp
-PYWSNMP_SPEC = (
-    'hlapi',
-    'error',
-)
-
 REDFISH_SPEC = (
     'redfish',
 )
