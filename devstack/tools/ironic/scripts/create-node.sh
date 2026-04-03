@@ -12,7 +12,7 @@ export PS4='+ ${BASH_SOURCE:-}:${FUNCNAME[0]:-}:L${LINENO:-}:   '
 # Keep track of the DevStack directory
 TOP_DIR=$(cd $(dirname "$0")/.. && pwd)
 
-while getopts "n:c:i:m:M:d:a:b:e:E:p:o:f:l:L:N:A:D:v:P:t:B:s:" arg; do
+while getopts "n:c:i:m:M:d:a:b:e:E:p:f:l:L:N:A:D:v:P:t:B:s:" arg; do
     case $arg in
         n) NAME=$OPTARG;;
         c) CPU=$OPTARG;;
@@ -27,7 +27,6 @@ while getopts "n:c:i:m:M:d:a:b:e:E:p:o:f:l:L:N:A:D:v:P:t:B:s:" arg; do
         e) EMULATOR=$OPTARG;;
         E) ENGINE=$OPTARG;;
         p) VBMC_PORT=$OPTARG;;
-        o) PDU_OUTLET=$OPTARG;;
         f) DISK_FORMAT=$OPTARG;;
         l) LOGDIR=$OPTARG;;
         L) UEFI_LOADER=$OPTARG;;
@@ -157,4 +156,4 @@ if [[ "${NET_SIMULATOR:-ovs}" == "ovs" ]]; then
 else
     VM_MAC=$(echo -n $(virsh domiflist $NAME |awk '/tap-/{print $5","$3}')|tr ' ' ';')
 fi
-echo -n "$VM_MAC $VBMC_PORT $PDU_OUTLET"
+echo -n "$VM_MAC $VBMC_PORT"

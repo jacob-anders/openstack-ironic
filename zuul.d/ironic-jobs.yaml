@@ -518,58 +518,6 @@
         s-object: True
         s-proxy: True
 
-# TODO(JayF): Tempest CI for SNMP is on its last legs; we are holding back
-# all openstack projects from updating pyasn1* packages due to our use of
-# pysnmp-lextudio instead of modern pysnmp. This job should be reworked to
-# no longer require SNMP and instead test the other items this job is for
-# and a mail sent to the list asking for action to keep it alive.
-- job:
-    name: ironic-tempest-ramdisk-bios-snmp-pxe
-    description: SNMP power, iPXE, OVN, no-op management and whole disk images.
-    parent: ironic-base
-    vars:
-      # NOTE(TheJulia): No reason to go much further than the network boot,
-      # Hence the use of the ramdisk test scenario as opposed to the others.
-      tempest_test_regex: test_ramdisk_iso
-      devstack_localrc:
-        IRONIC_ENABLED_HARDWARE_TYPES: snmp
-        IRONIC_DEPLOY_DRIVER: snmp
-        IRONIC_ENABLED_DEPLOY_INTERFACES: "ramdisk"
-        IRONIC_TEMPEST_WHOLE_DISK_IMAGE: True
-        IRONIC_VM_EPHEMERAL_DISK: 0
-        IRONIC_AUTOMATED_CLEAN_ENABLED: False
-        IRONIC_ALLOW_UNSUPPORTED_DRIVERS: True
-        # NOTE(TheJulia): Explicitly set scope enforcement to False until we
-        # remove the legacy policies.
-        IRONIC_ENFORCE_SCOPE: False
-        IRONIC_BOOT_MODE: bios
-        Q_AGENT: ovn
-        Q_ML2_TENANT_NETWORK_TYPE: vlan
-        Q_ML2_PLUGIN_MECHANISM_DRIVERS: ovn
-        ENABLE_CHASSIS_AS_GW: True
-        ML2_L3_PLUGIN: "ovn-router,trunk"
-        OVN_DBS_LOG_LEVEL: dbg
-      devstack_services:
-        atop: True
-        q-agt: False
-        q-dhcp: False
-        q-l3: False
-        ovn-controller: True
-        ovn-northd: True
-        q-ovn-metadata-agent: True
-        n-api: False
-        n-api-meta: False
-        n-cond: False
-        n-cpu: False
-        n-novnc: False
-        n-sch: False
-        nova: False
-        placement-api: False
-        s-account: False
-        s-container: False
-        s-object: False
-        s-proxy: False
-
 - job:
     name: ironic-tempest-ovn-uefi-ipmi-pxe
     description: IPMI power, UEFI, iPXE, OVN, image-based deployment. A

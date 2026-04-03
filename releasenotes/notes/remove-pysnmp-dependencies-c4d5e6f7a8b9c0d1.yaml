@@ -1,0 +1,7 @@
+---
+upgrade:
+  - |
+    The ``pysnmp-lextudio``, ``pyasn1``, and ``pyasn1-modules``
+    libraries have been removed from both driver and test
+    requirements, as they are no longer needed after the removal
+    of the SNMP and iRMC drivers.

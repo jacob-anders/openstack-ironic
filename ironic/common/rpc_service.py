@@ -13,16 +13,19 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
+import sys
 
 from oslo_config import cfg
 from oslo_log import log
 import oslo_messaging as messaging
 from oslo_service import service
+from oslo_service import threadgroup
 from oslo_utils import importutils
 
 from ironic.common import context
 from ironic.common.json_rpc import server as json_rpc
 from ironic.common import rpc
+from ironic.common import service as common_service
 from ironic.objects import base as objects_base
 
 LOG = log.getLogger(__name__)
@@ -41,6 +44,37 @@ class BaseRPCService(service.Service):
         self.rpcserver = None
         self._started = False
         self._failure = None
+
+    def __getstate__(self):
+        """Return picklable state for oslo.service's spawn mode.
+
+        oslo.service checks if the service is picklable to determine
+        whether to use the spawn or fork multiprocessing context. The
+        parent oslo.service.Service creates a ThreadGroup containing
+        threading objects that cannot be pickled.
+
+        ``_argv`` saves ``sys.argv`` from the parent process so that
+        ``__setstate__`` can re-configure CONF in a spawned child.
+        The full argv (including the program name at index 0) is needed
+        because ``prepare_command`` passes it to ``config.parse_args``
+        which strips ``argv[1:]`` internally.
+        """
+        state = self.__dict__.copy()
+        state.pop('tg', None)
+        state['_argv'] = sys.argv[:]
+        return state
+
+    def __setstate__(self, state):
+        argv = state.pop('_argv', None)
+        self.__dict__.update(state)
+        # Recreate ThreadGroup; start() will use it for managing threads
+        self.tg = threadgroup.ThreadGroup()
+        if argv is not None:
+            # In a spawned child process CONF starts as an empty singleton
+            # (fresh module import; spawn does not inherit parent memory).
+            # Re-run prepare_command with the parent's argv to restore all
+            # config values before start() is called.
+            common_service.prepare_command(argv)
 
     def start(self):
         self._failure = None

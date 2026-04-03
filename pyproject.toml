@@ -121,7 +121,6 @@ idrac-redfish = "ironic.drivers.modules.drac.power:DracRedfishPower"
 ilo = "ironic.drivers.modules.ilo.power:IloPower"
 ipmitool = "ironic.drivers.modules.ipmitool:IPMIPower"
 redfish = "ironic.drivers.modules.redfish.power:RedfishPower"
-snmp = "ironic.drivers.modules.snmp:SNMPPower"
 
 [project.entry-points."ironic.hardware.interfaces.raid"]
 agent = "ironic.drivers.modules.agent:AgentRAID"
@@ -159,7 +158,6 @@ intel-ipmi = "ironic.drivers.intel_ipmi:IntelIPMIHardware"
 ipmi = "ironic.drivers.ipmi:IPMIHardware"
 manual-management = "ironic.drivers.generic:ManualManagementHardware"
 redfish = "ironic.drivers.redfish:RedfishHardware"
-snmp = "ironic.drivers.snmp:SNMPHardware"
 
 [project.entry-points."ironic.inspection.hooks"]
 ramdisk-error = "ironic.drivers.modules.inspector.hooks.ramdisk_error:RamdiskErrorHook"

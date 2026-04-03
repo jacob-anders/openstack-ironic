@@ -1,0 +1,6 @@
+---
+upgrade:
+  - |
+    The SNMP hardware type and power interface has been removed.
+    Users of the SNMP power driver should migrate to a supported
+    hardware type, preferably ``redfish``.

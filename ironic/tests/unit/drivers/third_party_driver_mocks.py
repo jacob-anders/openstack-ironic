@@ -24,7 +24,6 @@ Any external library required by a third-party driver should be mocked here.
 Current list of mocked libraries:
 
 - proliantutils
-- pysnmp
 """
 
 import importlib
@@ -75,24 +74,6 @@ if not redfish:
 
 if 'ironic.drivers.redfish' in sys.modules:
     importlib.reload(sys.modules['ironic.drivers.modules.redfish'])
-
-# attempt to load the external 'pysnmp' library, which is required by
-# the optional drivers.modules.snmp module
-pysnmp = importutils.try_import("pysnmp")
-if not pysnmp:
-    pysnmp = mock.MagicMock(spec_set=mock_specs.PYWSNMP_SPEC)
-    sys.modules["pysnmp"] = pysnmp
-    sys.modules["pysnmp.hlapi"] = pysnmp.hlapi
-    sys.modules["pysnmp.error"] = pysnmp.error
-    pysnmp.error.PySnmpError = Exception
-    # Patch the RFC1902 integer class with a python int
-    pysnmp.hlapi.Integer = int
-
-
-# if anything has loaded the snmp driver yet, reload it now that the
-# external library has been mocked
-if 'ironic.drivers.modules.snmp' in sys.modules:
-    importlib.reload(sys.modules['ironic.drivers.modules.snmp'])
 
 
 # attempt to load the external 'networking_generic_switch' library, which is

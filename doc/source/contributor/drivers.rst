@@ -81,10 +81,6 @@ The minimum required interfaces are:
   * :py:class:`ironic.drivers.modules.ipmitool.IPMIManagement`
   * :py:class:`ironic.drivers.modules.redfish.management.RedfishManagement`
 
-  Some hardware types, such as ``snmp`` do not support out-of-band management.
-  They use the fake implementation in
-  :py:class:`ironic.drivers.modules.fake.FakeManagement` instead.
-
   Otherwise, you need to write your own implementation by subclassing
   :py:class:`ironic.drivers.base.ManagementInterface` and providing missing
   methods.

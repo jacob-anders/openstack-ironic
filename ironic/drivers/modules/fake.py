@@ -294,12 +294,7 @@ class FakeManagement(base.ManagementInterface):
         return {}
 
     def validate(self, task):
-        # TODO(dtantsur): remove when snmp hardware type no longer supports the
-        # fake management.
-        if task.node.driver == 'snmp':
-            LOG.warning('Using "fake" management with "snmp" hardware type '
-                        'is deprecated, use "noop" instead for node %s',
-                        task.node.uuid)
+        pass
 
     def get_supported_boot_devices(self, task):
         return [boot_devices.PXE]
