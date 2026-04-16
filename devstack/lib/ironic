@@ -3648,7 +3648,12 @@ function configure_iptables {
     if [[ "$Q_AGENT" != "ovn" ]]; then
         local pub_router_id
         pub_router_id=$(openstack --os-cloud $OS_CLOUD router show $Q_ROUTER_NAME -f value -c id)
-        if [[ ! -z "$pub_router_id" ]]; then
+        local qrouter
+        qrouter=$(sudo ip netns list | grep "$pub_router_id" | awk '{print $1;}')
+        # Before calling the next steps, we need to ensure that we have
+        # a router ID configured in terms of a network, and a qrouter
+        # namespace present in general. Otherwise we break on subnodes.
+        if [[ ! -z "$pub_router_id" ]] && [[ ! -z "$qrouter" ]]; then
             sudo ip netns exec qrouter-$pub_router_id iptables -A PREROUTING -t raw -p udp --dport 69 -j CT --helper tftp
             sudo ip netns exec qrouter-$pub_router_id ip6tables -A PREROUTING -t raw -p udp --dport 69 -j CT --helper tftp || true
         fi
