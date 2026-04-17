@@ -226,8 +226,7 @@ Driver support for Deployment with Secure Boot
 ----------------------------------------------
 
 Some hardware types support turning `UEFI secure boot`_ dynamically when
-deploying an instance. Currently these are :doc:`/admin/drivers/ilo`
-and :doc:`/admin/drivers/redfish`.
+deploying an instance. Currently this is :doc:`/admin/drivers/redfish`.
 
 Other drivers, such as :doc:`/admin/drivers/ipmitool`, may be able to be manually
 configured on the host, but as there is not standardization of Secure Boot

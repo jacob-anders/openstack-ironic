@@ -33,8 +33,7 @@ process.
     architectures that do not have BIOS support at all.
 
 The ``ipxe`` boot interface is used by default for many hardware types,
-including ``ipmi``. Some hardware types, notably ``ilo``, have
-their specific implementations of the PXE boot interface.
+including ``ipmi``.
 
 Additional configuration is required for this boot interface - see
 :doc:`/install/configure-pxe` for details.

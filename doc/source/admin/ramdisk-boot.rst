@@ -5,8 +5,8 @@ Ironic supports booting a user provided ramdisk or an ISO image (starting with
 the Victoria release) instead of deploying a node.
 Most commonly this is performed when an instance is booted via PXE, iPXE or
 Virtual Media, with the only local storage contents being those in memory.
-It is supported by ``pxe``, ``ipxe``, ``redfish-virtual-media`` and
-``ilo-virtual-media`` boot interfaces.
+It is supported by ``pxe``, ``ipxe`` and ``redfish-virtual-media``
+boot interfaces.
 
 Configuration
 -------------

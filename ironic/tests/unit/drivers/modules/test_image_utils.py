@@ -36,9 +36,6 @@ from ironic.tests.unit.objects import utils as obj_utils
 
 
 INFO_DICT = db_utils.get_test_redfish_info()
-INFO_DICT_ILO = db_utils.get_test_ilo_info()
-
-
 @mock.patch.object(image_service, 'get_image_service', autospec=True)
 @mock.patch.object(image_cache.ImageCache, 'clean_up', autospec=True)
 class ISOCacheTestCase(base.TestCase):
@@ -95,50 +92,6 @@ class RedfishImageHandlerTestCase(db_base.DbTestCase):
 
     def test_redfish_kernel_param_config(self):
         self.config(kernel_append_params="console=ttyS1", group='redfish')
-        img_handler_obj = image_utils.ImageHandler(self.node.driver)
-        actual_k_param = img_handler_obj.kernel_params
-        expected_k_param = "console=ttyS1"
-
-        self.assertEqual(expected_k_param, actual_k_param)
-
-
-class IloImageHandlerTestCase(db_base.DbTestCase):
-
-    def setUp(self):
-        super(IloImageHandlerTestCase, self).setUp()
-        self.config(enabled_hardware_types=['ilo'],
-                    enabled_power_interfaces=['ilo'],
-                    enabled_boot_interfaces=['ilo-virtual-media'],
-                    enabled_management_interfaces=['ilo'],
-                    enabled_inspect_interfaces=['ilo'],
-                    enabled_bios_interfaces=['ilo'])
-        self.node = obj_utils.create_test_node(
-            self.context, driver='ilo', driver_info=INFO_DICT_ILO)
-
-    def test_ilo_kernel_param_config(self):
-        self.config(kernel_append_params="console=ttyS1", group='ilo')
-        img_handler_obj = image_utils.ImageHandler(self.node.driver)
-        actual_k_param = img_handler_obj.kernel_params
-        expected_k_param = "console=ttyS1"
-
-        self.assertEqual(expected_k_param, actual_k_param)
-
-
-class Ilo5ImageHandlerTestCase(db_base.DbTestCase):
-
-    def setUp(self):
-        super(Ilo5ImageHandlerTestCase, self).setUp()
-        self.config(enabled_hardware_types=['ilo5'],
-                    enabled_power_interfaces=['ilo'],
-                    enabled_boot_interfaces=['ilo-virtual-media'],
-                    enabled_management_interfaces=['ilo5'],
-                    enabled_inspect_interfaces=['ilo'],
-                    enabled_bios_interfaces=['ilo'])
-        self.node = obj_utils.create_test_node(
-            self.context, driver='ilo5', driver_info=INFO_DICT_ILO)
-
-    def test_ilo5_kernel_param_config(self):
-        self.config(kernel_append_params="console=ttyS1", group='ilo')
         img_handler_obj = image_utils.ImageHandler(self.node.driver)
         actual_k_param = img_handler_obj.kernel_params
         expected_k_param = "console=ttyS1"

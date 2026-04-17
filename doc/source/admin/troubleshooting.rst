@@ -1538,13 +1538,6 @@ For example, with iDRAC drivers...
    The ``drac_username`` and ``drac_password`` parameters were used by WSMAN
    Dell iDRAC drivers. Newer versions of the drivers utilize Redfish natively.
 
-For example, with iLO drivers...
-
-.. code-block:: console
-
-    $ openstack baremetal node set --driver-info ilo_username=<new_user> --driver-info ilo_password=<new_pass> <node_uuid>
-    $ openstack baremetal node maintenance unset <node_uuid>
-
 .. note::
    Ironic generally does not manage or rotate the remote BMC credentials due
    to the risk of user lockout if the account is not for the specific use of

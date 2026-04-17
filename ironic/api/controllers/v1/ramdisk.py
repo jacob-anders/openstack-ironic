@@ -52,7 +52,6 @@ def config(token, node=None):
         # Out-of-band interfaces that don't need BMC detection
         skip_bmc_detect = mgmt_iface in (
             'redfish', 'idrac-redfish',
-            'ilo', 'ilo5', 'ilo6',
         )
         if skip_bmc_detect:
             LOG.debug('Skipping BMC detection for node %(node)s with '

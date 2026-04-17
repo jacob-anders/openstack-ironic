@@ -33,7 +33,6 @@ Hardware type support
 This feature is known to work with the following hardware types:
 
 * :doc:`Redfish </admin/drivers/redfish>` with ``redfish-virtual-media`` boot
-* :doc:`iLO </admin/drivers/ilo>` with ``ilo-virtual-media`` boot
 
 Configuring network data
 ------------------------

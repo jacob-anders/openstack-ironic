@@ -1,0 +1,8 @@
+---
+upgrade:
+  - |
+    The iLO and iLO5 hardware types and all their interfaces (bios,
+    boot, inspect, management, power, raid, vendor) have been removed.
+    Users of the iLO drivers should migrate to the ``redfish`` hardware
+    type, which provides equivalent functionality for HPE ProLiant
+    servers.

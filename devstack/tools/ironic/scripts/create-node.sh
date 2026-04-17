@@ -90,7 +90,7 @@ INTERFACE_COUNT=${INTERFACE_COUNT:-1}
 if [[ "${NET_SIMULATOR:-ovs}" == "ovs" ]]; then
     for int in $(seq 1 $INTERFACE_COUNT); do
         ovsif=ovs-${NAME}i${int}
-        sudo ovs-vsctl --no-wait add-port $BRIDGE $ovsif
+        sudo ovs-vsctl -- --if-exists del-port $BRIDGE $ovsif -- add-port $BRIDGE $ovsif
     done
 else
     for int in $(seq 1 $INTERFACE_COUNT); do

@@ -483,13 +483,10 @@ Hardware Manager.
 
 Out-of-band
 -----------
-Out-of-band are actions performed by your management controller, such as IPMI,
-iLO, or DRAC. Out-of-band steps will be performed by Ironic using a power or
-management interface. Which steps are performed depends on the hardware type
-and hardware itself.
-
-For Out-of-Band cleaning operations supported by iLO hardware types, refer to
-:ref:`ilo_node_cleaning`.
+Out-of-band are actions performed by your management controller, such as
+IPMI or DRAC. Out-of-band steps will be performed by Ironic using a
+power or management interface. Which steps are performed depends on the
+hardware type and hardware itself.
 
 FAQ
 ===
@@ -536,7 +533,6 @@ multiple configuration values:
   [conductor]
   clean_step_priority_override=deploy.erase_devices_metadata:123
   clean_step_priority_override=management.reset_bios_to_default:234
-  clean_step_priority_override=management.clean_priority_reset_ilo:345
 
 This parameter can be specified as many times as required to define priorities
 for several cleaning steps - the values will be combined.

@@ -605,14 +605,6 @@ class PasswordFileFailedToCreate(IronicException):
     _msg_fmt = _("Failed to create the password file. %(error)s")
 
 
-class IloOperationError(DriverOperationError):
-    _msg_fmt = _("%(operation)s failed, error: %(error)s")
-
-
-class IloOperationNotSupported(DriverOperationError):
-    _msg_fmt = _("%(operation)s not supported. error: %(error)s")
-
-
 class DracOperationError(DriverOperationError):
     _msg_fmt = _('DRAC operation failed. Reason: %(error)s')
 
@@ -822,6 +814,10 @@ class RunbookAlreadyExists(Conflict):
 
 class RunbookNotFound(NotFound):
     _msg_fmt = _("Runbook %(runbook)s could not be found.")
+
+
+class RunbookTraitNotFound(NotFound):
+    _msg_fmt = _("Runbook %(runbook_id)s doesn't have a trait '%(trait)s'")
 
 
 class InvalidRunbook(Invalid):

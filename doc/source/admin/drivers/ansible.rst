@@ -141,10 +141,8 @@ Bootstrap image requirements
 - python-requests (for ironic callback and streaming image download)
 - python-netifaces (for ironic callback)
 
-A set of scripts to build a suitable deploy ramdisk based on TinyCore Linux
-and ``tinyipa`` ramdisk, and an element for ``diskimage-builder`` can be found
-in ironic-staging-drivers_ project but will be eventually migrated to the new
-ironic-python-agent-builder_ project.
+An element for ``diskimage-builder`` to build a suitable deploy ramdisk
+can be found in the ironic-python-agent-builder_ project.
 
 Setting up your environment
 ===========================

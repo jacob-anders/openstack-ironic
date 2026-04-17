@@ -65,22 +65,6 @@ class ImageHandler(object):
                 "file_permission": CONF.redfish.file_permission,
                 "kernel_params": CONF.redfish.kernel_append_params
             },
-            "ilo5": {
-                "swift_enabled": not CONF.ilo.use_web_server_for_images,
-                "container": CONF.ilo.swift_ilo_container,
-                "timeout": CONF.ilo.swift_object_expiry_timeout,
-                "image_subdir": "ilo",
-                "file_permission": CONF.ilo.file_permission,
-                "kernel_params": CONF.ilo.kernel_append_params
-            },
-            "ilo": {
-                "swift_enabled": not CONF.ilo.use_web_server_for_images,
-                "container": CONF.ilo.swift_ilo_container,
-                "timeout": CONF.ilo.swift_object_expiry_timeout,
-                "image_subdir": "ilo",
-                "file_permission": CONF.ilo.file_permission,
-                "kernel_params": CONF.ilo.kernel_append_params
-            },
         }
 
         if driver not in _SWIFT_MAP:
@@ -376,9 +360,8 @@ def prepare_remote_image(task, image_url, file_name='boot.iso',
     """
     scheme = urlparse.urlparse(image_url).scheme.lower()
     if scheme == 'swift':
-        # FIXME(dtantsur): iLO supports swift: scheme. In the long run we
-        # should support it for all boot interfaces by using temporary
-        # URLs. Until it's done, return image_url as it is.
+        # FIXME(dtantsur): support swift: scheme for all boot interfaces
+        # by using temporary URLs. Until it's done, return as-is.
         return image_url
 
     if (download_source == 'swift'

@@ -37,7 +37,6 @@ _opts = [
     ('errors', ironic.conf.exception.opts),
     ('glance', ironic.conf.glance.list_opts()),
     ('healthcheck', ironic.conf.healthcheck.opts),
-    ('ilo', ironic.conf.ilo.opts),
     ('inspection_rules', ironic.conf.inspector.inspection_rule_opts),
     ('inspector', ironic.conf.inspector.opts),
     ('inventory', ironic.conf.inventory.opts),

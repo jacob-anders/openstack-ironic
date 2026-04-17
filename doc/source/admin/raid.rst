@@ -42,8 +42,7 @@ Build agent ramdisk which supports RAID configuration
 
 For doing in-band hardware RAID configuration, Ironic needs an agent ramdisk
 bundled with a hardware manager which supports RAID configuration for your
-hardware. For example, the :ref:`DIB_raid_support` should be used for HPE
-Proliant Servers.
+hardware.
 
 .. note::
     For in-band software RAID, the agent ramdisk does not need to be bundled
