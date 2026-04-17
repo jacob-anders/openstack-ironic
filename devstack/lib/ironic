@@ -36,10 +36,6 @@ set +o pipefail
 # Set up default directories
 GITDIR["python-ironicclient"]=$DEST/python-ironicclient
 
-GITREPO["pyghmi"]=${PYGHMI_REPO:-${GIT_BASE}/x/pyghmi}
-GITBRANCH["pyghmi"]=${PYGHMI_BRANCH:-master}
-GITDIR["pyghmi"]=$DEST/pyghmi
-
 GITREPO["virtualbmc"]=${VIRTUALBMC_REPO:-${GIT_BASE}/openstack/virtualbmc.git}
 GITBRANCH["virtualbmc"]=${VIRTUALBMC_BRANCH:-master}
 GITDIR["virtualbmc"]=$DEST/virtualbmc
@@ -325,15 +321,6 @@ IRONIC_DEFAULT_TRAITS=${IRONIC_DEFAULT_TRAITS:-CUSTOM_GOLD}
 # Whether to build the ramdisk or download a prebuilt one.
 IRONIC_BUILD_DEPLOY_RAMDISK=$(trueorfalse True IRONIC_BUILD_DEPLOY_RAMDISK)
 
-# Ironic IPA ramdisk type, supported types are:
-IRONIC_SUPPORTED_RAMDISK_TYPES_RE="^(tinyipa|dib)$"
-IRONIC_RAMDISK_TYPE=${IRONIC_RAMDISK_TYPE:-dib}
-
-# Confirm we have a supported ramdisk type or fail early.
-if [[ ! "$IRONIC_RAMDISK_TYPE" =~ $IRONIC_SUPPORTED_RAMDISK_TYPES_RE ]]; then
-    die $LINENO "Unrecognized IRONIC_RAMDISK_TYPE: $IRONIC_RAMDISK_TYPE. Expected 'tinyipa' or 'dib'"
-fi
-
 # Which deploy driver to use - valid choices right now
 # are ``ipmi`` and ``redfish``.
 #
@@ -374,18 +361,10 @@ IRONIC_DIB_RELEASE=${IRONIC_DIB_RAMDISK_RELEASE:-}
 if [[ "$IRONIC_BUILD_DEPLOY_RAMDISK" == "False" && \
         ! (-e "$IRONIC_DEPLOY_RAMDISK" && -e "$IRONIC_DEPLOY_KERNEL") && \
         (-z "$IRONIC_AGENT_KERNEL_URL" || -z "$IRONIC_AGENT_RAMDISK_URL") ]]; then
-    case $IRONIC_RAMDISK_TYPE in
-        tinyipa)
-            IRONIC_AGENT_KERNEL_FILE=tinyipa-${IPA_DOWNLOAD_BRANCH}.vmlinuz
-            IRONIC_AGENT_RAMDISK_FILE=tinyipa-${IPA_DOWNLOAD_BRANCH}.gz
-        ;;
-        dib)
-            IRONIC_AGENT_KERNEL_FILE=ipa-${IRONIC_DIB_RAMDISK_OS}-${IPA_DOWNLOAD_BRANCH}.kernel
-            IRONIC_AGENT_RAMDISK_FILE=ipa-${IRONIC_DIB_RAMDISK_OS}-${IPA_DOWNLOAD_BRANCH}.initramfs
-        ;;
-    esac
-    IRONIC_AGENT_KERNEL_URL=https://tarballs.openstack.org/${IPA_DOWNLOAD_SOURCE}/${IRONIC_RAMDISK_TYPE}/files/${IRONIC_AGENT_KERNEL_FILE}
-    IRONIC_AGENT_RAMDISK_URL=https://tarballs.openstack.org/${IPA_DOWNLOAD_SOURCE}/${IRONIC_RAMDISK_TYPE}/files/${IRONIC_AGENT_RAMDISK_FILE}
+    IRONIC_AGENT_KERNEL_FILE=ipa-${IRONIC_DIB_RAMDISK_OS}-${IPA_DOWNLOAD_BRANCH}.kernel
+    IRONIC_AGENT_RAMDISK_FILE=ipa-${IRONIC_DIB_RAMDISK_OS}-${IPA_DOWNLOAD_BRANCH}.initramfs
+    IRONIC_AGENT_KERNEL_URL=https://tarballs.openstack.org/${IPA_DOWNLOAD_SOURCE}/dib/files/${IRONIC_AGENT_KERNEL_FILE}
+    IRONIC_AGENT_RAMDISK_URL=https://tarballs.openstack.org/${IPA_DOWNLOAD_SOURCE}/dib/files/${IRONIC_AGENT_RAMDISK_FILE}
 fi
 
 # This refers the options for disk-image-create and the platform on which
@@ -868,21 +847,13 @@ IRONIC_NEUTRON_AGENT_REPORT_STATE_ATTEMPTS=$(( $IRONIC_NEUTRON_AGENT_REPORT_STAT
 
 # Username to use by Ansible to access ramdisk,
 # to be set as '[ansible]/default_username' option.
-# If not set here (default), will be set to 'tc' for TinyIPA ramdisk,
-# for other ramdisks it must be either provided here,
-# or set manually per-node via ironic API
 IRONIC_ANSIBLE_SSH_USER=${IRONIC_ANSIBLE_SSH_USER:-}
 # Path to the private SSH key to use by ansible deploy interface
 # that will be set as '[ansible]/default_key_file' option in config.
 # The public key path is assumed to be ${IRONIC_ANSIBLE_SSH_KEY}.pub
 # and will be used when rebuilding the image to include this public key
 # in ~/.ssh/authorized_keys of a $IRONIC_ANSIBLE_SSH_USER in the ramdisk.
-# Only the TinyIPA ramdisks are currently supported for such rebuild.
-# For TinyIPA ramdisks, if the specified file doesn't exist, it will
-# be created and will contain a new RSA passwordless key. We assume
-# that the directories in the path to this file exist and are
-# writable.
-# For other ramdisk types, make sure the corresponding public key is baked into
+# CRITICAL - Make sure the corresponding public key is baked into
 # the ramdisk to be used by DevStack and provide the path to the private key here,
 # or set it manually per node via ironic API.
 # FIXME(pas-ha) auto-generated keys currently won't work for multi-node
@@ -973,11 +944,6 @@ function is_deployed_by_ipmi {
     return 1
 }
 
-function is_deployed_by_ilo {
-    [[ "${IRONIC_DEPLOY_DRIVER}" == ilo ]] && return 0
-    return 1
-}
-
 function is_deployed_by_drac {
     [[ "${IRONIC_DEPLOY_DRIVER}" == idrac ]] && return 0
     return 1
@@ -1000,13 +966,6 @@ function is_ansible_deploy_enabled {
 
 function is_redfish_enabled {
     [[ -z "${IRONIC_ENABLED_HARDWARE_TYPES%%*redfish*}" ]] && return 0
-    return 1
-}
-
-function is_ansible_with_tinyipa {
-    # NOTE(pas-ha) we support rebuilding the ramdisk to include (generated) SSH keys
-    # as needed for ansible deploy interface only for TinyIPA ramdisks for now
-    is_ansible_deploy_enabled && [[ "$IRONIC_RAMDISK_TYPE" == "tinyipa" ]] && return 0
     return 1
 }
 
@@ -1922,31 +1881,10 @@ function configure_ironic_conductor {
     fi
 
     if is_ansible_deploy_enabled; then
-        if is_ansible_with_tinyipa; then
-            if [[ ! -f $IRONIC_ANSIBLE_SSH_KEY ]]; then
-                # generate ssh key if absent as we will rebuild the ramdisk
-                # TODO(pas-ha) make it work for multi-node DevStack:
-                # - generate outside of this script
-                # - pass path in as $IRONIC_ANSIBLE_SSH_KEY
-                # - distribute private key to subnodes under the same path
-                # Similar to what we do for n-g-s, may be even reuse its key.
-                ssh-keygen -t rsa -N '' -f $IRONIC_ANSIBLE_SSH_KEY
-                chmod 600 $IRONIC_ANSIBLE_SSH_KEY
-            fi
-            if [[ -z $IRONIC_ANSIBLE_SSH_USER ]]; then
-                # we definitely know the default username to use for TinyIPA image
-                IRONIC_ANSIBLE_SSH_USER='devuser'
-            fi
-            # (rpittau) most recent tinyipa uses python3 natively so we need to change
-            # the default ansible python interpreter.
-            iniset $IRONIC_CONF_FILE ansible default_python_interpreter /usr/bin/python3
-        fi
         iniset $IRONIC_CONF_FILE ansible default_key_file $IRONIC_ANSIBLE_SSH_KEY
         if [[ -n $IRONIC_ANSIBLE_SSH_USER ]]; then
             iniset $IRONIC_CONF_FILE ansible default_username $IRONIC_ANSIBLE_SSH_USER
         fi
-        # TODO(pas-ha) find a way to include the CA bundle into the image during rebuild,
-        # at least for the tinyipa ramdisk
         iniset $IRONIC_CONF_FILE ansible image_store_insecure "True"
     fi
 
@@ -2574,7 +2512,7 @@ SUBSHELL
     PUBLIC_SUBNET_ID=$(openstack router show $Q_ROUTER_NAME -c external_gateway_info -f json | jq -r .external_gateway_info.external_fixed_ips[0].subnet_id)
     # Add a route for dhcp-less return path traffic
     PUBLIC_SUBNET_DEV=$(ip -j route get $PUBLIC_SUBNET_IP | jq -r '.[0].dev')
-    sudo ip route add 10.0.6.0/24 via $PUBLIC_SUBNET_IP dev $PUBLIC_SUBNET_DEV onlink
+    sudo ip route replace 10.0.6.0/24 via $PUBLIC_SUBNET_IP dev $PUBLIC_SUBNET_DEV onlink
 
     if [[ "${IRONIC_NETWORK_SIMULATOR:-ovs}" != "ovs" ]]; then
         create_network_simulator
@@ -3345,13 +3283,6 @@ function enroll_nodes {
                 node_options+=" --driver-info ipmi_address=$bmc_address \
                     --driver-info ipmi_password=$bmc_passwd \
                     --driver-info ipmi_username=$bmc_username"
-            elif is_deployed_by_ilo; then
-                node_options+=" --driver-info ilo_address=$bmc_address \
-                    --driver-info ilo_password=$bmc_passwd \
-                    --driver-info ilo_username=$bmc_username"
-                if [[ $IRONIC_ENABLED_BOOT_INTERFACES == *"ilo-virtual-media"* ]]; then
-                    node_options+=" --driver-info deploy_iso=$IRONIC_DEPLOY_ISO_ID"
-                fi
             elif is_deployed_by_drac; then
                 node_options+=" --driver-info drac_address=$bmc_address \
                     --driver-info drac_password=$bmc_passwd \
@@ -3714,11 +3645,18 @@ function configure_iptables {
     fi
 
     # (rpittau) workaround to allow TFTP traffic on ubuntu bionic with conntrack helper disabled
-    local qrouter
-    qrouter=$(sudo ip netns list | grep qrouter | awk '{print $1;}')
-    if [[ ! -z "$qrouter" ]]; then
-        sudo ip netns exec $qrouter iptables -A PREROUTING -t raw -p udp --dport 69 -j CT --helper tftp
-        sudo ip netns exec $qrouter ip6tables -A PREROUTING -t raw -p udp --dport 69 -j CT --helper tftp || true
+    if [[ "$Q_AGENT" != "ovn" ]]; then
+        local pub_router_id
+        pub_router_id=$(openstack --os-cloud $OS_CLOUD router show $Q_ROUTER_NAME -f value -c id)
+        local qrouter
+        qrouter=$(sudo ip netns list | grep "$pub_router_id" | awk '{print $1;}')
+        # Before calling the next steps, we need to ensure that we have
+        # a router ID configured in terms of a network, and a qrouter
+        # namespace present in general. Otherwise we break on subnodes.
+        if [[ ! -z "$pub_router_id" ]] && [[ ! -z "$qrouter" ]]; then
+            sudo ip netns exec qrouter-$pub_router_id iptables -A PREROUTING -t raw -p udp --dport 69 -j CT --helper tftp
+            sudo ip netns exec qrouter-$pub_router_id ip6tables -A PREROUTING -t raw -p udp --dport 69 -j CT --helper tftp || true
+        fi
     fi
 }
 
@@ -3783,56 +3721,11 @@ function build_ipa_ramdisk {
     local kernel_path=$1
     local ramdisk_path=$2
     local iso_path=$3
-    case $IRONIC_RAMDISK_TYPE in
-        'tinyipa')
-            build_tinyipa_ramdisk $kernel_path $ramdisk_path $iso_path
-            ;;
-        'dib')
-            build_ipa_dib_ramdisk $kernel_path $ramdisk_path $iso_path
-            ;;
-        *)
-            die $LINENO "Unrecognised IRONIC_RAMDISK_TYPE: $IRONIC_RAMDISK_TYPE. Expected either of 'dib' or 'tinyipa'."
-            ;;
-    esac
+    build_ipa_dib_ramdisk $kernel_path $ramdisk_path $iso_path
 }
 
 function setup_ipa_builder {
     git_clone $IRONIC_PYTHON_AGENT_BUILDER_REPO $IRONIC_PYTHON_AGENT_BUILDER_DIR $IRONIC_PYTHON_AGENT_BUILDER_BRANCH
-}
-
-function build_tinyipa_ramdisk {
-    echo "Building ironic-python-agent deploy ramdisk"
-    local kernel_path=$1
-    local ramdisk_path=$2
-    local iso_path=$3
-    cd $IRONIC_PYTHON_AGENT_BUILDER_DIR/tinyipa
-    export BUILD_AND_INSTALL_TINYIPA=true
-    if is_ansible_deploy_enabled; then
-        export AUTHORIZE_SSH=true
-        export SSH_PUBLIC_KEY=$IRONIC_ANSIBLE_SSH_KEY.pub
-    fi
-    make
-    cp tinyipa.gz $ramdisk_path
-    cp tinyipa.vmlinuz $kernel_path
-    if is_deploy_iso_required; then
-        make iso
-        cp tinyipa.iso $iso_path
-    fi
-    make clean
-    cd -
-}
-
-function rebuild_tinyipa_for_ansible {
-    local ansible_tinyipa_ramdisk_name
-    pushd $IRONIC_PYTHON_AGENT_BUILDER_DIR/tinyipa
-    export TINYIPA_RAMDISK_FILE=$IRONIC_DEPLOY_RAMDISK
-    export SSH_PUBLIC_KEY=$IRONIC_ANSIBLE_SSH_KEY.pub
-    make addssh
-    ansible_tinyipa_ramdisk_name="ansible-$(basename $IRONIC_DEPLOY_RAMDISK)"
-    mv $ansible_tinyipa_ramdisk_name $TOP_DIR/files
-    make clean
-    popd
-    IRONIC_DEPLOY_RAMDISK=$TOP_DIR/files/$ansible_tinyipa_ramdisk_name
 }
 
 # install_diskimage_builder() - Collect source and prepare or install from pip
@@ -4092,11 +3985,6 @@ function upload_baremetal_ironic_deploy {
                 else
                     download_with_retry "$IRONIC_AGENT_RAMDISK_URL" $IRONIC_DEPLOY_RAMDISK
                 fi
-                if is_ansible_with_tinyipa; then
-                    # NOTE(pas-ha) if using ansible-deploy and tinyipa,
-                    # this will rebuild ramdisk and override $IRONIC_DEPLOY_RAMDISK
-                    rebuild_tinyipa_for_ansible
-                fi
             fi
         fi
 
@@ -4130,9 +4018,6 @@ function upload_baremetal_ironic_deploy {
             die_if_not_set $LINENO IRONIC_DEPLOY_ISO_ID "Failed to load deploy iso into glance"
         fi
     else
-        if is_ansible_with_tinyipa; then
-            ironic_deploy_ramdisk_name="ansible-$ironic_deploy_ramdisk_name"
-        fi
         IRONIC_DEPLOY_KERNEL_ID=$(openstack --os-cloud $OS_CLOUD image show $ironic_deploy_kernel_name -f value -c id)
         IRONIC_DEPLOY_RAMDISK_ID=$(openstack --os-cloud $OS_CLOUD image show $ironic_deploy_ramdisk_name -f value -c id)
     fi

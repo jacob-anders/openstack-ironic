@@ -987,7 +987,6 @@
       tempest_test_regex: BaremetalSingleTenant
       devstack_localrc:
         IRONIC_AGENT_IMAGE_DOWNLOAD_SOURCE: http
-        IRONIC_RAMDISK_TYPE: dib
         IRONIC_DIB_RAMDISK_OS: centos9
         IPV6_ENABLED: True
         IRONIC_IP_VERSION: 6
@@ -1062,7 +1061,6 @@
       # be explicit. This is the best place to wire it in.
       tempest_test_regex: ironic_standalone.test_advanced_ops
       devstack_localrc:
-        IRONIC_RAMDISK_TYPE: dib
         # known working path
         # The options below are known working, and leverage simple-init element
         # (glean) to perform initial configuration. Ironic's dib element

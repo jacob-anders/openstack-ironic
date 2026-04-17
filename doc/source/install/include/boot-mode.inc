@@ -3,8 +3,8 @@
 Boot mode support
 -----------------
 
-Some of the bare metal hardware types (namely, ``redfish``, ``ilo`` and
-generic ``ipmi``) support setting  boot mode (Legacy BIOS or UEFI).
+Some of the bare metal hardware types (namely, ``redfish`` and
+generic ``ipmi``) support setting boot mode (Legacy BIOS or UEFI).
 
 .. note::
 

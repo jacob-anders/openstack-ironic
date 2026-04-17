@@ -127,9 +127,7 @@ characteristics of hardware itself. However, keep in mind that
 
 * The machines should have enough RAM to fit the deployment/cleaning ramdisk
   to run. The minimum varies greatly depending on the way the ramdisk was
-  built. For example, *tinyipa*, the TinyCoreLinux-based ramdisk used in the
-  CI, only needs 400 MiB of RAM, while ramdisks built by *diskimage-builder*
-  may require 3 GiB or more.
+  built. Ramdisks built by *diskimage-builder* typically require 3 GiB or more.
 
 Image types
 -----------

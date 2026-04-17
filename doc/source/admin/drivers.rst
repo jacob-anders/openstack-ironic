@@ -25,7 +25,6 @@ Hardware Types
   :maxdepth: 1
 
   drivers/idrac
-  drivers/ilo
   drivers/intel-ipmi
   drivers/ipmitool
   drivers/redfish

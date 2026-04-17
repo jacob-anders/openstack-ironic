@@ -6,7 +6,7 @@ Capabilities discovery
 
 This is an incomplete list of capabilities we want to discover during
 inspection. The exact support is hardware and hardware type specific though,
-the most complete list is provided by the iLO :ref:`ilo-inspection`.
+the exact support depends on the hardware type in use.
 
 ``secure_boot`` (``true`` or ``false``)
     whether secure boot is supported for the node

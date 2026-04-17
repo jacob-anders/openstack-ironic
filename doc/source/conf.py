@@ -155,6 +155,11 @@ suppress_warnings = ['app.add_directive', 'autodoc']
 # Sphinx are currently 'default' and 'sphinxdoc'.
 html_theme = 'openstackdocs'
 
+#Enable project-scoped search in the sidebar
+html_theme_options = {
+    'sidebar_search': True,
+}
+
 # Output file base name for HTML help builder.
 htmlhelp_basename = 'Ironicdoc'
 

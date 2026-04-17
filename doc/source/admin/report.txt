@@ -368,23 +368,6 @@ glance:
   swift_temp_url_key = ***
   timeout = None
 
-ilo:
-  ca_file = None
-  clean_priority_clear_secure_boot_keys = 0
-  clean_priority_erase_devices = None
-  clean_priority_reset_bios_to_default = 10
-  clean_priority_reset_ilo = 0
-  clean_priority_reset_ilo_credential = 30
-  clean_priority_reset_secure_boot_keys_to_default = 20
-  client_port = 443
-  client_timeout = 60
-  default_boot_mode = auto
-  power_retry = 6
-  power_wait = 2
-  swift_ilo_container = ironic_ilo_container
-  swift_object_expiry_timeout = 900
-  use_web_server_for_images = False
-
 inspector:
   auth_section = None
   auth_type = password

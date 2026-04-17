@@ -8,7 +8,7 @@ The Bare Metal service delegates actual hardware management to **drivers**.
 *Drivers*, also called *hardware types*, consist of *hardware interfaces*:
 sets of functionality dealing with some aspect of bare metal provisioning
 in a vendor-specific way. There are generic **hardware types** (eg.
-``redfish`` and ``ipmi``), and vendor-specific one (eg. ``ilo``).
+``redfish`` and ``ipmi``), and vendor-specific ones.
 
 .. note::
    The terminologies *driver*, *dynamic driver*, and *hardware type*
@@ -64,8 +64,8 @@ boot
     .. code-block:: ini
 
         [DEFAULT]
-        enabled_hardware_types = ipmi,ilo
-        enabled_boot_interfaces = pxe,ilo-virtual-media
+        enabled_hardware_types = ipmi
+        enabled_boot_interfaces = pxe
 
     Boot interfaces with ``pxe`` in their name require :doc:`configure-pxe`.
     There are also a few hardware-specific boot interfaces - see
@@ -97,8 +97,8 @@ inspect
     .. code-block:: ini
 
         [DEFAULT]
-        enabled_hardware_types = ipmi,ilo
-        enabled_inspect_interfaces = ilo,agent
+        enabled_hardware_types = ipmi
+        enabled_inspect_interfaces = agent
 
     See :doc:`/admin/inspection` for more details.
 management
@@ -110,8 +110,8 @@ management
     .. code-block:: ini
 
         [DEFAULT]
-        enabled_hardware_types = ipmi,redfish,ilo
-        enabled_management_interfaces = ipmitool,redfish,ilo
+        enabled_hardware_types = ipmi,redfish
+        enabled_management_interfaces = ipmitool,redfish
 
     Using ``ipmitool`` requires :doc:`configure-ipmi`. See
     :doc:`/admin/drivers` for the required configuration of each driver.
@@ -126,8 +126,8 @@ power
     .. code-block:: ini
 
         [DEFAULT]
-        enabled_hardware_types = ipmi,redfish,ilo
-        enabled_power_interfaces = ipmitool,redfish,ilo
+        enabled_hardware_types = ipmi,redfish
+        enabled_power_interfaces = ipmitool,redfish
 
     Using ``ipmitool`` requires :doc:`configure-ipmi`. See
     :doc:`/admin/drivers` for the required configuration of each driver.
@@ -139,7 +139,7 @@ raid
     .. code-block:: ini
 
         [DEFAULT]
-        enabled_hardware_types = ipmi,redfish,ilo
+        enabled_hardware_types = ipmi,redfish
         enabled_raid_interfaces = agent,no-raid
 storage
     manages the interaction with a remote storage subsystem, such as the
@@ -167,7 +167,7 @@ vendor
     .. code-block:: ini
 
         [DEFAULT]
-        enabled_hardware_types = ipmi,redfish,ilo
+        enabled_hardware_types = ipmi,redfish
         enabled_vendor_interfaces = ipmitool,no-vendor
 
 Here is a complete configuration example, enabling two generic protocols,

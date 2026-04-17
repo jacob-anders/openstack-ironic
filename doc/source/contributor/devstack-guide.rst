@@ -108,7 +108,6 @@ hardware type by default::
     DEFAULT_INSTANCE_TYPE=baremetal
 
     IRONIC_RPC_TRANSPORT=json-rpc
-    IRONIC_RAMDISK_TYPE=tinyipa
 
     # Enable additional hardware types, if needed.
     #IRONIC_ENABLED_HARDWARE_TYPES=ipmi,fake-hardware

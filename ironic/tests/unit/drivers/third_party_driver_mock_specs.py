@@ -17,13 +17,6 @@
 """This module provides mock 'specs' for third party modules that can be used
 when needing to mock those third party modules"""
 
-# proliantutils
-PROLIANTUTILS_SPEC = (
-    'exception',
-    'ilo',
-    'utils',
-)
-
 REDFISH_SPEC = (
     'redfish',
 )

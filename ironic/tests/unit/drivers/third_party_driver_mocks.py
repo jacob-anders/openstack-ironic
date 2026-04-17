@@ -23,7 +23,6 @@ respective external libraries' actually being present.
 Any external library required by a third-party driver should be mocked here.
 Current list of mocked libraries:
 
-- proliantutils
 """
 
 import importlib
@@ -43,29 +42,6 @@ from ironic.tests.unit.drivers import third_party_driver_mock_specs \
 ipmitool.TIMING_SUPPORT = False
 ipmitool.DUAL_BRIDGE_SUPPORT = False
 ipmitool.SINGLE_BRIDGE_SUPPORT = False
-
-proliantutils = importutils.try_import('proliantutils')
-if not proliantutils:
-    proliantutils = mock.MagicMock(spec_set=mock_specs.PROLIANTUTILS_SPEC)
-    sys.modules['proliantutils'] = proliantutils
-    sys.modules['proliantutils.ilo'] = proliantutils.ilo
-    sys.modules['proliantutils.ilo.client'] = proliantutils.ilo.client
-    sys.modules['proliantutils.exception'] = proliantutils.exception
-    sys.modules['proliantutils.utils'] = proliantutils.utils
-    proliantutils.utils.process_firmware_image = mock.MagicMock()
-    proliantutils.exception.IloError = type('IloError', (Exception,), {})
-    proliantutils.exception.IloLogicalDriveNotFoundError = (
-        type('IloLogicalDriveNotFoundError', (Exception,), {}))
-    command_exception = type('IloCommandNotSupportedError', (Exception,), {})
-    proliantutils.exception.IloCommandNotSupportedError = command_exception
-    proliantutils.exception.IloCommandNotSupportedInBiosError = type(
-        'IloCommandNotSupportedInBiosError', (Exception,), {})
-    proliantutils.exception.InvalidInputError = type(
-        'InvalidInputError', (Exception,), {})
-    proliantutils.exception.ImageExtractionFailed = type(
-        'ImageExtractionFailed', (Exception,), {})
-    if 'ironic.drivers.ilo' in sys.modules:
-        importlib.reload(sys.modules['ironic.drivers.ilo'])
 
 redfish = importutils.try_import('redfish')
 if not redfish:

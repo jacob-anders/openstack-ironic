@@ -555,3 +555,21 @@ class DbConductorTestCase(base.DbTestCase):
         interfaces = self.dbapi.list_conductor_hardware_interfaces(
             conductor['id'])
         self.assertEqual([], interfaces)
+
+    def test_delete_conductor_clears_conductor_affinity(self):
+        conductor = self.dbapi.register_conductor(
+            {'hostname': 'test-conductor',
+             'drivers': ['fake'],
+             'conductor_group': 'test-group'})
+
+        node = self.dbapi.create_node({
+            'uuid': 'test-node-uuid',
+            'driver': 'fake',
+            'conductor_affinity': conductor['id']
+        })
+
+        self.assertEqual(conductor['id'], node.conductor_affinity)
+        self.dbapi.delete_conductor('test-conductor')
+
+        node = self.dbapi.get_node_by_uuid('test-node-uuid')
+        self.assertIsNone(node.conductor_affinity)

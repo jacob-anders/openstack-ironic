@@ -931,11 +931,11 @@ class TrySetBootDeviceTestCase(db_base.DbTestCase):
     @mock.patch.object(manager_utils, 'node_set_boot_device', autospec=True)
     def test_try_set_boot_device_some_other_exception(
             self, node_set_boot_device_mock):
-        exc = exception.IloOperationError(operation="qwe", error="error")
+        exc = exception.RedfishError(error="error")
         node_set_boot_device_mock.side_effect = exc
         with task_manager.acquire(self.context, self.node.uuid,
                                   shared=False) as task:
-            self.assertRaises(exception.IloOperationError,
+            self.assertRaises(exception.RedfishError,
                               utils.try_set_boot_device,
                               task, boot_devices.DISK, persistent=True)
             node_set_boot_device_mock.assert_called_once_with(

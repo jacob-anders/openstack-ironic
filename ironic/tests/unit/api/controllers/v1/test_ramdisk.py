@@ -240,20 +240,6 @@ class TestLookup(test_api_base.BaseApiTest):
         self.assertEqual(self.node.uuid, data['node']['uuid'])
         self._check_config(data, skip_bmc_detect=True)
 
-    def test_bmc_detect_skip_for_ilo_variants(self):
-        """Test BMC detection skip is enabled for iLO variants."""
-        for ilo_interface in ['ilo', 'ilo5', 'ilo6']:
-            self.node.management_interface = ilo_interface
-            self.node.save()
-            self._set_secret_mock(self.node, 'test-token')
-
-            data = self.get_json(
-                '/lookup?node_uuid=%s' % self.node.uuid,
-                headers={api_base.Version.string: str(api_v1.max_version())})
-
-            self.assertEqual(self.node.uuid, data['node']['uuid'])
-            self._check_config(data, skip_bmc_detect=True)
-
     def test_bmc_detect_skip_for_idrac_redfish(self):
         """Test BMC detection skip is enabled for iDRAC Redfish."""
         self.node.management_interface = 'idrac-redfish'

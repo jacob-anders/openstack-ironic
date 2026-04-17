@@ -33,8 +33,8 @@ Found a bug in one of our projects? Please see :doc:`/contributor/bugs`.
 
 Would like to engage with the community? See :doc:`/contributor/community`.
 
-Installation Guide
-==================
+Ironic Installation Guide
+=========================
 
 .. toctree::
   :maxdepth: 2
@@ -43,8 +43,8 @@ Installation Guide
   install/standalone
   admin/upgrade-guide
 
-User Guide
-==========
+Ironic User Guide
+=================
 
 .. toctree::
   :maxdepth: 3
