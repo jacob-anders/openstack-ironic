@@ -16,6 +16,8 @@
 Abstract base classes for drivers.
 """
 
+from __future__ import annotations
+
 import abc
 import collections
 import copy
@@ -23,6 +25,9 @@ import functools
 import inspect
 import json
 import os
+from typing import Any
+from typing import TYPE_CHECKING
+from typing import TypedDict
 
 from oslo_log import log as logging
 
@@ -30,6 +35,9 @@ from ironic.common import exception
 from ironic.common.i18n import _
 from ironic.common import raid
 from ironic.common import states
+
+if TYPE_CHECKING:
+    from ironic.conductor.task_manager import TaskManager
 
 LOG = logging.getLogger(__name__)
 
@@ -194,7 +202,48 @@ ALL_INTERFACES = set(BareDriver().all_interfaces)
 """Constant holding all known interfaces."""
 
 
-class BaseInterface(object, metaclass=abc.ABCMeta):
+# TODO(cardoe): simplify this with Required and NoRequired when we
+# have Python 3.11 as our minimum version
+class _BaseStepRequired(TypedDict):
+    step: str
+    priority: int
+    interface: str
+
+
+class BaseStep(_BaseStepRequired, total=False):
+    args: dict[str, Any]
+
+
+class _ArgInfoRequired(TypedDict):
+    description: str
+
+
+class ArgInfo(_ArgInfoRequired, total=False):
+    required: bool
+
+
+class _StepWithAbortAndArgsinfo(TypedDict):
+    abortable: bool
+    argsinfo: dict[str, ArgInfo] | None
+
+
+class CleanStep(BaseStep, _StepWithAbortAndArgsinfo):
+    requires_ramdisk: bool
+
+
+class DeployStep(BaseStep, _StepWithAbortAndArgsinfo):
+    pass
+
+
+class VerifyStep(BaseStep):
+    pass
+
+
+class ServiceStep(BaseStep, _StepWithAbortAndArgsinfo):
+    requires_ramdisk: bool
+
+
+class BaseInterface(abc.ABC):
     """A base interface implementing common functions for Driver Interfaces."""
 
     supported = True
@@ -207,15 +256,21 @@ class BaseInterface(object, metaclass=abc.ABCMeta):
     interface_type = 'base'
     """Interface type, used for clean steps and logging."""
 
+    clean_steps: list[CleanStep]
+    deploy_steps: list[DeployStep]
+    verify_steps: list[VerifyStep]
+    service_steps: list[ServiceStep]
+
     @abc.abstractmethod
-    def get_properties(self):
+    def get_properties(self) -> dict[str, Any]:
         """Return the properties of the interface.
 
         :returns: dictionary of <property name>:<property description> entries.
         """
+        ...
 
     @abc.abstractmethod
-    def validate(self, task):
+    def validate(self, task: TaskManager):
         """Validate the driver-specific Node deployment info.
 
         This method validates whether the 'driver_info' and/or 'instance_info'
@@ -229,6 +284,7 @@ class BaseInterface(object, metaclass=abc.ABCMeta):
         :raises: InvalidParameterValue on malformed parameter(s)
         :raises: MissingParameterValue on missing parameter(s)
         """
+        ...
 
     def __new__(cls, *args, **kwargs):
         # Get the list of clean steps, deploy steps and verify steps when the
@@ -304,7 +360,7 @@ class BaseInterface(object, metaclass=abc.ABCMeta):
 
         return instance
 
-    def _execute_step(self, task, step):
+    def _execute_step(self, task: TaskManager, step: BaseStep):
         """Execute the step on task.node.
 
         A step must take a single positional argument: a TaskManager
@@ -319,7 +375,7 @@ class BaseInterface(object, metaclass=abc.ABCMeta):
         else:
             return getattr(self, step['step'])(task)
 
-    def get_clean_steps(self, task):
+    def get_clean_steps(self, task: TaskManager):
         """Get a list of (enabled and disabled) clean steps for the interface.
 
         This function will return all clean steps (both enabled and disabled)
@@ -335,7 +391,7 @@ class BaseInterface(object, metaclass=abc.ABCMeta):
         """
         return self.clean_steps
 
-    def execute_clean_step(self, task, step):
+    def execute_clean_step(self, task: TaskManager, step: CleanStep):
         """Execute the clean step on task.node.
 
         A clean step must take a single positional argument: a TaskManager
@@ -357,7 +413,7 @@ class BaseInterface(object, metaclass=abc.ABCMeta):
         """
         return self._execute_step(task, step)
 
-    def get_deploy_steps(self, task):
+    def get_deploy_steps(self, task: TaskManager):
         """Get a list of (enabled and disabled) deploy steps for the interface.
 
         This function will return all deploy steps (both enabled and disabled)
@@ -373,7 +429,7 @@ class BaseInterface(object, metaclass=abc.ABCMeta):
         """
         return self.deploy_steps
 
-    def execute_deploy_step(self, task, step):
+    def execute_deploy_step(self, task: TaskManager, step: DeployStep):
         """Execute the deploy step on task.node.
 
         A deploy step must take a single positional argument: a TaskManager
@@ -396,7 +452,7 @@ class BaseInterface(object, metaclass=abc.ABCMeta):
         """
         return self._execute_step(task, step)
 
-    def get_verify_steps(self, task):
+    def get_verify_steps(self, task: TaskManager):
         """Get a list of (enabled and disabled) verify steps for the interface.
 
         This function will return all verify steps (both enabled and disabled)
@@ -412,7 +468,7 @@ class BaseInterface(object, metaclass=abc.ABCMeta):
         """
         return self.verify_steps
 
-    def execute_verify_step(self, task, step):
+    def execute_verify_step(self, task: TaskManager, step: VerifyStep):
         """Execute the verify step on task.node.
 
         A verify step must take a single positional argument: a TaskManager
@@ -425,7 +481,7 @@ class BaseInterface(object, metaclass=abc.ABCMeta):
         """
         return self._execute_step(task, step)
 
-    def get_service_steps(self, task):
+    def get_service_steps(self, task: TaskManager):
         """Get a list of service steps for the interface.
 
         This function will return all service steps (both enabled and disabled)
@@ -441,7 +497,7 @@ class BaseInterface(object, metaclass=abc.ABCMeta):
         """
         return self.service_steps
 
-    def execute_service_step(self, task, step):
+    def execute_service_step(self, task: TaskManager, step: ServiceStep):
         """Execute the service step on task.node.
 
         A service step must take a single positional argument: a TaskManager
@@ -460,7 +516,7 @@ class DeployInterface(BaseInterface):
     interface_type = 'deploy'
 
     @abc.abstractmethod
-    def deploy(self, task):
+    def deploy(self, task: TaskManager):
         """Perform a deployment to the task's node.
 
         Perform the necessary work to deploy an image onto the specified node.
@@ -471,9 +527,10 @@ class DeployInterface(BaseInterface):
         :param task: A TaskManager instance containing the node to act on.
         :returns: status of the deploy. One of ironic.common.states.
         """
+        ...
 
     @abc.abstractmethod
-    def tear_down(self, task):
+    def tear_down(self, task: TaskManager):
         """Tear down a previous deployment on the task's node.
 
         Given a node that has been previously deployed to,
@@ -482,9 +539,10 @@ class DeployInterface(BaseInterface):
         :param task: A TaskManager instance containing the node to act on.
         :returns: status of the deploy. One of ironic.common.states.
         """
+        ...
 
     @abc.abstractmethod
-    def prepare(self, task):
+    def prepare(self, task: TaskManager):
         """Prepare the deployment environment for the task's node.
 
         If preparation of the deployment environment ahead of time is possible,
@@ -497,9 +555,10 @@ class DeployInterface(BaseInterface):
 
         :param task: A TaskManager instance containing the node to act on.
         """
+        ...
 
     @abc.abstractmethod
-    def clean_up(self, task):
+    def clean_up(self, task: TaskManager):
         """Clean up the deployment environment for the task's node.
 
         If preparation of the deployment environment ahead of time is possible,
@@ -515,9 +574,10 @@ class DeployInterface(BaseInterface):
 
         :param task: A TaskManager instance containing the node to act on.
         """
+        ...
 
     @abc.abstractmethod
-    def take_over(self, task):
+    def take_over(self, task: TaskManager):
         """Take over management of this task's node from a dead conductor.
 
         If conductors' hosts maintain a static relationship to nodes, this
@@ -534,8 +594,9 @@ class DeployInterface(BaseInterface):
 
         :param task: A TaskManager instance containing the node to act on.
         """
+        ...
 
-    def prepare_cleaning(self, task):
+    def prepare_cleaning(self, task: TaskManager):
         """Prepare the node for cleaning tasks.
 
         For example, nodes that use the Ironic Python Agent will need to
@@ -558,7 +619,7 @@ class DeployInterface(BaseInterface):
         """
         pass
 
-    def tear_down_cleaning(self, task):
+    def tear_down_cleaning(self, task: TaskManager):
         """Tear down after cleaning is completed.
 
         Given that cleaning is complete, do all cleanup and tear
@@ -571,7 +632,7 @@ class DeployInterface(BaseInterface):
         """
         pass
 
-    def heartbeat(self, task, callback_url, agent_version,
+    def heartbeat(self, task: TaskManager, callback_url, agent_version,
                   agent_verify_ca=None, agent_status=None,
                   agent_status_message=None):
         """Record a heartbeat for the node.
@@ -588,7 +649,7 @@ class DeployInterface(BaseInterface):
                     'the driver %(driver)s does not support heartbeating',
                     {'node': task.node.uuid, 'driver': task.node.driver})
 
-    def tear_down_service(self, task):
+    def tear_down_service(self, task: TaskManager):
         """Tear down after servicing is completed.
 
         Given that servicing is complete, do all cleanup and tear
@@ -599,7 +660,7 @@ class DeployInterface(BaseInterface):
         """
         pass
 
-    def prepare_service(self, task):
+    def prepare_service(self, task: TaskManager):
         """Prepare the node for servicing tasks.
 
         For example, nodes that use the Ironic Python Agent will need to
@@ -620,7 +681,7 @@ class DeployInterface(BaseInterface):
         """
         pass
 
-    def switch_interface(self, task):
+    def switch_interface(self, task: TaskManager):
         """Optionally switch the interface to use for deployment.
 
         This method is called at the beginning of deployment before validation
@@ -632,7 +693,7 @@ class DeployInterface(BaseInterface):
         """
         pass
 
-    def restore_interface(self, task):
+    def restore_interface(self, task: TaskManager):
         """Restore the original deploy interface for the node.
 
         This restores the deploy interface to the original interface
@@ -642,7 +703,7 @@ class DeployInterface(BaseInterface):
         """
         pass
 
-    def supports_deploy(self, task):
+    def supports_deploy(self, task: TaskManager):
         """Check if deploy is supported for the given node by this interface.
 
         By default interfaces will claim to support deploy. Interfaces
@@ -661,7 +722,7 @@ class BootInterface(BaseInterface):
     capabilities = []
 
     @abc.abstractmethod
-    def prepare_ramdisk(self, task, ramdisk_params):
+    def prepare_ramdisk(self, task: TaskManager, ramdisk_params):
         """Prepares the boot of Ironic ramdisk.
 
         This method prepares the boot of the deploy or rescue ramdisk after
@@ -680,9 +741,10 @@ class BootInterface(BaseInterface):
             have different ways of passing parameters to the ramdisk.
         :returns: None
         """
+        ...
 
     @abc.abstractmethod
-    def clean_up_ramdisk(self, task):
+    def clean_up_ramdisk(self, task: TaskManager):
         """Cleans up the boot of ironic ramdisk.
 
         This method cleans up the environment that was setup for booting the
@@ -691,9 +753,10 @@ class BootInterface(BaseInterface):
         :param task: A task from TaskManager.
         :returns: None
         """
+        ...
 
     @abc.abstractmethod
-    def prepare_instance(self, task):
+    def prepare_instance(self, task: TaskManager):
         """Prepares the boot of instance.
 
         This method prepares the boot of the instance after reading
@@ -702,9 +765,10 @@ class BootInterface(BaseInterface):
         :param task: A task from TaskManager.
         :returns: None
         """
+        ...
 
     @abc.abstractmethod
-    def clean_up_instance(self, task):
+    def clean_up_instance(self, task: TaskManager):
         """Cleans up the boot of instance.
 
         This method cleans up the environment that was setup for booting
@@ -713,8 +777,9 @@ class BootInterface(BaseInterface):
         :param task: A task from TaskManager.
         :returns: None
         """
+        ...
 
-    def validate_rescue(self, task):
+    def validate_rescue(self, task: TaskManager):
         """Validate that the node has required properties for rescue.
 
         :param task: A TaskManager instance with the node being checked
@@ -725,7 +790,7 @@ class BootInterface(BaseInterface):
         raise exception.UnsupportedDriverExtension(
             driver=task.node.driver, extension='validate_rescue')
 
-    def validate_inspection(self, task):
+    def validate_inspection(self, task: TaskManager):
         """Validate that the node has required properties for inspection.
 
         :param task: A TaskManager instance with the node being checked
@@ -742,16 +807,17 @@ class PowerInterface(BaseInterface):
     interface_type = 'power'
 
     @abc.abstractmethod
-    def get_power_state(self, task):
+    def get_power_state(self, task: TaskManager):
         """Return the power state of the task's node.
 
         :param task: A TaskManager instance containing the node to act on.
         :raises: MissingParameterValue if a required parameter is missing.
         :returns: A power state. One of :mod:`ironic.common.states`.
         """
+        ...
 
     @abc.abstractmethod
-    def set_power_state(self, task, power_state, timeout=None):
+    def set_power_state(self, task: TaskManager, power_state, timeout=None):
         """Set the power state of the task's node.
 
         :param task: A TaskManager instance containing the node to act on.
@@ -760,9 +826,10 @@ class PowerInterface(BaseInterface):
           power state. ``None`` indicates to use default timeout.
         :raises: MissingParameterValue if a required parameter is missing.
         """
+        ...
 
     @abc.abstractmethod
-    def reboot(self, task, timeout=None):
+    def reboot(self, task: TaskManager, timeout=None):
         """Perform a hard reboot of the task's node.
 
         Drivers are expected to properly handle case when node is powered off
@@ -773,8 +840,9 @@ class PowerInterface(BaseInterface):
           power state. ``None`` indicates to use default timeout.
         :raises: MissingParameterValue if a required parameter is missing.
         """
+        ...
 
-    def get_supported_power_states(self, task):
+    def get_supported_power_states(self, task: TaskManager):
         """Get a list of the supported power states.
 
         :param task: A TaskManager instance containing the node to act on.
@@ -783,7 +851,7 @@ class PowerInterface(BaseInterface):
         """
         return [states.POWER_ON, states.POWER_OFF, states.REBOOT]
 
-    def supports_power_sync(self, task):
+    def supports_power_sync(self, task: TaskManager):
         """Check if power sync is supported for the given node.
 
         If ``False``, the conductor will simply store whatever
@@ -801,23 +869,25 @@ class ConsoleInterface(BaseInterface):
     interface_type = "console"
 
     @abc.abstractmethod
-    def start_console(self, task):
+    def start_console(self, task: TaskManager):
         """Start a remote console for the task's node.
 
         This method should not raise an exception if console already started.
 
         :param task: A TaskManager instance containing the node to act on.
         """
+        ...
 
     @abc.abstractmethod
-    def stop_console(self, task):
+    def stop_console(self, task: TaskManager):
         """Stop the remote console session for the task's node.
 
         :param task: A TaskManager instance containing the node to act on.
         """
+        ...
 
     @abc.abstractmethod
-    def get_console(self, task):
+    def get_console(self, task: TaskManager):
         """Get connection information about the console.
 
         This method should return the necessary information for the
@@ -826,6 +896,7 @@ class ConsoleInterface(BaseInterface):
         :param task: A TaskManager instance containing the node to act on.
         :returns: the console connection information.
         """
+        ...
 
 
 class RescueInterface(BaseInterface):
@@ -833,7 +904,7 @@ class RescueInterface(BaseInterface):
     interface_type = "rescue"
 
     @abc.abstractmethod
-    def rescue(self, task):
+    def rescue(self, task: TaskManager):
         """Boot the task's node into a rescue environment.
 
         :param task: A TaskManager instance containing the node to act on.
@@ -842,9 +913,10 @@ class RescueInterface(BaseInterface):
         :returns: states.RESCUEWAIT if rescue is in progress asynchronously
                   or states.RESCUE if it is complete.
         """
+        ...
 
     @abc.abstractmethod
-    def unrescue(self, task):
+    def unrescue(self, task: TaskManager):
         """Tear down the rescue environment, and return to normal.
 
         :param task: A TaskManager instance containing the node to act on.
@@ -852,8 +924,9 @@ class RescueInterface(BaseInterface):
                  operation fails.
         :returns: states.ACTIVE if it is successful.
         """
+        ...
 
-    def clean_up(self, task):
+    def clean_up(self, task: TaskManager):
         """Clean up the rescue environment for the task's node.
 
         This is particularly useful for nodes where rescuing is asynchronous
@@ -994,7 +1067,7 @@ class VendorInterface(BaseInterface):
         return inst
 
     @abc.abstractmethod
-    def validate(self, task, method=None, **kwargs):
+    def validate(self, task: TaskManager, method=None, **kwargs):
         """Validate vendor-specific actions.
 
         If invalid, raises an exception; otherwise returns None.
@@ -1007,6 +1080,7 @@ class VendorInterface(BaseInterface):
         :raises: InvalidParameterValue if kwargs does not contain 'method'.
         :raises: MissingParameterValue
         """
+        ...
 
     def driver_validate(self, method, **kwargs):
         """Validate driver-vendor-passthru actions.
@@ -1027,16 +1101,17 @@ class ManagementInterface(BaseInterface):
     interface_type = 'management'
 
     @abc.abstractmethod
-    def get_supported_boot_devices(self, task):
+    def get_supported_boot_devices(self, task: TaskManager):
         """Get a list of the supported boot devices.
 
         :param task: A task from TaskManager.
         :returns: A list with the supported boot devices defined
                   in :mod:`ironic.common.boot_devices`.
         """
+        ...
 
     @abc.abstractmethod
-    def set_boot_device(self, task, device, persistent=False):
+    def set_boot_device(self, task: TaskManager, device, persistent=False):
         """Set the boot device for a node.
 
         Set the boot device to use on next reboot of the node.
@@ -1051,9 +1126,10 @@ class ManagementInterface(BaseInterface):
                  specified.
         :raises: MissingParameterValue if a required parameter is missing
         """
+        ...
 
     @abc.abstractmethod
-    def get_boot_device(self, task):
+    def get_boot_device(self, task: TaskManager):
         """Get the current boot device for a node.
 
         Provides the current boot device of the node. Be aware that not
@@ -1071,8 +1147,9 @@ class ManagementInterface(BaseInterface):
                 not, None if it is unknown.
 
         """
+        ...
 
-    def get_supported_boot_modes(self, task):
+    def get_supported_boot_modes(self, task: TaskManager):
         """Get a list of the supported boot modes.
 
         NOTE: Not all drivers support this method. Older hardware
@@ -1092,7 +1169,7 @@ class ManagementInterface(BaseInterface):
         raise exception.UnsupportedDriverExtension(
             driver=task.node.driver, extension='get_supported_boot_modes')
 
-    def set_boot_mode(self, task, mode):
+    def set_boot_mode(self, task: TaskManager, mode):
         """Set the boot mode for a node.
 
         Set the boot mode to use on next reboot of the node.
@@ -1117,7 +1194,7 @@ class ManagementInterface(BaseInterface):
         raise exception.UnsupportedDriverExtension(
             driver=task.node.driver, extension='set_boot_mode')
 
-    def get_boot_mode(self, task):
+    def get_boot_mode(self, task: TaskManager):
         """Get the current boot mode for a node.
 
         Provides the current boot mode of the node.
@@ -1137,7 +1214,7 @@ class ManagementInterface(BaseInterface):
         raise exception.UnsupportedDriverExtension(
             driver=task.node.driver, extension='get_boot_mode')
 
-    def get_secure_boot_state(self, task):
+    def get_secure_boot_state(self, task: TaskManager):
         """Get the current secure boot state for the node.
 
         NOTE: Not all drivers support this method. Older hardware
@@ -1154,7 +1231,7 @@ class ManagementInterface(BaseInterface):
         raise exception.UnsupportedDriverExtension(
             driver=task.node.driver, extension='get_secure_boot_state')
 
-    def set_secure_boot_state(self, task, state):
+    def set_secure_boot_state(self, task: TaskManager, state):
         """Set the current secure boot state for the node.
 
         NOTE: Not all drivers support this method. Older hardware
@@ -1171,7 +1248,7 @@ class ManagementInterface(BaseInterface):
         raise exception.UnsupportedDriverExtension(
             driver=task.node.driver, extension='set_secure_boot_state')
 
-    def get_node_health(self, task):
+    def get_node_health(self, task: TaskManager):
         """Get the current health status for a node.
 
         Retrieves hardware health status from the BMC if available.
@@ -1195,7 +1272,7 @@ class ManagementInterface(BaseInterface):
             driver=task.node.driver, extension='get_node_health')
 
     @abc.abstractmethod
-    def get_sensors_data(self, task):
+    def get_sensors_data(self, task: TaskManager):
         """Get sensors data method.
 
         :param task: A TaskManager instance.
@@ -1234,8 +1311,9 @@ class ManagementInterface(BaseInterface):
                         }
                       }
         """
+        ...
 
-    def inject_nmi(self, task):
+    def inject_nmi(self, task: TaskManager):
         """Inject NMI, Non Maskable Interrupt.
 
         Inject NMI (Non Maskable Interrupt) for a node immediately.
@@ -1246,7 +1324,7 @@ class ManagementInterface(BaseInterface):
         raise exception.UnsupportedDriverExtension(
             driver=task.node.driver, extension='inject_nmi')
 
-    def get_supported_indicators(self, task, component=None):
+    def get_supported_indicators(self, task: TaskManager, component=None):
         """Get a map of the supported indicators (e.g. LEDs).
 
         :param task: A task from TaskManager.
@@ -1294,7 +1372,8 @@ class ManagementInterface(BaseInterface):
         raise exception.UnsupportedDriverExtension(
             driver=task.node.driver, extension='get_supported_indicators')
 
-    def set_indicator_state(self, task, component, indicator, state):
+    def set_indicator_state(self, task: TaskManager, component,
+                            indicator, state):
         """Set indicator on the hardware component to the desired state.
 
         :param task: A task from TaskManager.
@@ -1311,7 +1390,7 @@ class ManagementInterface(BaseInterface):
         raise exception.UnsupportedDriverExtension(
             driver=task.node.driver, extension='set_indicator_state')
 
-    def get_indicator_state(self, task, component, indicator):
+    def get_indicator_state(self, task: TaskManager, component, indicator):
         """Get current state of the indicator of the hardware component.
 
         :param task: A task from TaskManager.
@@ -1329,7 +1408,7 @@ class ManagementInterface(BaseInterface):
         raise exception.UnsupportedDriverExtension(
             driver=task.node.driver, extension='get_indicator_state')
 
-    def detect_vendor(self, task):
+    def detect_vendor(self, task: TaskManager):
         """Detects, stores, and returns the hardware vendor.
 
         If the Node object ``properties`` field does not already contain
@@ -1347,7 +1426,7 @@ class ManagementInterface(BaseInterface):
         raise exception.UnsupportedDriverExtension(
             driver=task.node.driver, extension='detect_vendor')
 
-    def get_mac_addresses(self, task):
+    def get_mac_addresses(self, task: TaskManager):
         """Get MAC address information for the node.
 
         :param task: A TaskManager instance containing the node to act on.
@@ -1358,7 +1437,7 @@ class ManagementInterface(BaseInterface):
         raise exception.UnsupportedDriverExtension(
             driver=task.node.driver, extension='get_mac_addresses')
 
-    def get_virtual_media(self, task):
+    def get_virtual_media(self, task: TaskManager):
         """Get all virtual media devices from the node.
 
         :param task: A TaskManager instance containing the node to act on.
@@ -1368,7 +1447,7 @@ class ManagementInterface(BaseInterface):
         raise exception.UnsupportedDriverExtension(
             driver=task.node.driver, extension='get_virtual_media')
 
-    def attach_virtual_media(self, task, device_type, image_url):
+    def attach_virtual_media(self, task: TaskManager, device_type, image_url):
         """Attach a virtual media device to the node.
 
         :param task: A TaskManager instance containing the node to act on.
@@ -1381,7 +1460,7 @@ class ManagementInterface(BaseInterface):
         raise exception.UnsupportedDriverExtension(
             driver=task.node.driver, extension='attach_virtual_media')
 
-    def detach_virtual_media(self, task, device_types=None):
+    def detach_virtual_media(self, task: TaskManager, device_types=None):
         """Detach some or all virtual media devices from the node.
 
         :param task: A TaskManager instance containing the node to act on.
@@ -1403,7 +1482,7 @@ class InspectInterface(BaseInterface):
     """The properties required by scheduler/deploy."""
 
     @abc.abstractmethod
-    def inspect_hardware(self, task):
+    def inspect_hardware(self, task: TaskManager):
         """Inspect hardware.
 
         Inspect hardware to obtain the essential & additional hardware
@@ -1415,8 +1494,9 @@ class InspectInterface(BaseInterface):
         :returns: Resulting state of the inspection i.e. states.MANAGEABLE
                   or None.
         """
+        ...
 
-    def abort(self, task):
+    def abort(self, task: TaskManager):
         """Abort asynchronized hardware inspection.
 
         Abort an ongoing hardware introspection, this is only used for
@@ -1432,7 +1512,8 @@ class InspectInterface(BaseInterface):
         raise exception.UnsupportedDriverExtension(
             driver=task.node.driver, extension='abort')
 
-    def continue_inspection(self, task, inventory, plugin_data=None):
+    def continue_inspection(self, task: TaskManager, inventory,
+                            plugin_data=None):
         """Continue in-band hardware inspection.
 
         Should not be implemented for purely out-of-band implementations.
@@ -1464,7 +1545,7 @@ class BIOSInterface(BaseInterface):
     interface_type = 'bios'
 
     @abc.abstractmethod
-    def apply_configuration(self, task, settings):
+    def apply_configuration(self, task: TaskManager, settings):
         """Validate & apply BIOS settings on the given node.
 
         This method takes the BIOS settings from the settings param and
@@ -1486,9 +1567,10 @@ class BIOSInterface(BaseInterface):
         :returns: states.CLEANWAIT if BIOS configuration is in progress
             asynchronously or None if it is complete.
         """
+        ...
 
     @abc.abstractmethod
-    def factory_reset(self, task):
+    def factory_reset(self, task: TaskManager):
         """Reset BIOS configuration to factory default on the given node.
 
         This method resets BIOS configuration to factory default on the
@@ -1502,9 +1584,10 @@ class BIOSInterface(BaseInterface):
         :returns: states.CLEANWAIT if BIOS configuration is in progress
             asynchronously or None if it is complete.
         """
+        ...
 
     @abc.abstractmethod
-    def cache_bios_settings(self, task):
+    def cache_bios_settings(self, task: TaskManager):
         """Store or update BIOS properties on the given node.
 
         This method stores BIOS properties to the bios_settings table during
@@ -1517,6 +1600,7 @@ class BIOSInterface(BaseInterface):
             support getting BIOS properties from bare metal.
         :returns: None.
         """
+        ...
 
 
 class RAIDInterface(BaseInterface):
@@ -1534,7 +1618,7 @@ class RAIDInterface(BaseInterface):
         """
         return {}
 
-    def validate(self, task):
+    def validate(self, task: TaskManager):
         """Validates the RAID Interface.
 
         This method validates the properties defined by Ironic for RAID
@@ -1550,7 +1634,7 @@ class RAIDInterface(BaseInterface):
             return
         self.validate_raid_config(task, target_raid_config)
 
-    def validate_raid_config(self, task, raid_config):
+    def validate_raid_config(self, task: TaskManager, raid_config):
         """Validates the given RAID configuration.
 
         This method validates the given RAID configuration.  Driver
@@ -1570,7 +1654,8 @@ class RAIDInterface(BaseInterface):
     # deploy_step decorator. The RAID_APPLY_CONFIGURATION_ARGSINFO variable may
     # be used for the deploy_step argsinfo argument. The create_configuration
     # method must also accept a delete_existing argument.
-    def apply_configuration(self, task, raid_config, create_root_volume=True,
+    def apply_configuration(self, task: TaskManager, raid_config,
+                            create_root_volume=True,
                             create_nonroot_volumes=True,
                             delete_existing=True):
         """Applies RAID configuration on the given node.
@@ -1629,9 +1714,10 @@ class RAIDInterface(BaseInterface):
             if RAID configuration is in progress asynchronously, or None if it
             is complete.
         """
+        ...
 
     @abc.abstractmethod
-    def delete_configuration(self, task):
+    def delete_configuration(self, task: TaskManager):
         """Deletes RAID configuration on the given node.
 
         This method deletes the RAID configuration on the give node.
@@ -1643,6 +1729,7 @@ class RAIDInterface(BaseInterface):
             if deletion is in progress asynchronously, or None if it is
             complete.
         """
+        ...
 
     def get_logical_disk_properties(self):
         """Get the properties that can be specified for logical disks.
@@ -1674,7 +1761,7 @@ class NetworkInterface(BaseInterface):
         """
         return {}
 
-    def validate(self, task):
+    def validate(self, task: TaskManager):
         """Validates the network interface.
 
         :param task: A TaskManager instance.
@@ -1684,25 +1771,27 @@ class NetworkInterface(BaseInterface):
         """
 
     @abc.abstractmethod
-    def port_changed(self, task, port_obj):
+    def port_changed(self, task: TaskManager, port_obj):
         """Handle any actions required when a port changes
 
         :param task: A TaskManager instance.
         :param port_obj: a changed Port object.
         :raises: Conflict, FailedToUpdateDHCPOptOnPort
         """
+        ...
 
     @abc.abstractmethod
-    def portgroup_changed(self, task, portgroup_obj):
+    def portgroup_changed(self, task: TaskManager, portgroup_obj):
         """Handle any actions required when a port changes
 
         :param task: A TaskManager instance.
         :param portgroup_obj: a changed Port object.
         :raises: Conflict, FailedToUpdateDHCPOptOnPort
         """
+        ...
 
     @abc.abstractmethod
-    def vif_attach(self, task, vif_info):
+    def vif_attach(self, task: TaskManager, vif_info):
         """Attach a virtual network interface to a node
 
         :param task: A TaskManager instance.
@@ -1711,27 +1800,30 @@ class NetworkInterface(BaseInterface):
             for that VIF.
         :raises: NetworkError, VifAlreadyAttached, NoFreePhysicalPorts
         """
+        ...
 
     @abc.abstractmethod
-    def vif_detach(self, task, vif_id):
+    def vif_detach(self, task: TaskManager, vif_id):
         """Detach a virtual network interface from a node
 
         :param task: A TaskManager instance.
         :param vif_id: A VIF ID to detach
         :raises: NetworkError, VifNotAttached
         """
+        ...
 
     @abc.abstractmethod
-    def vif_list(self, task):
+    def vif_list(self, task: TaskManager):
         """List attached VIF IDs for a node
 
         :param task: A TaskManager instance.
         :returns: List of VIF dictionaries, each dictionary will have an 'id'
             entry with the ID of the VIF.
         """
+        ...
 
     @abc.abstractmethod
-    def get_current_vif(self, task, p_obj):
+    def get_current_vif(self, task: TaskManager, p_obj):
         """Returns the currently used VIF associated with port or portgroup
 
         We are booting the node only in one network at a time, and presence of
@@ -1744,55 +1836,62 @@ class NetworkInterface(BaseInterface):
         :param p_obj: Ironic port or portgroup object.
         :returns: VIF ID associated with p_obj or None.
         """
+        ...
 
     @abc.abstractmethod
-    def add_provisioning_network(self, task):
+    def add_provisioning_network(self, task: TaskManager):
         """Add the provisioning network to a node.
 
         :param task: A TaskManager instance.
         :raises: NetworkError
         """
+        ...
 
     @abc.abstractmethod
-    def remove_provisioning_network(self, task):
+    def remove_provisioning_network(self, task: TaskManager):
         """Remove the provisioning network from a node.
 
         :param task: A TaskManager instance.
         """
+        ...
 
     @abc.abstractmethod
-    def configure_tenant_networks(self, task):
+    def configure_tenant_networks(self, task: TaskManager):
         """Configure tenant networks for a node.
 
         :param task: A TaskManager instance.
         :raises: NetworkError
         """
+        ...
 
     @abc.abstractmethod
-    def unconfigure_tenant_networks(self, task):
+    def unconfigure_tenant_networks(self, task: TaskManager):
         """Unconfigure tenant networks for a node.
 
         :param task: A TaskManager instance.
         """
+        ...
 
     @abc.abstractmethod
-    def add_cleaning_network(self, task):
+    def add_cleaning_network(self, task: TaskManager):
         """Add the cleaning network to a node.
 
         :param task: A TaskManager instance.
         :returns: a dictionary in the form {port.uuid: neutron_port['id']}
         :raises: NetworkError
         """
+        ...
 
     @abc.abstractmethod
-    def remove_cleaning_network(self, task):
+    def remove_cleaning_network(self, task: TaskManager):
         """Remove the cleaning network from a node.
 
         :param task: A TaskManager instance.
         :raises: NetworkError
         """
+        ...
 
-    def validate_rescue(self, task):
+    def validate_rescue(self, task: TaskManager):
         """Validates the network interface for rescue operation.
 
         :param task: A TaskManager instance.
@@ -1802,7 +1901,7 @@ class NetworkInterface(BaseInterface):
         """
         pass
 
-    def add_rescuing_network(self, task):
+    def add_rescuing_network(self, task: TaskManager):
         """Add the rescuing network to the node.
 
         :param task: A TaskManager instance.
@@ -1813,7 +1912,7 @@ class NetworkInterface(BaseInterface):
         """
         return {}
 
-    def remove_rescuing_network(self, task):
+    def remove_rescuing_network(self, task: TaskManager):
         """Removes the rescuing network from a node.
 
         :param task: A TaskManager instance.
@@ -1824,7 +1923,7 @@ class NetworkInterface(BaseInterface):
         """
         pass
 
-    def validate_inspection(self, task):
+    def validate_inspection(self, task: TaskManager):
         """Validate that the node has required properties for inspection.
 
         :param task: A TaskManager instance with the node being checked
@@ -1835,7 +1934,7 @@ class NetworkInterface(BaseInterface):
         raise exception.UnsupportedDriverExtension(
             driver=task.node.driver, extension='validate_inspection')
 
-    def add_inspection_network(self, task):
+    def add_inspection_network(self, task: TaskManager):
         """Add the inspection network to the node.
 
         :param task: A TaskManager instance.
@@ -1846,7 +1945,7 @@ class NetworkInterface(BaseInterface):
         """
         return {}
 
-    def remove_inspection_network(self, task):
+    def remove_inspection_network(self, task: TaskManager):
         """Removes the inspection network from a node.
 
         :param task: A TaskManager instance.
@@ -1856,7 +1955,7 @@ class NetworkInterface(BaseInterface):
         :raises: MissingParameterValue, if some parameters are missing.
         """
 
-    def need_power_on(self, task):
+    def need_power_on(self, task: TaskManager):
         """Check if node must be powered on before applying network changes
 
         :param task: A TaskManager instance.
@@ -1864,7 +1963,7 @@ class NetworkInterface(BaseInterface):
         """
         return False
 
-    def get_node_network_data(self, task):
+    def get_node_network_data(self, task: TaskManager):
         """Return network configuration for node NICs.
 
         Gather L2 and L3 network settings from ironic port/portgroups
@@ -1884,7 +1983,7 @@ class NetworkInterface(BaseInterface):
         """
         return task.node.network_data or {}
 
-    def add_servicing_network(self, task):
+    def add_servicing_network(self, task: TaskManager):
         """Add the servicing network to the node.
 
         :param task: A TaskManager instance.
@@ -1895,7 +1994,7 @@ class NetworkInterface(BaseInterface):
         """
         return {}
 
-    def remove_servicing_network(self, task):
+    def remove_servicing_network(self, task: TaskManager):
         """Removes the servicing network from a node.
 
         :param task: A TaskManager instance.
@@ -1907,29 +2006,31 @@ class NetworkInterface(BaseInterface):
         pass
 
 
-class StorageInterface(BaseInterface, metaclass=abc.ABCMeta):
+class StorageInterface(BaseInterface):
     """Base class for storage interfaces."""
 
     interface_type = 'storage'
 
     @abc.abstractmethod
-    def attach_volumes(self, task):
+    def attach_volumes(self, task: TaskManager):
         """Informs the storage subsystem to attach all volumes for the node.
 
         :param task: A TaskManager instance.
         :raises: UnsupportedDriverExtension
         """
+        ...
 
     @abc.abstractmethod
-    def detach_volumes(self, task):
+    def detach_volumes(self, task: TaskManager):
         """Informs the storage subsystem to detach all volumes for the node.
 
         :param task: A TaskManager instance.
         :raises: UnsupportedDriverExtension
         """
+        ...
 
     @abc.abstractmethod
-    def should_write_image(self, task):
+    def should_write_image(self, task: TaskManager):
         """Determines if deploy should perform the image write-out.
 
         :param task: A TaskManager instance.
@@ -1937,6 +2038,7 @@ class StorageInterface(BaseInterface, metaclass=abc.ABCMeta):
                   the image to be written by Ironic.
         :raises: UnsupportedDriverExtension
         """
+        ...
 
 
 def cache_firmware_components(func):
@@ -1958,7 +2060,7 @@ class FirmwareInterface(BaseInterface):
     interface_type = 'firmware'
 
     @abc.abstractmethod
-    def update(self, task, settings):
+    def update(self, task: TaskManager, settings):
         """Update the Firmware on the given using the settings for components.
 
         :param task: a TaskManager instance.
@@ -1973,9 +2075,10 @@ class FirmwareInterface(BaseInterface):
         :returns: states.CLEANWAIT if Firmware update with the settings is in
             progress asynchronously of None if it is complete.
         """
+        ...
 
     @abc.abstractmethod
-    def cache_firmware_components(self, task):
+    def cache_firmware_components(self, task: TaskManager):
         """Store or update Firmware Components on the given node.
 
         This method stores Firmware Components to the firmware_information
@@ -1986,9 +2089,10 @@ class FirmwareInterface(BaseInterface):
         :raises: UnsupportedDriverExtension, if the node's driver doesn't
             support getting Firmware Components from bare metal.
         """
+        ...
 
 
-def _validate_argsinfo(argsinfo):
+def _validate_argsinfo(argsinfo: dict[str, ArgInfo] | None):
     """Validate args info.
 
     This method validates args info, so that the values are the expected
@@ -2042,8 +2146,10 @@ def _validate_argsinfo(argsinfo):
                 {'arg': arg})
 
 
-def clean_step(priority, abortable=False, argsinfo=None,
-               requires_ramdisk=True):
+def clean_step(priority: int,
+               abortable: bool = False,
+               argsinfo: dict[str, ArgInfo] | None = None,
+               requires_ramdisk: bool = True):
     """Decorator for cleaning steps.
 
     Cleaning steps may be used in manual or automated cleaning.
@@ -2124,7 +2230,9 @@ def clean_step(priority, abortable=False, argsinfo=None,
     return decorator
 
 
-def deploy_step(priority, abortable=True, argsinfo=None):
+def deploy_step(priority: int,
+                abortable: bool = True,
+                argsinfo: dict[str, ArgInfo] | None = None):
     """Decorator for deployment steps.
 
     Only steps with priorities greater than 0 are used.
@@ -2193,7 +2301,7 @@ def deploy_step(priority, abortable=True, argsinfo=None):
     return decorator
 
 
-def verify_step(priority):
+def verify_step(priority: int):
     """Decorator for verify steps.
 
     Only steps with priorities greater than 0 are used. These steps are
@@ -2234,8 +2342,10 @@ def verify_step(priority):
     return decorator
 
 
-def service_step(priority=None, abortable=False, argsinfo=None,
-                 requires_ramdisk=True):
+def service_step(priority: int | None = None,
+                 abortable: bool = False,
+                 argsinfo: dict[str, ArgInfo] | None = None,
+                 requires_ramdisk: bool = True):
     """Decorator for service steps.
 
     Service steps may be used in performing service upon a node.
