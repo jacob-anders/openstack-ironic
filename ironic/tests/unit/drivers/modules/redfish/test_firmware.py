@@ -670,9 +670,11 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
 
             log_call = [
                 mock.call('Updating Firmware on node %(node_uuid)s '
-                          'with settings %(settings)s',
+                          'with settings %(settings)s, '
+                          'allow_grouping_reboots=%(group)s',
                           {'node_uuid': self.node.uuid,
-                           'settings': settings}),
+                           'settings': settings,
+                           'group': False}),
                 mock.call('For node %(node)s serving firmware for '
                           '%(component)s from original location %(url)s',
                           {'node': self.node.uuid,
@@ -2985,3 +2987,150 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
             self.assertTrue(
                 refreshed_settings[0].get('bios_reboot_triggered'),
                 'Flag must be persisted to database')
+
+    @mock.patch.object(redfish_fw.RedfishFirmware, '_execute_firmware_update',
+                       autospec=True)
+    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
+    def test_update_stores_batched_flag(self, mock_get_update_service,
+                                        mock_execute_fw_update):
+        settings = [{'component': 'bios', 'url': 'http://bios/v1.0.0'},
+                     {'component': 'nic:NIC1', 'url': 'http://nic/v1.0.0'}]
+        mock_execute_fw_update.side_effect = self._mock_exc_fwup_side_effect
+
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            task.node.service_step = {'step': 'update',
+                                      'interface': 'firmware'}
+            task.driver.firmware.update(task, settings,
+                                        allow_grouping_reboots=True)
+            info = task.node.driver_internal_info
+            self.assertTrue(info.get('firmware_batched_update'))
+
+    @mock.patch.object(redfish_fw.RedfishFirmware, '_execute_firmware_update',
+                       autospec=True)
+    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
+    def test_update_rejects_non_bool_allow_grouping_reboots(
+            self, mock_get_update_service, mock_execute_fw_update):
+        settings = [{'component': 'bios', 'url': 'http://bios/v1.0.0'}]
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            task.node.service_step = {'step': 'update',
+                                      'interface': 'firmware'}
+            self.assertRaises(exception.InvalidParameterValue,
+                              task.driver.firmware.update,
+                              task, settings,
+                              allow_grouping_reboots='yes')
+            mock_execute_fw_update.assert_not_called()
+
+    @mock.patch.object(redfish_fw.RedfishFirmware, '_execute_firmware_update',
+                       autospec=True)
+    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
+    def test_update_rejects_duplicate_components_batched(
+            self, mock_get_update_service, mock_execute_fw_update):
+        settings = [{'component': 'bios', 'url': 'http://bios/v1.0.0'},
+                     {'component': 'bios', 'url': 'http://bios/v2.0.0'}]
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            task.node.service_step = {'step': 'update',
+                                      'interface': 'firmware'}
+            self.assertRaises(exception.InvalidParameterValue,
+                              task.driver.firmware.update,
+                              task, settings,
+                              allow_grouping_reboots=True)
+            mock_execute_fw_update.assert_not_called()
+
+    @mock.patch.object(redfish_fw.RedfishFirmware, '_execute_firmware_update',
+                       autospec=True)
+    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
+    def test_update_allows_different_nic_components_batched(
+            self, mock_get_update_service, mock_execute_fw_update):
+        settings = [{'component': 'nic:NIC1', 'url': 'http://nic1/v1.0.0'},
+                     {'component': 'nic:NIC2', 'url': 'http://nic2/v1.0.0'}]
+        mock_execute_fw_update.side_effect = self._mock_exc_fwup_side_effect
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            task.node.service_step = {'step': 'update',
+                                      'interface': 'firmware'}
+            task.driver.firmware.update(task, settings,
+                                        allow_grouping_reboots=True)
+            mock_execute_fw_update.assert_called_once()
+
+    @mock.patch.object(redfish_fw.RedfishFirmware, '_execute_firmware_update',
+                       autospec=True)
+    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
+    def test_update_rejects_duplicate_across_bmc_batched(
+            self, mock_get_update_service, mock_execute_fw_update):
+        settings = [{'component': 'bios', 'url': 'http://bios/v1.0.0'},
+                     {'component': 'bmc', 'url': 'http://bmc/v1.0.0'},
+                     {'component': 'bios', 'url': 'http://bios/v2.0.0'}]
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            task.node.service_step = {'step': 'update',
+                                      'interface': 'firmware'}
+            self.assertRaises(exception.InvalidParameterValue,
+                              task.driver.firmware.update,
+                              task, settings,
+                              allow_grouping_reboots=True)
+            mock_execute_fw_update.assert_not_called()
+
+    @mock.patch.object(redfish_fw.RedfishFirmware, '_execute_firmware_update',
+                       autospec=True)
+    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
+    def test_update_allows_duplicates_without_batching(
+            self, mock_get_update_service, mock_execute_fw_update):
+        settings = [{'component': 'bios', 'url': 'http://bios/v1.0.0'},
+                     {'component': 'bios', 'url': 'http://bios/v2.0.0'}]
+        mock_execute_fw_update.side_effect = self._mock_exc_fwup_side_effect
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            task.node.service_step = {'step': 'update',
+                                      'interface': 'firmware'}
+            task.driver.firmware.update(task, settings,
+                                        allow_grouping_reboots=False)
+            mock_execute_fw_update.assert_called_once()
+
+    @mock.patch.object(redfish_fw.RedfishFirmware, '_execute_firmware_update',
+                       autospec=True)
+    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
+    def test_update_rejects_wait_with_batching(
+            self, mock_get_update_service, mock_execute_fw_update):
+        settings = [{'component': 'bmc', 'url': 'http://bmc/v1.0.0',
+                      'wait': 300},
+                     {'component': 'bios', 'url': 'http://bios/v1.0.0'}]
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            task.node.service_step = {'step': 'update',
+                                      'interface': 'firmware'}
+            self.assertRaises(exception.InvalidParameterValue,
+                              task.driver.firmware.update,
+                              task, settings,
+                              allow_grouping_reboots=True)
+            mock_execute_fw_update.assert_not_called()
+
+    @mock.patch.object(redfish_fw.RedfishFirmware, '_execute_firmware_update',
+                       autospec=True)
+    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
+    def test_update_allows_wait_without_batching(
+            self, mock_get_update_service, mock_execute_fw_update):
+        settings = [{'component': 'bmc', 'url': 'http://bmc/v1.0.0',
+                      'wait': 300}]
+        mock_execute_fw_update.side_effect = self._mock_exc_fwup_side_effect
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            task.node.service_step = {'step': 'update',
+                                      'interface': 'firmware'}
+            task.driver.firmware.update(task, settings,
+                                        allow_grouping_reboots=False)
+            mock_execute_fw_update.assert_called_once()
+
+    @mock.patch.object(firmware_utils, 'cleanup', autospec=True)
+    def test_clear_updates_removes_batched_flag(self, mock_cleanup):
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            task.node.set_driver_internal_info('redfish_fw_updates', [])
+            task.node.set_driver_internal_info('firmware_batched_update', True)
+            task.node.save()
+            task.driver.firmware._clear_updates(task.node)
+            info = task.node.driver_internal_info
+            self.assertNotIn('firmware_batched_update', info)
+            self.assertNotIn('redfish_fw_updates', info)

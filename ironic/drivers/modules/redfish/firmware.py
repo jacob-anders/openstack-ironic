@@ -39,6 +39,7 @@ METRICS = metrics_utils.get_metrics_logger(__name__)
 # Temporary field names stored in node.driver_internal_info
 BMC_FW_VERSION_BEFORE_UPDATE = 'bmc_fw_version_before_update'
 FIRMWARE_REBOOT_REQUESTED = 'firmware_reboot_requested'
+FIRMWARE_BATCHED_UPDATE = 'firmware_batched_update'
 
 # Temporary field names stored in fw_upd/current_update settings dict
 NIC_NEEDS_POST_COMPLETION_REBOOT = 'nic_needs_post_completion_reboot'
@@ -56,6 +57,16 @@ class RedfishFirmware(base.FirmwareInterface):
                 'A list of dicts with firmware components to be updated'
             ),
             'required': True
+        },
+        'allow_grouping_reboots': {
+            'description': (
+                'Boolean. When True, non-BMC firmware updates are batched '
+                'into a single host reboot instead of rebooting after each '
+                'component. When bmc is listed before non-BMC entries, it '
+                'is processed in a separate phase first. Ironic does not '
+                'reorder the settings list. Defaults to False.'
+            ),
+            'required': False
         }
     }
 
@@ -238,13 +249,15 @@ class RedfishFirmware(base.FirmwareInterface):
     @base.service_step(priority=0, abortable=False,
                        argsinfo=_FW_SETTINGS_ARGSINFO,
                        requires_ramdisk=False)
-    def update(self, task, settings):
+    def update(self, task, settings, allow_grouping_reboots=False):
         """Update the Firmware on the node using the settings for components.
 
         :param task: a TaskManager instance.
         :param settings: a list of dictionaries, each dictionary contains the
             component name and the url that will be used to update the
             firmware.
+        :param allow_grouping_reboots: Boolean. When True, non-BMC firmware
+            updates are batched into a single host reboot. Defaults to False.
         :raises: UnsupportedDriverExtension, if the node's driver doesn't
             support update via the interface.
         :raises: InvalidParameterValue, if validation of the settings fails.
@@ -254,12 +267,40 @@ class RedfishFirmware(base.FirmwareInterface):
             progress asynchronously of None if it is complete.
         """
         firmware_utils.validate_firmware_interface_update_args(settings)
+        if not isinstance(allow_grouping_reboots, bool):
+            raise exception.InvalidParameterValue(
+                _('allow_grouping_reboots must be a boolean, '
+                  'got %s') % type(allow_grouping_reboots).__name__)
+        if allow_grouping_reboots:
+            seen = set()
+            for s in settings:
+                comp = s.get('component', '')
+                if comp in seen:
+                    raise exception.InvalidParameterValue(
+                        _("component '%(comp)s' appears more than once; "
+                          "batched updates require distinct components. "
+                          "Use separate firmware.update steps, or omit "
+                          "allow_grouping_reboots, for staged or sequential "
+                          "updates of the same component.") % {'comp': comp})
+                seen.add(comp)
+                if s.get('wait'):
+                    raise exception.InvalidParameterValue(
+                        _("per-component 'wait' is not supported with "
+                          "allow_grouping_reboots. Remove 'wait' from "
+                          "component '%(comp)s' or omit "
+                          "allow_grouping_reboots.") % {'comp': comp})
+
         node = task.node
         update_service = redfish_utils.get_update_service(node)
 
         LOG.debug('Updating Firmware on node %(node_uuid)s with settings '
-                  '%(settings)s',
-                  {'node_uuid': node.uuid, 'settings': settings})
+                  '%(settings)s, allow_grouping_reboots=%(group)s',
+                  {'node_uuid': node.uuid, 'settings': settings,
+                   'group': allow_grouping_reboots})
+
+        if allow_grouping_reboots:
+            node.set_driver_internal_info(FIRMWARE_BATCHED_UPDATE, True)
+
         self._execute_firmware_update(node, update_service, settings)
 
         # Store updated settings and start time for overall timeout tracking
@@ -913,6 +954,7 @@ class RedfishFirmware(base.FirmwareInterface):
         node.del_driver_internal_info('redfish_fw_updates')
         node.del_driver_internal_info('redfish_fw_update_start_time')
         node.del_driver_internal_info('firmware_cleanup')
+        node.del_driver_internal_info(FIRMWARE_BATCHED_UPDATE)
         # Clean all temporary fields used during firmware update monitoring
         self._clean_temp_fields(node)
         node.save()
