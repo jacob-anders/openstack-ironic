@@ -1,0 +1,21 @@
+---
+features:
+  - |
+    Adds the ``allow_grouping_reboots`` argument to the Redfish
+    ``firmware.update`` cleaning and servicing step. When set to ``true``,
+    adjacent non-BMC firmware components (BIOS, NIC) are staged
+    sequentially via Redfish SimpleUpdate and then applied in a single
+    consolidated host reboot, reducing total downtime compared to the
+    default one-reboot-per-component behaviour.
+
+    BMC firmware entries automatically segment the list, as BMC updates
+    reset the management controller rather than the host. Each segment
+    of adjacent, distinct, non-BMC components shares one reboot.
+
+    For example, ``[bios, nic:NIC.1-1, bmc, nic:NIC.Slot.2, nic:NIC.Slot.3]``
+    produces three phases and three reboots instead of five.
+
+    Duplicate component values are rejected when batching is enabled, as
+    staging multiple updates for the same component is unsafe with a single
+    consolidated reboot. The per-component ``wait`` argument is not
+    supported with ``allow_grouping_reboots``.

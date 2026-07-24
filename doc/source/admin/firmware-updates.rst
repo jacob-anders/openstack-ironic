@@ -93,6 +93,82 @@ mandatory, while the ``wait`` argument is optional.
 For ``url`` currently ``http``, ``https``, ``swift`` and ``file`` schemes are
 supported.
 
+Batched updates (consolidated reboot)
+--------------------------------------
+
+By default, the firmware update step applies each component sequentially and
+reboots the server after each one. When updating multiple non-BMC components
+(BIOS, NICs), you can use the ``allow_grouping_reboots`` argument to stage all
+firmware packages and apply them in a single consolidated reboot, reducing
+total downtime::
+
+    [{
+        "interface": "firmware",
+        "step": "update",
+        "args": {
+            "settings": [
+                {"component": "bios", "url": "http://192.0.2.10/BIOS_v2.0.EXE"},
+                {"component": "nic:NIC.1-1", "url": "http://192.0.2.10/NIC_v3.0.EXE"},
+                {"component": "nic:NIC.Slot.2", "url": "http://192.0.2.10/NIC2_v3.0.EXE"}
+            ],
+            "allow_grouping_reboots": true
+        }
+    }]
+
+**How batching works:**
+
+1. Each non-BMC component is submitted via Redfish SimpleUpdate one at a time.
+   The step waits for each to reach a "staged" state before submitting the
+   next (firmware is downloaded to the BMC but not yet applied).
+
+2. After all components are staged, a single consolidated reboot is triggered.
+   Firmware is applied during POST.
+
+3. After the reboot, the step waits for the BMC to become responsive and
+   verifies that all firmware tasks completed successfully.
+
+**Segmentation rules:**
+
+A reboot is shared by a maximal run of adjacent, distinct, non-BMC components.
+BMC firmware updates always use the sequential path with their own reboot, as
+they reset the management controller rather than the host.
+
+For example, ``[bios, nic:NIC.1-1, bmc, nic:NIC.Slot.2, nic:NIC.Slot.3]``
+produces three phases: batch ``[bios, nic:NIC.1-1]`` with one reboot,
+``bmc`` sequential with its own reset, then batch
+``[nic:NIC.Slot.2, nic:NIC.Slot.3]`` with one reboot — 3 reboots instead
+of 5.
+
+A single non-BMC component falls through to the sequential path, which retains
+per-component intelligence (BIOS Starting-triggered reboot, NIC
+Starting-vs-Running state discrimination).
+
+**Restrictions:**
+
+- Each component value must be unique within the settings list. Duplicate
+  components (e.g., two ``bios`` entries) are rejected because batching stages
+  all packages against the running firmware and applies them in a single
+  reboot, making repeated updates of the same component unsafe. Use separate
+  ``firmware.update`` steps for staged upgrade paths.
+
+- The ``wait`` per-component argument cannot be combined with
+  ``allow_grouping_reboots``.
+
+**Maintenance mode interaction:**
+
+If the node enters maintenance mode during a batched update, the current
+submission or polling cycle completes but no further components are submitted.
+Note that firmware already staged on the BMC will remain staged. When the
+node exits maintenance mode, processing resumes from where it left off.
+
+**Timeout sizing:**
+
+With ``allow_grouping_reboots``, the overall timeout
+(``firmware_update_overall_timeout``) must account for staging time of all
+components plus the reboot. Firmware staging can take several minutes per
+component (Dell NIC firmware may take ~6.5 minutes). Size the timeout
+accordingly for the number of components being batched.
+
 Applying updates
 ----------------
 
