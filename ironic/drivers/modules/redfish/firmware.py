@@ -40,6 +40,9 @@ METRICS = metrics_utils.get_metrics_logger(__name__)
 BMC_FW_VERSION_BEFORE_UPDATE = 'bmc_fw_version_before_update'
 FIRMWARE_REBOOT_REQUESTED = 'firmware_reboot_requested'
 FIRMWARE_BATCHED_UPDATE = 'firmware_batched_update'
+FIRMWARE_BATCH_SUBMITTED = 'firmware_batch_submitted'
+FIRMWARE_BATCH_CURRENT_INDEX = 'firmware_batch_current_index'
+FIRMWARE_BATCH_REBOOT_TIME = 'firmware_batch_reboot_time'
 
 # Temporary field names stored in fw_upd/current_update settings dict
 NIC_NEEDS_POST_COMPLETION_REBOOT = 'nic_needs_post_completion_reboot'
@@ -300,6 +303,16 @@ class RedfishFirmware(base.FirmwareInterface):
 
         if allow_grouping_reboots:
             node.set_driver_internal_info(FIRMWARE_BATCHED_UPDATE, True)
+            first_component = redfish_utils.get_component_type(
+                settings[0].get('component', ''))
+            if first_component != redfish_utils.BMC:
+                self._execute_batched_non_bmc_updates(
+                    task, update_service, settings)
+                node.set_driver_internal_info(
+                    'redfish_fw_update_start_time',
+                    timeutils.utcnow().isoformat())
+                node.save()
+                return async_steps.get_return_state(node)
 
         self._execute_firmware_update(node, update_service, settings)
 
@@ -745,6 +758,71 @@ class RedfishFirmware(base.FirmwareInterface):
         else:
             self._setup_default_update_monitoring(node, fw_upd)
 
+    def _submit_one_batched_component(self, node, update_service, settings,
+                                      idx):
+        """Submit a single SimpleUpdate for one component in a batch.
+
+        :param node: the node object
+        :param update_service: the sushy firmware update service
+        :param settings: list of firmware update dicts
+        :param idx: index into settings for the component to submit
+        :raises: RedfishError if SimpleUpdate submission fails
+        """
+        fw_upd = settings[idx]
+        component = fw_upd.get('component', '')
+        LOG.debug('Batched submission %(idx)d/%(total)d: staging '
+                  '%(component)s from %(url)s for node %(node)s',
+                  {'idx': idx + 1, 'total': len(settings),
+                   'component': component, 'url': fw_upd['url'],
+                   'node': node.uuid})
+        try:
+            self._submit_simple_update(node, update_service, fw_upd)
+        except Exception as e:
+            LOG.error('Batched firmware submission failed at component '
+                      '%(component)s (%(idx)d/%(total)d) for node '
+                      '%(node)s. Error: %(error)s. No consolidated '
+                      'reboot will be issued.',
+                      {'component': component, 'idx': idx + 1,
+                       'total': len(settings), 'node': node.uuid,
+                       'error': e})
+            raise
+
+    def _execute_batched_non_bmc_updates(self, task, update_service, settings):
+        """Submit the first non-BMC firmware update and start staging polling.
+
+        Submits SimpleUpdate for the first component in settings and sets
+        up async polling. The periodic poller will monitor staging progress
+        and submit subsequent components one at a time, only triggering a
+        consolidated reboot after all components are staged.
+
+        :param task: a TaskManager instance
+        :param update_service: the sushy firmware update service
+        :param settings: list of firmware update dicts (must not contain BMC)
+        :raises: RedfishError if the SimpleUpdate submission fails
+        """
+        node = task.node
+        self._clean_temp_fields(node)
+
+        LOG.info('Starting batched non-BMC firmware submission for node '
+                 '%(node)s with %(count)d component(s)',
+                 {'node': node.uuid, 'count': len(settings)})
+
+        self._submit_one_batched_component(node, update_service, settings, 0)
+
+        node.set_driver_internal_info(FIRMWARE_BATCH_CURRENT_INDEX, 0)
+        node.set_driver_internal_info('redfish_fw_updates', settings)
+
+        deploy_utils.set_async_step_flags(
+            node,
+            reboot=False,
+            polling=True
+        )
+        node.save()
+
+        LOG.info('Submitted component 1/%(count)d for node %(node)s. '
+                 'Polling for staging completion before submitting next.',
+                 {'count': len(settings), 'node': node.uuid})
+
     def _validate_resources_stability(self, node):
         """Validate that BMC resources are consistently available.
 
@@ -985,6 +1063,9 @@ class RedfishFirmware(base.FirmwareInterface):
         node.del_driver_internal_info('redfish_fw_update_start_time')
         node.del_driver_internal_info('firmware_cleanup')
         node.del_driver_internal_info(FIRMWARE_BATCHED_UPDATE)
+        node.del_driver_internal_info(FIRMWARE_BATCH_SUBMITTED)
+        node.del_driver_internal_info(FIRMWARE_BATCH_CURRENT_INDEX)
+        node.del_driver_internal_info(FIRMWARE_BATCH_REBOOT_TIME)
         # Clean all temporary fields used during firmware update monitoring
         self._clean_temp_fields(node)
         node.save()
@@ -1559,6 +1640,13 @@ class RedfishFirmware(base.FirmwareInterface):
         # the process eventually times out if the BMC is unresponsive.
         node.touch_provisioning()
 
+        if (node.driver_internal_info.get(FIRMWARE_BATCHED_UPDATE)
+                and (node.driver_internal_info.get(FIRMWARE_BATCH_SUBMITTED)
+                     or node.driver_internal_info.get(
+                         FIRMWARE_BATCH_CURRENT_INDEX) is not None)):
+            self._check_batched_update_status(task, settings)
+            return
+
         wait_start_time = current_update.get('wait_start_time')
         if wait_start_time:
             wait_start = timeutils.parse_isotime(wait_start_time)
@@ -1590,6 +1678,300 @@ class RedfishFirmware(base.FirmwareInterface):
         # Handle firmware update task monitoring
         self._handle_firmware_update_task(
             task, node, current_update, update_service, settings)
+
+    def _check_batched_update_status(self, task, settings):
+        """Check batched firmware update status (two-phase).
+
+        Phase 1 (staging): polls the current component's task. When staged,
+        submits the next component or transitions to Phase 2.
+        Phase 2 (post-reboot): polls ALL task monitors for completion.
+
+        :param task: a TaskManager instance
+        :param settings: firmware update settings with task_monitor URIs
+        """
+        node = task.node
+        if node.driver_internal_info.get(FIRMWARE_BATCH_SUBMITTED):
+            self._check_batched_post_reboot(task, settings)
+        else:
+            self._check_batched_staging(task, settings)
+
+    def _check_batched_staging(self, task, settings):
+        """Phase 1: poll the current component and advance when staged."""
+        node = task.node
+        current_idx = node.driver_internal_info.get(
+            FIRMWARE_BATCH_CURRENT_INDEX, 0)
+        fw_upd = settings[current_idx]
+        component = fw_upd.get('component', '')
+        monitor_uri = fw_upd.get('task_monitor')
+
+        if not monitor_uri:
+            LOG.debug('No task monitor for %(component)s on node %(node)s. '
+                      'Treating as staged.',
+                      {'component': component, 'node': node.uuid})
+            self._advance_batch_staging(task, settings, current_idx)
+            return
+
+        try:
+            task_monitor = redfish_utils.get_task_monitor(node, monitor_uri)
+        except exception.RedfishConnectionError as e:
+            LOG.warning('Unable to reach task monitor for %(component)s '
+                        'on node %(node)s: %(error)s. Will retry.',
+                        {'component': component,
+                         'node': node.uuid, 'error': e})
+            return
+        except exception.RedfishError:
+            LOG.debug('Task monitor for %(component)s disappeared on '
+                      'node %(node)s. Treating as staged.',
+                      {'component': component, 'node': node.uuid})
+            self._advance_batch_staging(task, settings, current_idx)
+            return
+
+        try:
+            sushy_task = task_monitor.get_task()
+        except Exception as e:
+            LOG.warning('Unable to get task for %(component)s on node '
+                        '%(node)s: %(error)s. Will retry.',
+                        {'component': component,
+                         'node': node.uuid, 'error': e})
+            return
+
+        if sushy_task.task_state in [sushy.TASK_STATE_NEW,
+                                     sushy.TASK_STATE_PENDING,
+                                     sushy.TASK_STATE_RUNNING]:
+            LOG.debug('Component %(component)s still staging on node '
+                      '%(node)s (state=%(state)s). Will retry.',
+                      {'component': component, 'node': node.uuid,
+                       'state': sushy_task.task_state})
+            return
+
+        # Starting = "staged, scheduled for apply at reboot" (Dell BIOS/SSD
+        # pattern). In Phase 2 post-reboot, Starting means "still running".
+        if sushy_task.task_state in [sushy.TASK_STATE_STARTING,
+                                     sushy.TASK_STATE_COMPLETED]:
+            if (sushy_task.task_state == sushy.TASK_STATE_COMPLETED
+                    and sushy_task.task_status not in
+                    [sushy.HEALTH_OK, sushy.HEALTH_WARNING]):
+                self._fail_batched_update(
+                    task, node, fw_upd, sushy_task)
+                return
+            LOG.info('Component %(component)s staged on node %(node)s '
+                     '(state=%(state)s).',
+                     {'component': component, 'node': node.uuid,
+                      'state': sushy_task.task_state})
+            self._advance_batch_staging(task, settings, current_idx)
+            return
+
+        self._fail_batched_update(task, node, fw_upd, sushy_task)
+
+    def _advance_batch_staging(self, task, settings, current_idx):
+        """Submit next component or trigger reboot if all staged."""
+        node = task.node
+        next_idx = current_idx + 1
+
+        if next_idx < len(settings):
+            try:
+                update_service = redfish_utils.get_update_service(node)
+            except exception.RedfishError as e:
+                error_msg = (
+                    _('Failed to get update service for node %(node)s '
+                      'while advancing batch: %(error)s')
+                    % {'node': node.uuid, 'error': e})
+                LOG.error(error_msg)
+                self._clear_updates(node)
+                self._report_step_error(task, error_msg)
+                return
+
+            try:
+                self._submit_one_batched_component(
+                    node, update_service, settings, next_idx)
+            except Exception as e:
+                error_msg = (
+                    _('Batched firmware submission failed at component '
+                      '%(component)s (%(idx)d/%(total)d) for node '
+                      '%(node)s. Error: %(error)s')
+                    % {'component': settings[next_idx].get('component', ''),
+                       'idx': next_idx + 1, 'total': len(settings),
+                       'node': node.uuid, 'error': e})
+                LOG.error(error_msg)
+                self._clear_updates(node)
+                self._report_step_error(task, error_msg)
+                return
+
+            node.set_driver_internal_info(FIRMWARE_BATCH_CURRENT_INDEX,
+                                          next_idx)
+            node.set_driver_internal_info('redfish_fw_updates', settings)
+            node.save()
+            LOG.info('Submitted component %(idx)d/%(total)d for node '
+                     '%(node)s. Polling for staging completion.',
+                     {'idx': next_idx + 1, 'total': len(settings),
+                      'node': node.uuid})
+        else:
+            node.set_driver_internal_info(
+                FIRMWARE_BATCH_REBOOT_TIME,
+                timeutils.utcnow().isoformat())
+            node.del_driver_internal_info(FIRMWARE_BATCH_CURRENT_INDEX)
+            node.set_driver_internal_info(FIRMWARE_BATCH_SUBMITTED, True)
+            node.set_driver_internal_info('redfish_fw_updates', settings)
+            node.save()
+
+            LOG.info('All %(count)d components staged for node %(node)s. '
+                     'Triggering consolidated reboot.',
+                     {'count': len(settings), 'node': node.uuid})
+            power_timeout = settings[0].get('power_timeout', 0)
+            manager_utils.node_power_action(task, states.REBOOT,
+                                            power_timeout)
+
+    def _check_batched_post_reboot(self, task, settings):
+        """Phase 2: poll all task monitors for final completion."""
+        node = task.node
+
+        reboot_time = node.driver_internal_info.get(FIRMWARE_BATCH_REBOOT_TIME)
+        if reboot_time:
+            elapsed = (timeutils.utcnow(True)
+                       - timeutils.parse_isotime(reboot_time))
+            min_wait = CONF.redfish.firmware_update_status_interval
+            if elapsed.total_seconds() < min_wait:
+                LOG.debug('Too early to poll after reboot for node %(node)s '
+                          '(%(elapsed)ds < %(min)ds). Will retry.',
+                          {'node': node.uuid,
+                           'elapsed': int(elapsed.total_seconds()),
+                           'min': min_wait})
+                return
+            try:
+                self._validate_resources_stability(node)
+            except exception.RedfishError:
+                LOG.debug('BMC not yet stable after reboot for node %s, '
+                          'will retry', node.uuid)
+                return
+            node.del_driver_internal_info(FIRMWARE_BATCH_REBOOT_TIME)
+            node.save()
+
+        completed = 0
+        still_running = 0
+
+        for fw_upd in settings:
+            monitor_uri = fw_upd.get('task_monitor')
+            if not monitor_uri:
+                completed += 1
+                continue
+
+            try:
+                task_monitor = redfish_utils.get_task_monitor(
+                    node, monitor_uri)
+            except exception.RedfishConnectionError as e:
+                LOG.warning('Unable to reach task monitor for %(component)s '
+                            'on node %(node)s: %(error)s. Will retry.',
+                            {'component': fw_upd.get('component', ''),
+                             'node': node.uuid, 'error': e})
+                still_running += 1
+                continue
+            except exception.RedfishError:
+                LOG.debug('Task monitor for %(component)s disappeared on '
+                          'node %(node)s. Assuming completed.',
+                          {'component': fw_upd.get('component', ''),
+                           'node': node.uuid})
+                fw_upd.pop('task_monitor', None)
+                completed += 1
+                continue
+
+            try:
+                sushy_task = task_monitor.get_task()
+            except Exception as e:
+                LOG.warning('Unable to get task for %(component)s on node '
+                            '%(node)s: %(error)s. Will retry.',
+                            {'component': fw_upd.get('component', ''),
+                             'node': node.uuid, 'error': e})
+                still_running += 1
+                continue
+
+            # Starting = "still applying" post-reboot (will transition to
+            # Completed during POST). In Phase 1 staging, Starting means
+            # "staged".
+            if sushy_task.task_state in [sushy.TASK_STATE_NEW,
+                                         sushy.TASK_STATE_RUNNING,
+                                         sushy.TASK_STATE_STARTING,
+                                         sushy.TASK_STATE_PENDING]:
+                still_running += 1
+                continue
+
+            if (sushy_task.task_state == sushy.TASK_STATE_COMPLETED
+                    and sushy_task.task_status in
+                    [sushy.HEALTH_OK, sushy.HEALTH_WARNING]):
+                fw_upd.pop('task_monitor', None)
+                completed += 1
+                continue
+
+            self._fail_batched_update(task, node, fw_upd, sushy_task)
+            return
+
+        total = len(settings)
+        LOG.debug('Batched firmware update progress for node %(node)s: '
+                  '%(completed)d/%(total)d completed, '
+                  '%(running)d still running',
+                  {'node': node.uuid, 'completed': completed,
+                   'total': total, 'running': still_running})
+
+        node.set_driver_internal_info('redfish_fw_updates', settings)
+        node.save()
+
+        if still_running == 0:
+            self._finalize_batched_update(task)
+
+    def _fail_batched_update(self, task, node, fw_upd, sushy_task):
+        """Handle a failed task during batched firmware update."""
+        messages = []
+        if sushy_task.messages:
+            if not sushy_task.messages[0].message:
+                sushy_task.parse_messages()
+            for m in sushy_task.messages:
+                msg = m.message
+                if not msg or msg.lower() in ['unknown', 'unknown error']:
+                    msg = m.message_id
+                if msg:
+                    messages.append(msg)
+
+        error_msg = (
+            _('Batched firmware update failed for component '
+              '%(component)s on node %(node)s. Error: %(errors)s')
+            % {'component': fw_upd.get('component', ''),
+               'node': node.uuid,
+               'errors': ', '.join(messages)})
+        LOG.error(error_msg)
+        self._clear_updates(node)
+        self._report_step_error(task, error_msg)
+
+    def _finalize_batched_update(self, task):
+        """Complete the batched firmware update after all tasks finish.
+
+        Validates BMC stability, refreshes the firmware component cache,
+        and resumes the conductor step flow.
+
+        :param task: a TaskManager instance
+        """
+        node = task.node
+        LOG.info('All batched firmware updates completed for node %(node)s.',
+                 {'node': node.uuid})
+
+        LOG.debug('Validating BMC responsiveness before resuming '
+                  'conductor operations for node %(node)s',
+                  {'node': node.uuid})
+        try:
+            self._validate_resources_stability(node)
+        except exception.RedfishError:
+            LOG.warning('BMC resources did not stabilize for node %(node)s '
+                        'after batched firmware update, but proceeding '
+                        'with finalization.',
+                        {'node': node.uuid})
+
+        try:
+            self.cache_firmware_components(task)
+        except Exception as e:
+            LOG.warning('Failed to refresh firmware components for node '
+                        '%(node)s after batched update: %(error)s',
+                        {'node': node.uuid, 'error': e})
+
+        self._clear_updates(node)
+        self._resume_step(task)
 
     def _stage_firmware_file(self, node, component_update):
 
