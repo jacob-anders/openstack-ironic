@@ -52,6 +52,26 @@ BIOS_REBOOT_TRIGGERED = 'bios_reboot_triggered'
 BMC_UPDATE_COMPLETED = 'bmc_update_completed'
 
 
+def _leading_batchable_run(settings):
+    """Length of the leading run of adjacent, distinct, non-BMC components.
+
+    A reboot is shared by a maximal run of adjacent, distinct, non-BMC
+    components. This function returns the length of that leading run.
+
+    :param settings: list of firmware update dicts
+    :returns: int — number of components in the leading batchable run
+    """
+    seen = set()
+    for i, s in enumerate(settings):
+        component = s.get('component', '')
+        if redfish_utils.get_component_type(component) == redfish_utils.BMC:
+            return i
+        if component in seen:
+            return i
+        seen.add(component)
+    return len(settings)
+
+
 class RedfishFirmware(base.FirmwareInterface):
 
     _FW_SETTINGS_ARGSINFO = {
@@ -303,9 +323,7 @@ class RedfishFirmware(base.FirmwareInterface):
 
         if allow_grouping_reboots:
             node.set_driver_internal_info(FIRMWARE_BATCHED_UPDATE, True)
-            first_component = redfish_utils.get_component_type(
-                settings[0].get('component', ''))
-            if first_component != redfish_utils.BMC:
+            if _leading_batchable_run(settings) >= 2:
                 self._execute_batched_non_bmc_updates(
                     task, update_service, settings)
                 node.set_driver_internal_info(
@@ -803,9 +821,12 @@ class RedfishFirmware(base.FirmwareInterface):
         node = task.node
         self._clean_temp_fields(node)
 
-        LOG.info('Starting batched non-BMC firmware submission for node '
-                 '%(node)s with %(count)d component(s)',
-                 {'node': node.uuid, 'count': len(settings)})
+        run_length = _leading_batchable_run(settings)
+        LOG.info('Batching %(batch)d of %(total)d components for node '
+                 '%(node)s; remaining components will be processed '
+                 'sequentially.',
+                 {'batch': run_length, 'total': len(settings),
+                  'node': node.uuid})
 
         self._submit_one_batched_component(node, update_service, settings, 0)
 
@@ -1020,33 +1041,53 @@ class RedfishFirmware(base.FirmwareInterface):
             self._validate_resources_stability(node)
 
             settings.pop(0)
-            self._execute_firmware_update(node,
-                                          update_service,
-                                          settings)
+            self._start_next_segment(task, update_service, settings)
+
+    def _start_next_segment(self, task, update_service, settings):
+        """Dispatch the next firmware update segment.
+
+        Starts either a batched or sequential firmware update for the
+        first component(s) in settings. Called after the previous segment
+        has completed and its entry has been removed from settings.
+
+        :param task: a TaskManager instance
+        :param update_service: the sushy firmware update service
+        :param settings: remaining firmware update dicts to process
+        """
+        node = task.node
+
+        if (node.driver_internal_info.get(FIRMWARE_BATCHED_UPDATE)
+                and _leading_batchable_run(settings) >= 2):
+            self._execute_batched_non_bmc_updates(
+                task, update_service, settings)
             node.save()
+            return
 
-            # Only reboot if the component code requested it.
-            if task.node.clean_step:
-                reboot_field = async_steps.CLEANING_REBOOT
-            elif task.node.deploy_step:
-                reboot_field = async_steps.DEPLOYMENT_REBOOT
-            elif task.node.service_step:
-                reboot_field = async_steps.SERVICING_REBOOT
-            else:
-                reboot_field = None
+        self._execute_firmware_update(node,
+                                      update_service,
+                                      settings)
+        node.save()
 
-            # Default to reboot=True for backwards compatibility.
-            should_reboot = (node.driver_internal_info.get(reboot_field, True)
-                             if reboot_field else True)
+        if task.node.clean_step:
+            reboot_field = async_steps.CLEANING_REBOOT
+        elif task.node.deploy_step:
+            reboot_field = async_steps.DEPLOYMENT_REBOOT
+        elif task.node.service_step:
+            reboot_field = async_steps.SERVICING_REBOOT
+        else:
+            reboot_field = None
 
-            if should_reboot:
-                power_timeout = settings[0].get('power_timeout', 0)
-                manager_utils.node_power_action(task, states.REBOOT,
-                                                power_timeout)
-            else:
-                LOG.debug('Component requested no immediate reboot for node '
-                          '%(node)s. Continuing with async polling.',
-                          {'node': node.uuid})
+        should_reboot = (node.driver_internal_info.get(reboot_field, True)
+                         if reboot_field else True)
+
+        if should_reboot:
+            power_timeout = settings[0].get('power_timeout', 0)
+            manager_utils.node_power_action(task, states.REBOOT,
+                                            power_timeout)
+        else:
+            LOG.debug('Component requested no immediate reboot for node '
+                      '%(node)s. Continuing with async polling.',
+                      {'node': node.uuid})
 
     def _clear_updates(self, node):
         """Clears firmware updates artifacts
@@ -1767,8 +1808,9 @@ class RedfishFirmware(base.FirmwareInterface):
         """Submit next component or trigger reboot if all staged."""
         node = task.node
         next_idx = current_idx + 1
+        run_length = _leading_batchable_run(settings)
 
-        if next_idx < len(settings):
+        if next_idx < run_length:
             try:
                 update_service = redfish_utils.get_update_service(node)
             except exception.RedfishError as e:
@@ -1790,7 +1832,7 @@ class RedfishFirmware(base.FirmwareInterface):
                       '%(component)s (%(idx)d/%(total)d) for node '
                       '%(node)s. Error: %(error)s')
                     % {'component': settings[next_idx].get('component', ''),
-                       'idx': next_idx + 1, 'total': len(settings),
+                       'idx': next_idx + 1, 'total': run_length,
                        'node': node.uuid, 'error': e})
                 LOG.error(error_msg)
                 self._clear_updates(node)
@@ -1803,7 +1845,7 @@ class RedfishFirmware(base.FirmwareInterface):
             node.save()
             LOG.info('Submitted component %(idx)d/%(total)d for node '
                      '%(node)s. Polling for staging completion.',
-                     {'idx': next_idx + 1, 'total': len(settings),
+                     {'idx': next_idx + 1, 'total': run_length,
                       'node': node.uuid})
         else:
             node.set_driver_internal_info(
@@ -1814,9 +1856,9 @@ class RedfishFirmware(base.FirmwareInterface):
             node.set_driver_internal_info('redfish_fw_updates', settings)
             node.save()
 
-            LOG.info('All %(count)d components staged for node %(node)s. '
-                     'Triggering consolidated reboot.',
-                     {'count': len(settings), 'node': node.uuid})
+            LOG.info('All %(count)d batch components staged for node '
+                     '%(node)s. Triggering consolidated reboot.',
+                     {'count': run_length, 'node': node.uuid})
             power_timeout = settings[0].get('power_timeout', 0)
             manager_utils.node_power_action(task, states.REBOOT,
                                             power_timeout)
@@ -1846,10 +1888,11 @@ class RedfishFirmware(base.FirmwareInterface):
             node.del_driver_internal_info(FIRMWARE_BATCH_REBOOT_TIME)
             node.save()
 
+        run_length = _leading_batchable_run(settings)
         completed = 0
         still_running = 0
 
-        for fw_upd in settings:
+        for fw_upd in settings[:run_length]:
             monitor_uri = fw_upd.get('task_monitor')
             if not monitor_uri:
                 completed += 1
@@ -1904,12 +1947,11 @@ class RedfishFirmware(base.FirmwareInterface):
             self._fail_batched_update(task, node, fw_upd, sushy_task)
             return
 
-        total = len(settings)
         LOG.debug('Batched firmware update progress for node %(node)s: '
                   '%(completed)d/%(total)d completed, '
                   '%(running)d still running',
                   {'node': node.uuid, 'completed': completed,
-                   'total': total, 'running': still_running})
+                   'total': run_length, 'running': still_running})
 
         node.set_driver_internal_info('redfish_fw_updates', settings)
         node.save()
@@ -1941,16 +1983,51 @@ class RedfishFirmware(base.FirmwareInterface):
         self._report_step_error(task, error_msg)
 
     def _finalize_batched_update(self, task):
-        """Complete the batched firmware update after all tasks finish.
+        """Complete the current batch segment and hand off if more remain.
 
-        Validates BMC stability, refreshes the firmware component cache,
-        and resumes the conductor step flow.
+        Pops the completed batch components from settings. If more
+        components remain, hands off to _start_next_segment for the next
+        segment (which might be a sequential BMC update or another batch).
+        Otherwise, validates stability, caches firmware, and resumes.
 
         :param task: a TaskManager instance
         """
         node = task.node
-        LOG.info('All batched firmware updates completed for node %(node)s.',
-                 {'node': node.uuid})
+        settings = node.driver_internal_info.get('redfish_fw_updates', [])
+        run_length = _leading_batchable_run(settings)
+
+        LOG.info('Batch segment of %(count)d components completed for node '
+                 '%(node)s.',
+                 {'count': run_length, 'node': node.uuid})
+
+        for _ in range(run_length):
+            settings.pop(0)
+
+        node.del_driver_internal_info(FIRMWARE_BATCH_SUBMITTED)
+        node.del_driver_internal_info(FIRMWARE_BATCH_REBOOT_TIME)
+        node.del_driver_internal_info(FIRMWARE_BATCH_CURRENT_INDEX)
+
+        if settings:
+            LOG.info('%(remaining)d components remaining for node %(node)s. '
+                     'Continuing with next segment.',
+                     {'remaining': len(settings), 'node': node.uuid})
+            node.set_driver_internal_info('redfish_fw_updates', settings)
+            node.save()
+
+            try:
+                update_service = redfish_utils.get_update_service(node)
+            except exception.RedfishError as e:
+                error_msg = (
+                    _('Failed to get update service for node %(node)s '
+                      'while continuing after batch: %(error)s')
+                    % {'node': node.uuid, 'error': e})
+                LOG.error(error_msg)
+                self._clear_updates(node)
+                self._report_step_error(task, error_msg)
+                return
+
+            self._start_next_segment(task, update_service, settings)
+            return
 
         LOG.debug('Validating BMC responsiveness before resuming '
                   'conductor operations for node %(node)s',

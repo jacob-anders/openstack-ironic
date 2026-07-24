@@ -3724,3 +3724,366 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
 
             mock_check_batch.assert_not_called()
             mock_handle_task.assert_called_once()
+
+    def test_leading_batchable_run_all_non_bmc(self):
+        settings = [
+            {'component': 'bios', 'url': 'http://bios/v1.0.0'},
+            {'component': 'nic:NIC.1-1', 'url': 'http://nic/v2.0.0'},
+        ]
+        self.assertEqual(2, redfish_fw._leading_batchable_run(settings))
+
+    def test_leading_batchable_run_bmc_first(self):
+        settings = [
+            {'component': 'bmc', 'url': 'http://bmc/v1.0.0'},
+            {'component': 'bios', 'url': 'http://bios/v1.0.0'},
+            {'component': 'nic:NIC.1-1', 'url': 'http://nic/v2.0.0'},
+        ]
+        self.assertEqual(0, redfish_fw._leading_batchable_run(settings))
+
+    def test_leading_batchable_run_bmc_middle(self):
+        settings = [
+            {'component': 'bios', 'url': 'http://bios/v1.0.0'},
+            {'component': 'bmc', 'url': 'http://bmc/v1.0.0'},
+            {'component': 'nic:NIC.1-1', 'url': 'http://nic/v2.0.0'},
+        ]
+        self.assertEqual(1, redfish_fw._leading_batchable_run(settings))
+
+    def test_leading_batchable_run_bmc_last(self):
+        settings = [
+            {'component': 'bios', 'url': 'http://bios/v1.0.0'},
+            {'component': 'nic:NIC.1-1', 'url': 'http://nic/v2.0.0'},
+            {'component': 'bmc', 'url': 'http://bmc/v1.0.0'},
+        ]
+        self.assertEqual(2, redfish_fw._leading_batchable_run(settings))
+
+    def test_leading_batchable_run_duplicate_component(self):
+        settings = [
+            {'component': 'bios', 'url': 'http://bios/v1.0.0'},
+            {'component': 'bios', 'url': 'http://bios/v2.0.0'},
+        ]
+        self.assertEqual(1, redfish_fw._leading_batchable_run(settings))
+
+    def test_leading_batchable_run_single_component(self):
+        settings = [
+            {'component': 'bios', 'url': 'http://bios/v1.0.0'},
+        ]
+        self.assertEqual(1, redfish_fw._leading_batchable_run(settings))
+
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       '_execute_batched_non_bmc_updates', autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware, '_execute_firmware_update',
+                       autospec=True)
+    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
+    def test_update_bmc_first_falls_through_to_sequential(
+            self, mock_get_update_service, mock_execute_fw_update,
+            mock_execute_batched):
+        """[bmc, bios, nic] — BMC first, run_length=0 < 2, sequential."""
+        settings = [
+            {'component': 'bmc', 'url': 'http://bmc/v1.0.0'},
+            {'component': 'bios', 'url': 'http://bios/v1.0.0'},
+            {'component': 'nic:NIC.1-1', 'url': 'http://nic/v2.0.0'},
+        ]
+        mock_execute_fw_update.side_effect = self._mock_exc_fwup_side_effect
+
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            task.node.service_step = {'step': 'update',
+                                      'interface': 'firmware'}
+            task.driver.firmware.update(task, settings,
+                                        allow_grouping_reboots=True)
+            mock_execute_fw_update.assert_called_once()
+            mock_execute_batched.assert_not_called()
+
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       '_execute_batched_non_bmc_updates', autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware, '_execute_firmware_update',
+                       autospec=True)
+    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
+    def test_update_single_non_bmc_falls_through_to_sequential(
+            self, mock_get_update_service, mock_execute_fw_update,
+            mock_execute_batched):
+        """[bios] — single component, run_length=1 < 2, sequential."""
+        settings = [
+            {'component': 'bios', 'url': 'http://bios/v1.0.0'},
+        ]
+        mock_execute_fw_update.side_effect = self._mock_exc_fwup_side_effect
+
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            task.node.service_step = {'step': 'update',
+                                      'interface': 'firmware'}
+            task.driver.firmware.update(task, settings,
+                                        allow_grouping_reboots=True)
+            mock_execute_fw_update.assert_called_once()
+            mock_execute_batched.assert_not_called()
+
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       '_execute_batched_non_bmc_updates', autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware, '_execute_firmware_update',
+                       autospec=True)
+    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
+    def test_update_bios_bmc_nic_sequential_only(
+            self, mock_get_update_service, mock_execute_fw_update,
+            mock_execute_batched):
+        """[bios, bmc, nic] — run_length=1 < 2, all sequential."""
+        settings = [
+            {'component': 'bios', 'url': 'http://bios/v1.0.0'},
+            {'component': 'bmc', 'url': 'http://bmc/v1.0.0'},
+            {'component': 'nic:NIC.1-1', 'url': 'http://nic/v2.0.0'},
+        ]
+        mock_execute_fw_update.side_effect = self._mock_exc_fwup_side_effect
+
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            task.node.service_step = {'step': 'update',
+                                      'interface': 'firmware'}
+            task.driver.firmware.update(task, settings,
+                                        allow_grouping_reboots=True)
+            mock_execute_fw_update.assert_called_once()
+            mock_execute_batched.assert_not_called()
+
+    @mock.patch.object(redfish_fw.RedfishFirmware, '_resume_step',
+                       autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware, '_clear_updates',
+                       autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       '_validate_resources_stability', autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       'cache_firmware_components', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_task_monitor', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
+    def test_finalize_batched_update_no_remaining(
+            self, mock_get_update_service, mock_get_task_monitor,
+            mock_cache_fw, mock_validate_stability, mock_clear_updates,
+            mock_resume_step):
+        """All settings in one batch, nothing remaining after finalize."""
+        settings = [
+            {'component': 'bios', 'url': 'http://bios/v1.0.0'},
+            {'component': 'nic:NIC.1-1', 'url': 'http://nic/v2.0.0'},
+        ]
+
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            task.node.service_step = {'step': 'update',
+                                      'interface': 'firmware'}
+            task.node.set_driver_internal_info('redfish_fw_updates', settings)
+            task.node.set_driver_internal_info(
+                'firmware_batch_submitted', True)
+            task.node.set_driver_internal_info('firmware_batched_update', True)
+            task.node.save()
+
+            firmware_interface = redfish_fw.RedfishFirmware()
+            firmware_interface._finalize_batched_update(task)
+
+            mock_validate_stability.assert_called_once()
+            mock_cache_fw.assert_called_once()
+            mock_clear_updates.assert_called_once()
+            mock_resume_step.assert_called_once()
+
+    @mock.patch.object(redfish_fw.RedfishFirmware, '_start_next_segment',
+                       autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware, '_clear_updates',
+                       autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       'cache_firmware_components', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
+    def test_finalize_batched_update_hands_off_remaining(
+            self, mock_get_update_service, mock_cache_fw,
+            mock_clear_updates, mock_start_next):
+        """[bios, nic, bmc] — batch completes [bios, nic], hands off bmc."""
+        settings = [
+            {'component': 'bios', 'url': 'http://bios/v1.0.0'},
+            {'component': 'nic:NIC.1-1', 'url': 'http://nic/v2.0.0'},
+            {'component': 'bmc', 'url': 'http://bmc/v1.0.0'},
+        ]
+
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            task.node.service_step = {'step': 'update',
+                                      'interface': 'firmware'}
+            task.node.set_driver_internal_info('redfish_fw_updates', settings)
+            task.node.set_driver_internal_info(
+                'firmware_batch_submitted', True)
+            task.node.set_driver_internal_info('firmware_batched_update', True)
+            task.node.save()
+
+            firmware_interface = redfish_fw.RedfishFirmware()
+            firmware_interface._finalize_batched_update(task)
+
+            mock_start_next.assert_called_once()
+            remaining = mock_start_next.call_args[0][3]
+            self.assertEqual(1, len(remaining))
+            self.assertEqual('bmc', remaining[0]['component'])
+            mock_cache_fw.assert_not_called()
+            mock_clear_updates.assert_not_called()
+            info = task.node.driver_internal_info
+            self.assertNotIn('firmware_batch_submitted', info)
+            self.assertNotIn('firmware_batch_reboot_time', info)
+
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       '_execute_batched_non_bmc_updates', autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware, '_execute_firmware_update',
+                       autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       '_validate_resources_stability', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
+    def test_continue_updates_enters_batch_after_bmc(
+            self, mock_get_update_service, mock_validate_stability,
+            mock_execute_fw_update, mock_execute_batched):
+        """After BMC sequential, remaining [bios, nic] enter batch path."""
+        settings = [
+            {'component': 'bmc', 'url': 'http://bmc/v1.0.0'},
+            {'component': 'bios', 'url': 'http://bios/v1.0.0'},
+            {'component': 'nic:NIC.1-1', 'url': 'http://nic/v2.0.0'},
+        ]
+
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            task.node.service_step = {'step': 'update',
+                                      'interface': 'firmware'}
+            task.node.set_driver_internal_info('redfish_fw_updates', settings)
+            task.node.set_driver_internal_info('firmware_batched_update', True)
+            task.node.save()
+
+            firmware_interface = redfish_fw.RedfishFirmware()
+            mock_update_service = mock_get_update_service.return_value
+            firmware_interface._continue_updates(
+                task, mock_update_service, settings)
+
+            mock_execute_batched.assert_called_once()
+            batched_settings = mock_execute_batched.call_args[0][3]
+            self.assertEqual(2, len(batched_settings))
+            self.assertEqual('bios', batched_settings[0]['component'])
+            mock_execute_fw_update.assert_not_called()
+
+    @mock.patch.object(manager_utils, 'node_power_action', autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       '_execute_batched_non_bmc_updates', autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware, '_execute_firmware_update',
+                       autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       '_validate_resources_stability', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
+    def test_continue_updates_single_remaining_stays_sequential(
+            self, mock_get_update_service, mock_validate_stability,
+            mock_execute_fw_update, mock_execute_batched,
+            mock_power_action):
+        """After BMC sequential, single remaining [bios] stays sequential."""
+        settings = [
+            {'component': 'bmc', 'url': 'http://bmc/v1.0.0'},
+            {'component': 'bios', 'url': 'http://bios/v1.0.0'},
+        ]
+        mock_execute_fw_update.side_effect = self._mock_exc_fwup_side_effect
+
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            task.node.service_step = {'step': 'update',
+                                      'interface': 'firmware'}
+            task.node.set_driver_internal_info('redfish_fw_updates', settings)
+            task.node.set_driver_internal_info('firmware_batched_update', True)
+            task.node.save()
+
+            firmware_interface = redfish_fw.RedfishFirmware()
+            mock_update_service = mock_get_update_service.return_value
+            firmware_interface._continue_updates(
+                task, mock_update_service, settings)
+
+            mock_execute_fw_update.assert_called_once()
+            mock_execute_batched.assert_not_called()
+
+    @mock.patch.object(manager_utils, 'node_power_action', autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware, '_execute_firmware_update',
+                       autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware, '_clear_updates',
+                       autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       '_validate_resources_stability', autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       'cache_firmware_components', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
+    def test_finalize_batched_bios_nic_bmc_submits_bmc(
+            self, mock_get_update_service, mock_cache_fw,
+            mock_validate_stability, mock_clear_updates,
+            mock_execute_fw_update, mock_power_action):
+        """N1 regression: [bios, nic, bmc] — BMC is submitted, not skipped.
+
+        _finalize_batched_update pops batch [bios, nic], then hands
+        [bmc] to _start_next_segment which must submit it via
+        _execute_firmware_update, NOT skip it.
+        """
+        settings = [
+            {'component': 'bios', 'url': 'http://bios/v1.0.0'},
+            {'component': 'nic:NIC.1-1', 'url': 'http://nic/v2.0.0'},
+            {'component': 'bmc', 'url': 'http://bmc/v1.0.0'},
+        ]
+        mock_execute_fw_update.side_effect = self._mock_exc_fwup_side_effect
+
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            task.node.service_step = {'step': 'update',
+                                      'interface': 'firmware'}
+            task.node.set_driver_internal_info('redfish_fw_updates', settings)
+            task.node.set_driver_internal_info(
+                'firmware_batch_submitted', True)
+            task.node.set_driver_internal_info('firmware_batched_update', True)
+            task.node.save()
+
+            firmware_interface = redfish_fw.RedfishFirmware()
+            firmware_interface._finalize_batched_update(task)
+
+            mock_execute_fw_update.assert_called_once()
+            submitted = mock_execute_fw_update.call_args[0][3]
+            self.assertEqual(1, len(submitted))
+            self.assertEqual('bmc', submitted[0]['component'])
+            mock_clear_updates.assert_not_called()
+            mock_cache_fw.assert_not_called()
+
+    @mock.patch.object(manager_utils, 'node_power_action', autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       '_execute_batched_non_bmc_updates', autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware, '_execute_firmware_update',
+                       autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware, '_clear_updates',
+                       autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       '_validate_resources_stability', autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       'cache_firmware_components', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
+    def test_finalize_batched_bios_nic_bmc_bios2_nic2_three_phases(
+            self, mock_get_update_service, mock_cache_fw,
+            mock_validate_stability, mock_clear_updates,
+            mock_execute_fw_update, mock_execute_batched,
+            mock_power_action):
+        """N1 regression: [bios, nic, bmc, bios2, nic2] — BMC submitted,
+        then [bios2, nic2] batched. Three phases, not two.
+        """
+        settings = [
+            {'component': 'bios', 'url': 'http://bios/v1.0.0'},
+            {'component': 'nic:NIC.1-1', 'url': 'http://nic/v2.0.0'},
+            {'component': 'bmc', 'url': 'http://bmc/v1.0.0'},
+            {'component': 'bios', 'url': 'http://bios2/v2.0.0'},
+            {'component': 'nic:NIC.Slot.2', 'url': 'http://nic2/v2.0.0'},
+        ]
+        mock_execute_fw_update.side_effect = self._mock_exc_fwup_side_effect
+
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            task.node.service_step = {'step': 'update',
+                                      'interface': 'firmware'}
+            task.node.set_driver_internal_info('redfish_fw_updates', settings)
+            task.node.set_driver_internal_info(
+                'firmware_batch_submitted', True)
+            task.node.set_driver_internal_info('firmware_batched_update', True)
+            task.node.save()
+
+            firmware_interface = redfish_fw.RedfishFirmware()
+            firmware_interface._finalize_batched_update(task)
+
+            mock_execute_fw_update.assert_called_once()
+            submitted = mock_execute_fw_update.call_args[0][3]
+            self.assertEqual('bmc', submitted[0]['component'])
+            self.assertEqual(3, len(submitted))
+            mock_execute_batched.assert_not_called()
+            mock_clear_updates.assert_not_called()
+            mock_cache_fw.assert_not_called()
