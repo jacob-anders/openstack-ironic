@@ -1,0 +1,11 @@
+---
+fixes:
+  - |
+    Improves Lifecycle Controller job checking on Dell iDRAC during
+    Redfish firmware updates. When the Redfish task of a BIOS update
+    disappears before Ironic can poll it, a job that ended in error, or
+    that can no longer be found, is now reported as a failed update rather
+    than treated as complete, and a temporary failure to read the job
+    queue is retried instead of triggering the reboot. Telling a failed
+    job from a successful one needs a recent sushy release; with older
+    releases a finished job is still assumed to have succeeded.

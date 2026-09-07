@@ -1293,6 +1293,8 @@ class RedfishFirmware(base.FirmwareInterface):
         :param current_update: the current firmware update being processed
         :returns: True if a matching scheduled job was found, False if
             no matching job exists, None if this check is not supported
+        :raises: RedfishError or sushy.exceptions.SushyError if the BMC
+            jobs cannot be read
         """
         vendor = task.node.properties.get('vendor', '')
         if vendor and 'Dell' in vendor.split():
@@ -1314,7 +1316,8 @@ class RedfishFirmware(base.FirmwareInterface):
         cases. Vendor-specific subclasses can override that method to
         query the BMC job queue. When the check is not supported
         (returns None), falls back to triggering a reboot
-        unconditionally.
+        unconditionally. When the BMC jobs cannot be read, nothing is
+        decided and the check is repeated on the next poll.
 
         :param task: a TaskManager instance
         :param node: an Ironic node object
@@ -1322,8 +1325,14 @@ class RedfishFirmware(base.FirmwareInterface):
         :param update_service: the sushy firmware update service
         :param settings: firmware update settings
         """
-        has_job = self._check_bmc_scheduled_firmware_update(
-            task, current_update)
+        try:
+            has_job = self._check_bmc_scheduled_firmware_update(
+                task, current_update)
+        except (exception.RedfishError, sushy.exceptions.SushyError) as e:
+            LOG.warning('Unable to check the BMC for a scheduled firmware '
+                        'job on node %(node)s: %(error)s. Will try again on '
+                        'the next poll.', {'node': node.uuid, 'error': e})
+            return
         task.upgrade_lock()
 
         if has_job is None:
