@@ -1,0 +1,8 @@
+---
+other:
+  - |
+    Adds helpers to the Redfish driver utilities for reading a node's
+    ``BootProgress`` and for deciding, after a reboot, whether the
+    reported state describes the new boot or is still latched from the
+    previous one. These are used by the firmware update post-reboot
+    verification; on their own they change no behaviour.
