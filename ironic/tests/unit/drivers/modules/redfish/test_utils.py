@@ -67,6 +67,14 @@ class RedfishUtilsTestCase(db_base.DbTestCase):
             self.parsed_driver_info['firmware_update_unresponsive_bmc_wait'],
             30)
 
+    def test_is_dell_node(self):
+        self.node.properties['vendor'] = 'Dell Inc.'
+        self.assertTrue(redfish_utils.is_dell_node(self.node))
+
+    def test_is_dell_node_no_vendor(self):
+        self.node.properties.pop('vendor', None)
+        self.assertFalse(redfish_utils.is_dell_node(self.node))
+
     def test_parse_driver_info_default_scheme(self):
         self.node.driver_info['redfish_address'] = 'example.com'
         response = redfish_utils.parse_driver_info(self.node)
