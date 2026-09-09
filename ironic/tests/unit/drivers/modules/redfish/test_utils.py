@@ -847,6 +847,23 @@ class RedfishUtilsSystemTestCase(db_base.DbTestCase):
         self.assertEqual(fake_conn.get_system.call_count, 2)
 
 
+class IsDellNodeTestCase(db_base.DbTestCase):
+
+    def test_is_dell_node(self):
+        for vendor, expected in [('Dell Inc.', True),
+                                 ('Dell', True),
+                                 ('HPE', False),
+                                 ('Dellsomething', False),
+                                 ('', False),
+                                 (None, False)]:
+            node = mock.Mock(properties={'vendor': vendor})
+            self.assertIs(expected, redfish_utils.is_dell_node(node))
+
+    def test_is_dell_node_no_vendor(self):
+        node = mock.Mock(properties={})
+        self.assertFalse(redfish_utils.is_dell_node(node))
+
+
 class GetBootProgressTargetsTestCase(db_base.DbTestCase):
 
     def test_service_step(self):

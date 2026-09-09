@@ -166,6 +166,80 @@ opts = [
                       'start applying firmware, while others can begin '
                       'immediately. This timeout helps determine which '
                       'behavior the hardware exhibits.')),
+    cfg.IntOpt('firmware_update_post_reboot_verify_timeout',
+               min=0,
+               default=1800,
+               help=_('Maximum time (in seconds) to wait, after a reboot '
+                      'to apply staged firmware, for the post-reboot '
+                      'verify phase to complete: a Dell Lifecycle '
+                      'Controller job finishing (Dell only) and the '
+                      'node reaching a target BootProgress state. '
+                      'During servicing the node must reach OSRunning, '
+                      'so that the firmware versions cached before the '
+                      'step resumes are current; during cleaning and '
+                      'deployment an earlier state is accepted, since '
+                      'no OS need boot. Each check is skipped when '
+                      'unavailable. The node may be flashing firmware '
+                      'during POST for part of this period, so it must '
+                      'accommodate a full POST cycle. Set to 0 to wait '
+                      'indefinitely, bounded only by '
+                      '``firmware_update_overall_timeout``. Default is '
+                      '1800 seconds (30 minutes).')),
+    cfg.IntOpt('firmware_update_os_running_timeout',
+               min=0,
+               default=300,
+               help=_('Maximum time (in seconds) to keep waiting for '
+                      'BootProgress to report OSRunning after the node '
+                      'has finished POST, reporting '
+                      'SystemHardwareInitializationComplete or '
+                      'OSBootStarted, during a servicing firmware '
+                      'update. The firmware versions cached '
+                      'before the step resumes are most accurate once '
+                      'the OS is fully running, but whether and when a '
+                      'BMC reports OSRunning is platform-specific and '
+                      'not guaranteed by the Redfish schema: some BMCs '
+                      'never advance past the end of POST. '
+                      'When this time elapses, Ironic logs a warning '
+                      'and proceeds. Set to 0 to not wait beyond the '
+                      'end of POST at all. Only applies to servicing: '
+                      'cleaning and deployment accept earlier boot '
+                      'states. Default is 300 seconds (5 minutes).')),
+    cfg.IntOpt('firmware_update_boot_check_delay',
+               min=0,
+               default=600,
+               help=_('Minimum time (in seconds) after a reboot issued '
+                      'to apply firmware before Ironic trusts a target '
+                      'BootProgress state it has not seen the node '
+                      'reach. A reboot request does not reset '
+                      'BootProgress: until the host actually resets, '
+                      'the BMC keeps reporting the state the previous '
+                      'boot ended in, so an immediate reading can be a '
+                      'stale one. It is also how long a node whose BMC '
+                      'does not report BootProgress at all is held '
+                      'before it is allowed to proceed. On hardware '
+                      'that gives no boot signal this delay stands in '
+                      'for the whole POST-and-flash window, during '
+                      'which the node must not be powered off, so it '
+                      'should comfortably exceed the slowest POST '
+                      'expected in the deployment. Where the reboot is '
+                      'observed instead -- BootProgress changes after '
+                      'the reset, or a non-target state is polled -- '
+                      'the delay does not apply and the node proceeds '
+                      'as soon as its boot state says it may. Default '
+                      'is 600 seconds (10 minutes).')),
+    cfg.IntOpt('firmware_update_reboot_watch_timeout',
+               min=0,
+               default=60,
+               help=_('How long (in seconds) to watch BootProgress, '
+                      'after issuing a reboot to apply firmware, for '
+                      'LastState to leave the value it held before the '
+                      'reboot, which proves the node reset. A BMC that '
+                      'resets slowly may need more. If the change is '
+                      'not seen within this time, Ironic falls back on '
+                      '``firmware_update_boot_check_delay``; a change '
+                      'seen later by the regular polling still counts. '
+                      'Set to 0 to disable the watch. Default is 60 '
+                      'seconds.')),
     cfg.IntOpt('firmware_update_overall_timeout',
                min=0,
                default=7200,

@@ -1,0 +1,43 @@
+---
+fixes:
+  - |
+    Redfish firmware updates no longer resume the clean, service or deploy
+    step as soon as the reboot applying staged firmware is issued. The
+    step now waits until the node has demonstrably completed the reboot:
+    on any BMC reporting ``BootProgress``, until the boot reaches the
+    step's target state (``OSRunning`` for servicing, which is waited for
+    up to ``[redfish]firmware_update_os_running_timeout`` once the node
+    has finished POST); on Dell iDRAC, additionally until the Lifecycle
+    Controller job(s) applying the firmware have finished, failing the
+    step if a job ends in error. Firmware versions are cached only after
+    these checks. Previously the node could be powered off while firmware
+    was still being flashed during POST. Effective Lifecycle Controller
+    verification requires sushy with ``DellJobCollection.get_jobs()``;
+    older releases fall back to a coarser check with a warning.
+  - |
+    A BMC that does not report ``BootProgress`` at all, such as HPE iLO,
+    no longer lets a Redfish firmware update resume immediately after the
+    reboot that applies the firmware. With no signal to wait on, the node
+    is instead held for a fixed, conservative
+    ``[redfish]firmware_update_boot_check_delay`` before the step
+    proceeds.
+upgrade:
+  - |
+    ``[redfish]firmware_update_post_reboot_verify_timeout`` (default 1800
+    seconds) now bounds the whole post-reboot verification for all vendors.
+    A new option ``[redfish]firmware_update_os_running_timeout`` (default
+    300 seconds, 0 to disable) bounds the wait for ``OSRunning`` during
+    servicing; on expiry the step proceeds with a warning.
+  - |
+    A new option ``[redfish]firmware_update_boot_check_delay`` (default
+    600 seconds) sets how long after a reboot to apply firmware Ironic
+    waits before trusting a ``BootProgress`` target state it has not seen
+    the node reach, and how long a node whose BMC reports no
+    ``BootProgress`` is held before the step proceeds. It should exceed
+    the slowest POST expected in the deployment, since on hardware that
+    reports nothing it stands in for the whole POST-and-flash window.
+    Ironic first watches ``BootProgress`` for up to
+    ``[redfish]firmware_update_reboot_watch_timeout`` (default 60
+    seconds, 0 to disable) for the state to leave its pre-reboot value;
+    where that change is seen, the reboot is proven and the delay does
+    not apply.
