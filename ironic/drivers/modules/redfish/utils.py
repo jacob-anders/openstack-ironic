@@ -136,6 +136,17 @@ def get_component_type(component):
     return None
 
 
+def is_dell_node(node):
+    """Check whether a node is Dell hardware.
+
+    :param node: an Ironic node object
+    :returns: True if the ``vendor`` property identifies the node as Dell
+        hardware, False otherwise
+    """
+    vendor = node.properties.get('vendor') or ''
+    return 'Dell' in vendor.split()
+
+
 def _parse_tls_settings(node, driver_info):
     """Parse TLS hardening settings from driver_info with config fallback.
 
