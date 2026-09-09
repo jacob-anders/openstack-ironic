@@ -1,0 +1,27 @@
+---
+features:
+  - |
+    The Redfish ``firmware.update`` step (cleaning, servicing and deploy)
+    accepts a new boolean argument ``allow_grouping_reboots``. When set,
+    adjacent non-BMC components in the ``settings`` list are staged one
+    after another and applied with a single consolidated host reboot
+    instead of one reboot per component. BMC entries segment the list,
+    since a BMC update resets the management controller rather than the
+    host; each segment of adjacent non-BMC components shares one reboot.
+    Duplicate components are rejected when grouping is enabled, and the
+    per-component ``wait`` argument is only supported for BMC components.
+    The default (``False``) keeps one reboot per component.
+  - |
+    All non-BMC Redfish firmware updates (BIOS, NIC and unknown component
+    types) now follow the same stage-then-reboot flow: the firmware is
+    staged via SimpleUpdate, the node is rebooted once the staging task is
+    terminal, and the step then waits in the post-reboot verify phase
+    until every check the platform makes available confirms the firmware
+    was applied (Dell Lifecycle Controller jobs and BootProgress), for
+    the whole segment, before resuming or continuing.
+deprecations:
+  - |
+    The ``[redfish]firmware_update_nic_starting_wait`` option is
+    deprecated and no longer used. NIC firmware updates use the unified
+    stage-then-reboot flow and no longer monitor the ``Starting`` task
+    state to decide whether a reboot is needed.
