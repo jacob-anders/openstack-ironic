@@ -1334,6 +1334,7 @@ def fast_track_able(task):
             and task.node.provision_state not in states.SERVICING_STATES
             # NOTE: Firmware updates require proper cleanup (e.g., virtual
             # media ejection) and should not use fast-track.
+            and not task.node.driver_internal_info.get('redfish_fw_update')
             and not task.node.driver_internal_info.get('redfish_fw_updates')
             and not task.node.driver_internal_info.get('firmware_updates'))
 
