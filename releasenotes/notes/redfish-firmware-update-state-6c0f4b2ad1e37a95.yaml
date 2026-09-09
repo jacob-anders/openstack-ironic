@@ -1,0 +1,34 @@
+---
+upgrade:
+  - |
+    The ``redfish`` firmware interface now tracks an in-progress firmware
+    update under a single ``redfish_fw_update`` entry in the node's
+    ``driver_internal_info`` (visible in ``baremetal node show``). It is a
+    versioned object holding the named state the update is in, the time
+    that state was entered, the remaining components, and the bookkeeping
+    each phase needs. Nothing else about the update is stored outside it.
+  - |
+    A firmware update that is in progress across the upgrade is migrated
+    automatically the first time the conductor polls it, with a warning,
+    but it is not resumed where it left off: which components had already
+    been staged on the BMC cannot be recovered from the old entries.
+    Ironic instead waits for the node's boot to complete, caches its
+    firmware components and resumes the step. Components that had not
+    been applied yet must be updated again.
+  - |
+    The following ``driver_internal_info`` entries are no longer written
+    by the ``redfish`` firmware interface and are removed from nodes as
+    they are migrated: ``redfish_fw_updates``,
+    ``redfish_fw_update_start_time``, ``firmware_cleanup``,
+    ``bmc_fw_version_before_update``, ``firmware_reboot_requested``,
+    ``firmware_batched_update``, ``firmware_batch_submitted``,
+    ``firmware_batch_current_index``, ``firmware_batch_reboot_time``,
+    ``firmware_batch_verify`` and ``firmware_allow_grouping``. The
+    per-component ``wait_start_time``, ``bmc_check_start_time``,
+    ``bmc_version_checking``, ``component_type``, ``bmc_update_completed``
+    and ``post_reboot_verify`` entries are no longer written either, and
+    are discarded with the components of the update that carried them.
+    Note that ``firmware_cleanup`` is still used by the deprecated
+    ``redfish`` management interface firmware update, which is unaffected
+    by this change. Any tooling that read these entries to follow a
+    firmware update should read ``redfish_fw_update`` instead.

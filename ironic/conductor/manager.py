@@ -1815,6 +1815,8 @@ class ConductorManager(base_manager.BaseConductorManager):
                     # cycling can interrupt the update process.
                     has_fw_update = (
                         task.node.driver_internal_info.get(
+                            'redfish_fw_update') is not None
+                        or task.node.driver_internal_info.get(
                             'redfish_fw_updates') is not None
                     )
                     if (task.node.provision_state in SYNC_EXCLUDED_STATES
