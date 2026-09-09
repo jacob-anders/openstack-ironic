@@ -47,6 +47,15 @@ NIC_STARTING_TIMESTAMP = 'nic_starting_timestamp'
 NIC_REBOOT_TRIGGERED = 'nic_reboot_triggered'
 BIOS_REBOOT_TRIGGERED = 'bios_reboot_triggered'
 BMC_UPDATE_COMPLETED = 'bmc_update_completed'
+POST_REBOOT_VERIFY = 'post_reboot_verify'
+
+# Values for the 'lc' and 'boot' gates within the POST_REBOOT_VERIFY state
+# dict, and for its 'next' key.
+_VERIFY_PENDING = 'pending'
+_VERIFY_PASSED = 'passed'
+_VERIFY_SKIPPED = 'skipped'
+_VERIFY_NEXT_FINALIZE = 'finalize'
+_VERIFY_NEXT_CONTINUE = 'continue'
 
 
 class RedfishFirmware(base.FirmwareInterface):
@@ -702,6 +711,91 @@ class RedfishFirmware(base.FirmwareInterface):
 
         return task_monitor.task_monitor_uri
 
+    def _observe_boot(self, node):
+        """Read the markers that show whether the node's host has reset.
+
+        :param node: the Ironic node object.
+        :returns: an observation from
+            :func:`redfish_utils.get_boot_observation`, or None if the
+            BMC cannot be read.
+        """
+        try:
+            system = redfish_utils.get_system(node)
+            return redfish_utils.get_boot_observation(system)
+        except (exception.RedfishError, sushy.exceptions.SushyError) as e:
+            LOG.warning('Could not read the boot state of node %(node)s '
+                        'before rebooting it to apply firmware: %(error)s. '
+                        'The reboot can only be confirmed by the boot '
+                        'progress that follows it.',
+                        {'node': node.uuid, 'error': e})
+            return None
+
+    def _start_post_reboot_verify(self, node, fw_upd, next_state):
+        """Enter the post-reboot verify phase for an apply-reboot.
+
+        Called before the reboot is requested, so that the phase is
+        recorded even if the conductor stops while the request is in
+        flight: a reboot must never be requested twice, since the second
+        one could interrupt firmware being flashed during POST.
+
+        :param node: the Ironic node object.
+        :param fw_upd: the settings dict for the update about to be
+            applied by the reboot. A JID ending its ``task_monitor`` URI
+            identifies the Dell LC job applying it. The
+            ``POST_REBOOT_VERIFY`` state is stored under this dict's
+            ``POST_REBOOT_VERIFY`` key.
+        :param next_state: ``'finalize'`` or ``'continue'`` -- what to
+            do once every available gate has passed.
+        """
+        jid = drac_fw.jid_from_task_monitor(fw_upd.get('task_monitor'))
+        fw_upd[POST_REBOOT_VERIFY] = {
+            'started': str(timeutils.utcnow().isoformat()),
+            'jids': [jid] if jid else [],
+            'lc': _VERIFY_PENDING,
+            'boot': _VERIFY_PENDING,
+            'before': self._observe_boot(node),
+            'reboot_issued': False,
+            'new_boot_observed': False,
+            'os_boot_started_at': None,
+            'next': next_state,
+        }
+
+    def _reboot_to_apply(self, task, settings, next_state,
+                         power_timeout=None):
+        """Reboot the node to apply staged firmware, then verify it.
+
+        The verify phase is persisted before the reboot is requested and
+        marked as issued once the request returns, so that a conductor
+        restart in between is detected instead of rebooting again.
+
+        :param task: a TaskManager instance.
+        :param settings: firmware update settings; the first entry is the
+            update applied by this reboot.
+        :param next_state: ``'finalize'`` or ``'continue'`` -- what to
+            do once every available gate has passed.
+        :param power_timeout: the power action timeout, or None for the
+            default.
+        """
+        node = task.node
+        fw_upd = settings[0]
+        self._start_post_reboot_verify(node, fw_upd, next_state)
+        if next_state == _VERIFY_NEXT_FINALIZE:
+            node.del_driver_internal_info(FIRMWARE_REBOOT_REQUESTED)
+        self._persist_post_reboot_verify(node, settings)
+
+        if power_timeout is None:
+            manager_utils.node_power_action(task, states.REBOOT)
+        else:
+            manager_utils.node_power_action(task, states.REBOOT,
+                                            power_timeout)
+
+        # The phase's delays and timeouts run from the reboot itself, not
+        # from preparing for it.
+        fw_upd[POST_REBOOT_VERIFY].update(
+            started=str(timeutils.utcnow().isoformat()),
+            reboot_issued=True)
+        self._persist_post_reboot_verify(node, settings)
+
     def _execute_firmware_update(self, node, update_service, settings):
         """Executes the next firmware update to the node
 
@@ -908,17 +1002,19 @@ class RedfishFirmware(base.FirmwareInterface):
             reboot_requested = node.driver_internal_info.get(
                 FIRMWARE_REBOOT_REQUESTED, False)
 
+            if reboot_requested:
+                if not fw_upd.get(POST_REBOOT_VERIFY):
+                    LOG.info('Rebooting node %(node)s to apply firmware. '
+                             'Will verify application before resuming.',
+                             {'node': node.uuid})
+                    self._reboot_to_apply(task, settings,
+                                          _VERIFY_NEXT_FINALIZE)
+                return
+
             self._clear_updates(node)
 
             LOG.info('Firmware updates completed for node %(node)s',
                      {'node': node.uuid})
-
-            # If reboot was requested (e.g., for BMC timeout or NIC
-            # completion), trigger the reboot before notifying conductor
-            if reboot_requested:
-                LOG.info('Rebooting node %(node)s to apply firmware updates',
-                         {'node': node.uuid})
-                manager_utils.node_power_action(task, states.REBOOT)
 
             LOG.debug('Validating BMC responsiveness before resuming '
                       'conductor operations for node %(node)s',
@@ -935,18 +1031,6 @@ class RedfishFirmware(base.FirmwareInterface):
             self._resume_step(task)
 
         else:
-            # Validate BMC resources are stable before continuing next update
-            LOG.info('Validating BMC responsiveness before continuing '
-                     'to next firmware update for node %(node)s',
-                     {'node': node.uuid})
-            self._validate_resources_stability(node)
-
-            settings.pop(0)
-            self._execute_firmware_update(node,
-                                          update_service,
-                                          settings)
-            node.save()
-
             # Only reboot if the component code requested it.
             if task.node.clean_step:
                 reboot_field = async_steps.CLEANING_REBOOT
@@ -962,13 +1046,32 @@ class RedfishFirmware(base.FirmwareInterface):
                              if reboot_field else True)
 
             if should_reboot:
-                power_timeout = settings[0].get('power_timeout', 0)
-                manager_utils.node_power_action(task, states.REBOOT,
-                                                power_timeout)
-            else:
-                LOG.debug('Component requested no immediate reboot for node '
-                          '%(node)s. Continuing with async polling.',
-                          {'node': node.uuid})
+                if not fw_upd.get(POST_REBOOT_VERIFY):
+                    LOG.info('Rebooting node %(node)s to apply '
+                             '%(component)s firmware before continuing to '
+                             'the next component. Will verify application '
+                             'before continuing.',
+                             {'node': node.uuid,
+                              'component': fw_upd['component']})
+                    self._reboot_to_apply(
+                        task, settings, _VERIFY_NEXT_CONTINUE,
+                        power_timeout=fw_upd.get('power_timeout', 0))
+                return
+
+            LOG.info('Validating BMC responsiveness before continuing '
+                     'to next firmware update for node %(node)s',
+                     {'node': node.uuid})
+            self._validate_resources_stability(node)
+
+            settings.pop(0)
+            self._execute_firmware_update(node,
+                                          update_service,
+                                          settings)
+            node.save()
+
+            LOG.debug('Component requested no immediate reboot for node '
+                      '%(node)s. Continuing with async polling.',
+                      {'node': node.uuid})
 
     def _clear_updates(self, node):
         """Clears firmware updates artifacts
@@ -1296,8 +1399,7 @@ class RedfishFirmware(base.FirmwareInterface):
         :raises: RedfishError or sushy.exceptions.SushyError if the BMC
             jobs cannot be read
         """
-        vendor = task.node.properties.get('vendor', '')
-        if vendor and 'Dell' in vendor.split():
+        if redfish_utils.is_dell_node(task.node):
             return drac_fw.check_scheduled_idrac_job(task, current_update)
         return None
 
@@ -1479,6 +1581,409 @@ class RedfishFirmware(base.FirmwareInterface):
         self._report_step_error(task, msg, traceback=False)
         return True
 
+    def _post_reboot_verify_timed_out(self, verify):
+        """Check whether the post-reboot verify phase has timed out.
+
+        :param verify: the POST_REBOOT_VERIFY state dict.
+        :returns: True if
+            ``CONF.redfish.firmware_update_post_reboot_verify_timeout``
+            is nonzero and has elapsed since ``verify['started']``,
+            False otherwise (including when the timeout is 0, meaning
+            unbounded).
+        """
+        timeout = CONF.redfish.firmware_update_post_reboot_verify_timeout
+        if timeout <= 0:
+            return False
+
+        started = timeutils.parse_isotime(verify['started'])
+        elapsed = timeutils.utcnow(True) - started
+        return elapsed.total_seconds() >= timeout
+
+    def _fail_post_reboot_verify(self, task, msg):
+        """Fail the step during the post-reboot verify phase.
+
+        :param task: a TaskManager instance.
+        :param msg: the error message.
+        """
+        LOG.error(msg)
+        self._clear_updates(task.node)
+        self._report_step_error(task, msg, traceback=False)
+
+    def _persist_post_reboot_verify(self, node, settings):
+        """Persist the (possibly updated) firmware update settings.
+
+        :param node: an Ironic node object.
+        :param settings: firmware update settings.
+        """
+        node.set_driver_internal_info('redfish_fw_updates', settings)
+        node.save()
+
+    def _run_lc_job_gate(self, task, settings, verify, timed_out):
+        """Run the Dell LC job gate.
+
+        Skipped (treated as passed) on non-Dell nodes, on Dell nodes
+        whose job collection is unavailable, and when the update's task
+        monitor named no LC job. Otherwise the gate holds the phase
+        until the LC job(s) applying the firmware are terminal. A job
+        collection that cannot be read holds the phase too: it says
+        nothing about the jobs.
+
+        :param task: a TaskManager instance.
+        :param settings: firmware update settings.
+        :param verify: the POST_REBOOT_VERIFY state dict.
+        :param timed_out: whether the overall phase timeout has
+            elapsed.
+        :returns: True if the caller should stop and return (the step
+            failed, or another poll is needed); False if the phase
+            should proceed to the BootProgress gate.
+        """
+        node = task.node
+        if not redfish_utils.is_dell_node(node):
+            verify['lc'] = _VERIFY_SKIPPED
+            self._persist_post_reboot_verify(node, settings)
+            return False
+
+        if not verify['jids']:
+            LOG.warning('The firmware update task of node %(node)s did '
+                        'not name a Lifecycle Controller job. Skipping '
+                        'the LC job gate.', {'node': node.uuid})
+            verify['lc'] = _VERIFY_SKIPPED
+            self._persist_post_reboot_verify(node, settings)
+            return False
+
+        timeout = CONF.redfish.firmware_update_post_reboot_verify_timeout
+        try:
+            status, detail = drac_fw.check_lc_jobs(task, verify['jids'])
+        except (exception.RedfishError, sushy.exceptions.SushyError) as e:
+            if timed_out:
+                msg = (_('Firmware update on node %(node)s was rebooted '
+                         'to apply firmware, but the Dell Lifecycle '
+                         'Controller job(s) %(jids)s could not be read '
+                         'within %(timeout)s seconds: %(error)s. The node '
+                         'may still be applying firmware during POST and '
+                         'must not be power-cycled until the Lifecycle '
+                         'Controller job finishes.')
+                       % {'node': node.uuid,
+                          'jids': ', '.join(verify['jids']),
+                          'timeout': timeout, 'error': e})
+                self._fail_post_reboot_verify(task, msg)
+                return True
+            LOG.warning('Unable to read Dell Lifecycle Controller job(s) '
+                        '%(jids)s for node %(node)s: %(error)s. Will check '
+                        'again on next poll.',
+                        {'jids': verify['jids'], 'node': node.uuid,
+                         'error': e})
+            self._persist_post_reboot_verify(node, settings)
+            return True
+
+        if status == drac_fw.LCJobStatus.ERROR:
+            msg = (_('Firmware update on node %(node)s failed: the '
+                     'Dell Lifecycle Controller did not apply the '
+                     'firmware: %(detail)s')
+                   % {'node': node.uuid, 'detail': detail})
+            self._fail_post_reboot_verify(task, msg)
+            return True
+        if status == drac_fw.LCJobStatus.RUNNING:
+            if timed_out:
+                msg = (_('Firmware update on node %(node)s was '
+                         'rebooted to apply firmware, but the Dell '
+                         'Lifecycle Controller job(s) %(jids)s did '
+                         'not finish within %(timeout)s seconds. '
+                         'The node may still be applying firmware '
+                         'during POST and must not be power-cycled '
+                         'until the Lifecycle Controller job '
+                         'finishes.')
+                       % {'node': node.uuid,
+                          'jids': ', '.join(verify['jids']),
+                          'timeout': timeout})
+                self._fail_post_reboot_verify(task, msg)
+                return True
+            LOG.debug('Dell Lifecycle Controller job(s) %(jids)s '
+                      'still running for node %(node)s. Will check '
+                      'again on next poll.',
+                      {'jids': verify['jids'], 'node': node.uuid})
+            self._persist_post_reboot_verify(node, settings)
+            return True
+        if status == drac_fw.LCJobStatus.UNAVAILABLE:
+            LOG.warning('Cannot verify Dell Lifecycle Controller '
+                        'job(s) for node %(node)s: %(detail)s. '
+                        'Skipping the LC job gate.',
+                        {'node': node.uuid, 'detail': detail})
+            verify['lc'] = _VERIFY_SKIPPED
+        else:
+            LOG.info('Dell Lifecycle Controller job(s) %(jids)s '
+                     'finished for node %(node)s.',
+                     {'jids': verify['jids'], 'node': node.uuid})
+            verify['lc'] = _VERIFY_PASSED
+        self._persist_post_reboot_verify(node, settings)
+        return False
+
+    def _os_running_wait_elapsed(self, verify):
+        """Whether the bounded wait for OSRunning is over.
+
+        Measured from the first observation of a booted-OS state, not
+        from the reboot: the node may have spent most of the phase
+        applying firmware during POST before the OS started at all.
+        Records that first observation on ``verify``.
+
+        :param verify: the POST_REBOOT_VERIFY state dict, updated in
+            place with ``os_boot_started_at`` on the first call.
+        :returns: True if the caller should stop waiting for OSRunning
+            and proceed, False if it should keep polling.
+        """
+        timeout = CONF.redfish.firmware_update_os_running_timeout
+        if timeout <= 0:
+            return True
+
+        started_at = verify.get('os_boot_started_at')
+        if started_at is None:
+            verify['os_boot_started_at'] = str(
+                timeutils.utcnow().isoformat())
+            return False
+
+        elapsed = timeutils.utcnow(True) - timeutils.parse_isotime(
+            started_at)
+        return elapsed.total_seconds() >= timeout
+
+    def _run_boot_progress_gate(self, task, settings, verify, timed_out,
+                                system):
+        """Run the BootProgress gate.
+
+        :param task: a TaskManager instance.
+        :param settings: firmware update settings.
+        :param verify: the POST_REBOOT_VERIFY state dict.
+        :param timed_out: whether the overall phase timeout has
+            elapsed.
+        :param system: the sushy System read in this poll, or None if it
+            could not be read.
+        :returns: True if the caller should stop and return (the step
+            failed, or another poll is needed); False if the phase
+            should proceed to its finish path.
+        """
+        node = task.node
+        timeout = CONF.redfish.firmware_update_post_reboot_verify_timeout
+
+        if system is None:
+            LOG.warning('Unable to read BootProgress for node %(node)s. '
+                        'Will check again on next poll.',
+                        {'node': node.uuid})
+            self._persist_post_reboot_verify(node, settings)
+            return True
+
+        check_delay = CONF.redfish.firmware_update_boot_check_delay
+        targets = redfish_utils.get_boot_progress_targets(node)
+        status, last_state, new_boot_observed = (
+            redfish_utils.check_boot_progress(
+                node, system, targets, reboot_time=verify['started'],
+                check_delay=check_delay,
+                new_boot_observed=verify['new_boot_observed']))
+        verify['new_boot_observed'] = new_boot_observed
+
+        if status == redfish_utils.BOOT_PROGRESS_WAITING:
+            # POST is over, but the step wants OSRunning, which some BMCs
+            # report late and others never report at all: how far up the
+            # ladder a BMC goes is platform-specific and not guaranteed
+            # by the Redfish schema. The end of POST is where that
+            # divergence starts, so bound the wait from there, well
+            # short of the whole phase, with the phase timeout as a
+            # backstop.
+            past_post = last_state in redfish_utils.BOOT_PROGRESS_POST_COMPLETE
+            awaiting = past_post and last_state not in targets
+            if awaiting and (self._os_running_wait_elapsed(verify)
+                             or timed_out):
+                LOG.warning('Node %(node)s reported BootProgress %(state)s '
+                            'but the BMC did not report OSRunning within '
+                            'the configured wait. Not every BMC reports '
+                            'OSRunning, so proceeding.',
+                            {'node': node.uuid, 'state': last_state})
+                verify['boot'] = _VERIFY_SKIPPED
+            elif not timed_out:
+                LOG.debug('BootProgress for node %(node)s: %(state)s. '
+                          'Still waiting for a target state.',
+                          {'node': node.uuid, 'state': last_state})
+                self._persist_post_reboot_verify(node, settings)
+                return True
+            elif node.service_step and not past_post:
+                msg = (_('Firmware update on node %(node)s was '
+                         'rebooted to apply firmware, but the node did '
+                         'not reach a target BootProgress state within '
+                         '%(timeout)s seconds. The OS did not boot on '
+                         'the new firmware.')
+                       % {'node': node.uuid, 'timeout': timeout})
+                self._fail_post_reboot_verify(task, msg)
+                return True
+            else:
+                LOG.warning('Node %(node)s did not reach a target '
+                            'BootProgress state within %(timeout)s '
+                            'seconds. Proceeding without a confirmed '
+                            'boot since this step does not require the '
+                            'OS to boot.',
+                            {'node': node.uuid, 'timeout': timeout})
+                verify['boot'] = _VERIFY_SKIPPED
+        elif status == redfish_utils.BOOT_PROGRESS_UNAVAILABLE:
+            # The BMC reports no BootProgress, so nothing here can say
+            # whether the node has finished POST -- and with it any
+            # firmware flashed during POST. Unless an LC job has already
+            # proven the POST ran, the configured check delay is the
+            # only protection the flash window has: wait it out rather
+            # than resuming, and possibly powering the node off, right
+            # after the reboot. The gate stays pending until then, so
+            # that the wait spans polls rather than ending on the next
+            # one.
+            if verify['lc'] != _VERIFY_PASSED:
+                started = timeutils.parse_isotime(verify['started'])
+                elapsed = (timeutils.utcnow(True) - started).total_seconds()
+                if elapsed < check_delay and not timed_out:
+                    LOG.debug('Node %(node)s reports no BootProgress '
+                              '%(secs)ds after the reboot to apply '
+                              'firmware. Waiting for %(delay)ds to pass '
+                              'before proceeding.',
+                              {'node': node.uuid, 'secs': int(elapsed),
+                               'delay': check_delay})
+                    self._persist_post_reboot_verify(node, settings)
+                    return True
+                LOG.info('Node %(node)s reports no BootProgress, so the '
+                         'reboot to apply firmware could not be observed. '
+                         'Proceeding after the configured %(delay)ds '
+                         'firmware_update_boot_check_delay, of which the '
+                         'node has now spent %(secs)ds since the reboot.',
+                         {'node': node.uuid, 'delay': check_delay,
+                          'secs': int(elapsed)})
+            verify['boot'] = _VERIFY_SKIPPED
+        else:
+            verify['boot'] = _VERIFY_PASSED
+
+        self._persist_post_reboot_verify(node, settings)
+        return False
+
+    def _finish_post_reboot_verify(self, task, update_service, settings,
+                                   current_update, verify):
+        """Dispatch once every available verify-phase gate has passed.
+
+        :param task: a TaskManager instance.
+        :param update_service: the sushy firmware update service.
+        :param settings: firmware update settings.
+        :param current_update: the current firmware update being
+            processed.
+        :param verify: the POST_REBOOT_VERIFY state dict.
+        """
+        node = task.node
+
+        if verify['next'] == _VERIFY_NEXT_FINALIZE:
+            self._clear_updates(node)
+
+            LOG.debug('Validating BMC responsiveness before resuming '
+                      'conductor operations for node %(node)s',
+                      {'node': node.uuid})
+            self._validate_resources_stability(node)
+
+            try:
+                self.cache_firmware_components(task)
+            except Exception as e:
+                LOG.warning('Failed to refresh firmware components for '
+                            'node %(node)s after firmware update: '
+                            '%(error)s',
+                            {'node': node.uuid, 'error': e})
+
+            self._resume_step(task)
+        else:
+            current_update.pop(POST_REBOOT_VERIFY, None)
+            settings.pop(0)
+
+            LOG.info('Validating BMC responsiveness before continuing '
+                     'to next firmware update for node %(node)s',
+                     {'node': node.uuid})
+            self._validate_resources_stability(node)
+
+            self._execute_firmware_update(node, update_service, settings)
+            node.save()
+
+    def _detect_reset(self, node, verify):
+        """Read the node's System and check whether the host has reset.
+
+        Compares the boot markers read in this poll with those read
+        before the reboot was requested, recording on ``verify`` that the
+        new boot has been observed once any of them shows the host reset.
+
+        :param node: an Ironic node object.
+        :param verify: the POST_REBOOT_VERIFY state dict, updated in
+            place.
+        :returns: the sushy System, or None if it could not be read.
+        """
+        try:
+            system = redfish_utils.get_system(node)
+            observation = redfish_utils.get_boot_observation(system)
+        except (exception.RedfishError, sushy.exceptions.SushyError) as e:
+            LOG.warning('Unable to read the boot state of node %(node)s: '
+                        '%(error)s. Will check again on next poll.',
+                        {'node': node.uuid, 'error': e})
+            return None
+
+        if (not verify['new_boot_observed']
+                and redfish_utils.boot_changed_since(verify['before'],
+                                                     observation)):
+            LOG.debug('Node %(node)s has reset since it was rebooted to '
+                      'apply firmware: %(before)s, now %(now)s.',
+                      {'node': node.uuid, 'before': verify['before'],
+                       'now': observation})
+            verify['new_boot_observed'] = True
+        return system
+
+    def _process_post_reboot_verify(self, task, update_service, settings,
+                                    current_update):
+        """Advance the post-reboot verify phase by one poll.
+
+        Checks whether the host has reset since the reboot, then runs
+        the LC job gate (Dell only) and the BootProgress gate. Each
+        gate either lets the phase proceed to the next one in this same
+        poll, returns to keep polling, or fails the step. Once every
+        available gate has passed, dispatches on the state's ``next`` key
+        via :meth:`_finish_post_reboot_verify`.
+
+        :param task: a TaskManager instance.
+        :param update_service: the sushy firmware update service.
+        :param settings: firmware update settings.
+        :param current_update: the current firmware update being
+            processed; must carry a ``POST_REBOOT_VERIFY`` state.
+        """
+        task.upgrade_lock()
+        node = task.node
+        verify = current_update[POST_REBOOT_VERIFY]
+        timed_out = self._post_reboot_verify_timed_out(verify)
+        system = self._detect_reset(node, verify)
+
+        if not verify['reboot_issued']:
+            # The conductor stopped between recording the phase and the
+            # reboot request returning. Requesting the reboot again could
+            # interrupt firmware being flashed during POST, so continue
+            # only if the node has visibly reset.
+            if not verify['new_boot_observed']:
+                msg = (_('Firmware update on node %(node)s was interrupted '
+                         'while rebooting the node to apply firmware, and '
+                         'it cannot be confirmed that the reboot took '
+                         'place. The reboot is not requested again, since '
+                         'the node may be applying firmware during POST. '
+                         'Check the node and its BMC before retrying the '
+                         'update.') % {'node': node.uuid})
+                self._fail_post_reboot_verify(task, msg)
+                return
+            LOG.info('Node %(node)s has reset since an interrupted reboot '
+                     'request to apply firmware. Continuing to verify the '
+                     'firmware application.', {'node': node.uuid})
+            verify['reboot_issued'] = True
+
+        if verify['lc'] == _VERIFY_PENDING:
+            if self._run_lc_job_gate(task, settings, verify, timed_out):
+                return
+
+        if verify['boot'] == _VERIFY_PENDING:
+            if self._run_boot_progress_gate(
+                    task, settings, verify, timed_out, system):
+                return
+
+        self._finish_post_reboot_verify(
+            task, update_service, settings, current_update, verify)
+
     def _handle_firmware_update_task(self, task, node, current_update,
                                      update_service, settings):
         """Handle the firmware update task monitoring and completion.
@@ -1632,6 +2137,14 @@ class RedfishFirmware(base.FirmwareInterface):
         # Note: Only touch after successful BMC communication to ensure
         # the process eventually times out if the BMC is unresponsive.
         node.touch_provisioning()
+
+        # The node was rebooted to apply staged firmware. Do not resume
+        # (or continue to the next component) until every available
+        # gate -- LC job, BootProgress -- passes.
+        if current_update.get(POST_REBOOT_VERIFY):
+            self._process_post_reboot_verify(
+                task, update_service, settings, current_update)
+            return
 
         wait_start_time = current_update.get('wait_start_time')
         if wait_start_time:
