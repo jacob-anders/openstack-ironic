@@ -1569,6 +1569,55 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
         ]
         log_mock.info.assert_has_calls(info_call)
 
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       'cache_firmware_components', autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       '_validate_resources_stability', autospec=True)
+    @mock.patch.object(manager_utils, 'notify_conductor_resume_clean',
+                       autospec=True)
+    def test_continue_updates_last_non_bmc_no_validation(
+            self, cond_resume_clean_mock, validate_mock, cache_mock):
+        """A non-BMC update resumes without the BMC stability wait.
+
+        Only a BMC firmware update can leave the BMC's web service
+        flapping; a BIOS update does not touch it.
+        """
+        self._generate_new_driver_internal_info(['bios'])
+        task = self._test_continue_updates()
+
+        cond_resume_clean_mock.assert_called_once_with(task)
+        validate_mock.assert_not_called()
+        cache_mock.assert_called_once_with(mock.ANY, task)
+
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       'cache_firmware_components', autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       '_validate_resources_stability', autospec=True)
+    @mock.patch.object(manager_utils, 'notify_conductor_resume_clean',
+                       autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       '_get_current_bmc_version', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
+    def test_bmc_completion_validates_stability(
+            self, get_us_mock, get_bmc_version_mock, cond_resume_clean_mock,
+            validate_mock, cache_mock):
+        """A completed BMC update validates before resuming the step."""
+        self._generate_new_driver_internal_info(['bmc'])
+        settings = self.node.driver_internal_info['redfish_fw_updates']
+        get_bmc_version_mock.return_value = '2.0.0'
+
+        firmware = redfish_fw.RedfishFirmware()
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            task.node.set_driver_internal_info(
+                'bmc_fw_version_before_update', '1.0.0')
+
+            firmware._handle_bmc_update_completion(
+                task, get_us_mock.return_value, settings, settings[0])
+
+            validate_mock.assert_called_once_with(firmware, task.node)
+            cond_resume_clean_mock.assert_called_once_with(task)
+
     @mock.patch.object(redfish_utils, 'watch_boot_progress_change',
                        autospec=True)
     @mock.patch.object(redfish_utils, 'get_system', autospec=True)
@@ -3570,7 +3619,9 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
             firmware._check_node_redfish_firmware_update(task)
 
             clear_mock.assert_called_once_with(firmware, task.node)
-            validate_mock.assert_called_once_with(firmware, task.node)
+            # The reboot gates have just read from the BMC, which never
+            # reset, so the stability validation is not run again.
+            validate_mock.assert_not_called()
             cache_mock.assert_called_once_with(firmware, task)
             resume_mock.assert_called_once_with(firmware, task)
 
@@ -4120,7 +4171,9 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
             clear_mock.assert_not_called()
             cache_mock.assert_not_called()
             resume_mock.assert_not_called()
-            validate_mock.assert_called_once_with(firmware, task.node)
+            # The apply reboot was gated on the BMC answering, so the
+            # next component is submitted without a stability wait.
+            validate_mock.assert_not_called()
             execute_mock.assert_called_once()
             # _execute_firmware_update(self, node, update_service, settings)
             remaining = execute_mock.call_args[0][3]

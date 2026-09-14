@@ -1,0 +1,16 @@
+---
+fixes:
+  - |
+    The BMC resource stability validation that follows a Redfish firmware
+    update -- repeated reads of ``System``, ``Manager`` and the chassis
+    ``NetworkAdapters`` until
+    ``[redfish]firmware_update_required_successes`` consecutive reads
+    succeed -- now runs only after a BMC firmware update, the case it was
+    written for, where the BMC's own web service can answer and then drop
+    out again while the new image comes up. After a reboot applying any
+    other firmware the BMC never reset, and the Lifecycle Controller job
+    and ``BootProgress`` checks gating that reboot have just read from it,
+    so the validation added its full duration -- by default three
+    successful rounds at ``[redfish]firmware_update_validation_interval``
+    apart, about a minute -- to every such update without proving
+    anything new.
