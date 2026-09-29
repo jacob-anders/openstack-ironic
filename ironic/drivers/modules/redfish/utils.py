@@ -134,6 +134,22 @@ def get_component_type(component):
     return None
 
 
+def get_system_vendor(node):
+    """Use the cached vendor, or discover it before choosing OEM checks."""
+    return (node.properties.get('vendor')
+            or get_system(node).manufacturer or '')
+
+
+def is_dell_node(node):
+    """Check whether a node is Dell hardware.
+
+    :param node: an Ironic node object
+    :returns: True if the ``vendor`` property identifies the node as Dell
+        hardware, False otherwise
+    """
+    return 'dell' in get_system_vendor(node).lower().split()
+
+
 def _parse_tls_settings(node, driver_info):
     """Parse TLS hardening settings from driver_info with config fallback.
 
@@ -513,7 +529,7 @@ def get_task_monitor(node, uri):
         LOG.error('The Redfish TaskMonitor "%(uri)s" was not found for '
                   'node %(node)s. Error %(error)s',
                   {'uri': uri, 'node': node.uuid, 'error': e})
-        raise exception.RedfishError(error=e)
+        raise exception.RedfishTaskMonitorNotFound(error=e)
 
 
 def _get_connection(node, lambda_fun, *args):
