@@ -1436,6 +1436,7 @@ class ErrorHandlersTestCase(db_base.DbTestCase):
                                  target_provision_state=states.NOSTATE,
                                  maintenance=False, maintenance_reason=None,
                                  id=fake_node.id)
+        self.node.driver_internal_info.get.return_value = None
         self.task.context = self.context
 
     @mock.patch.object(conductor_utils, 'LOG', autospec=True)
@@ -2751,6 +2752,16 @@ class FastTrackTestCase(db_base.DbTestCase):
                 self.context, self.node.uuid, shared=False) as task:
             task.node.set_driver_internal_info('redfish_fw_updates',
                                                [{'url': 'http://test'}])
+            self.assertFalse(conductor_utils.is_fast_track(task))
+
+    def test_is_fast_track_redfish_fw_update_state(self, mock_get_power):
+        mock_get_power.return_value = states.POWER_ON
+        with task_manager.acquire(
+                self.context, self.node.uuid, shared=False) as task:
+            task.node.set_driver_internal_info(
+                'redfish_fw_update',
+                {'version': 1, 'state': 'staging',
+                 'settings': [{'url': 'http://test'}]})
             self.assertFalse(conductor_utils.is_fast_track(task))
 
     def test_is_fast_track_firmware_updates(self, mock_get_power):
