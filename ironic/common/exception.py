@@ -713,6 +713,10 @@ class RedfishTaskMonitorNotFound(RedfishError):
     """The BMC has removed a task monitor (an actual HTTP 404)."""
 
 
+class FirmwareUpdateFailed(RedfishError):
+    """A terminal firmware failure, rather than a retryable Redfish error."""
+
+
 class RedfishConnectionError(RedfishError):
     _msg_fmt = _("Redfish connection failed for node %(node)s: %(error)s")
 
@@ -1169,3 +1173,8 @@ class InvalidContent(Invalid):
     """Invalid or malicious content has been provided to the conductor."""
     _msg_fmt = _("Invalid or potentially malicious content has been provided "
                  "to the conductor and the conductor will not proceed.")
+
+
+class InvalidFirmwareUpdateState(IronicException):
+    _msg_fmt = _("Invalid Redfish firmware update state transition for "
+                 "node %(node)s: %(old)s -> %(new)s")

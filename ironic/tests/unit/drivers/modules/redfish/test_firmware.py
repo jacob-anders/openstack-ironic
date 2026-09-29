@@ -12,6 +12,7 @@
 #    under the License.
 
 import datetime
+import inspect
 import json
 import time
 from unittest import mock
@@ -20,12 +21,14 @@ from oslo_config import cfg
 from oslo_utils import timeutils
 import sushy
 
+from ironic.common import async_steps
 from ironic.common import exception
 from ironic.common import states
 from ironic.conductor import task_manager
 from ironic.conductor import utils as manager_utils
 from ironic.conf import CONF
 from ironic.drivers.modules import deploy_utils
+from ironic.drivers.modules.drac import firmware as drac_fw
 from ironic.drivers.modules.redfish import firmware as redfish_fw
 from ironic.drivers.modules.redfish import firmware_utils
 from ironic.drivers.modules.redfish import utils as redfish_utils
@@ -48,42 +51,37 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
                     enabled_management_interfaces=['redfish'],
                     enabled_firmware_interfaces=['redfish'])
         self.node = obj_utils.create_test_node(
-            self.context, driver='redfish', driver_info=INFO_DICT)
-
-    def _mock_exc_fwup_side_effect(self, firmware_interface, node,
-                                   update_service, settings_list):
-        """Helper to simulate _execute_firmware_update behavior.
-
-        The real _execute_firmware_update:
-        1. Adds a task_monitor field to the settings
-        2. Calls component-specific setup methods
-
-        This helper replicates that behavior for tests that mock
-        this method to avoid JSON serialization issues.
-
-        :param firmware_interface: The firmware interface instance (unused,
-                                   but passed by mock framework)
-        :param node: The node being updated
-        :param update_service: The update service
-        :param settings_list: The settings list
-        """
-        settings_list[0]['task_monitor'] = '/redfish/v1/TaskService/Tasks/1'
-
-        # Simulate component-specific setup that now happens inside
-        # _execute_firmware_update
-        fw_upd = settings_list[0]
-        component = fw_upd.get('component', '')
-
-        # Call the actual setup method based on component type
-        # This ensures the driver_internal_info is set correctly
-        if component == redfish_utils.BMC:
-            firmware_interface._setup_bmc_update_monitoring(node, fw_upd)
-        elif component.startswith(redfish_utils.NIC_COMPONENT_PREFIX):
-            firmware_interface._setup_nic_update_monitoring(node)
-        elif component == redfish_utils.BIOS:
-            firmware_interface._setup_bios_update_monitoring(node)
-        else:
-            firmware_interface._setup_default_update_monitoring(node, fw_upd)
+            self.context, driver='redfish', driver_info=INFO_DICT,
+            properties={'vendor': 'Generic'})
+        # Every reboot issued to apply firmware reads BootProgress and
+        # then watches it for the reset. Stub both out by default so
+        # tests neither sleep through the watch window nor reach for a
+        # BMC; tests that care set mock_read_boot_progress.return_value
+        # and assert on mock_watch_boot.
+        self.read_boot_progress_patcher = mock.patch.object(
+            redfish_fw.RedfishFirmware, '_read_boot_progress',
+            autospec=True, return_value=None)
+        self.mock_read_boot_progress = (
+            self.read_boot_progress_patcher.start())
+        self.addCleanup(self.read_boot_progress_patcher.stop)
+        watch = mock.patch.object(
+            redfish_utils, 'watch_boot_progress_change', autospec=True,
+            return_value=False)
+        self.mock_watch_boot = watch.start()
+        self.addCleanup(watch.stop)
+        observation = mock.patch.object(
+            redfish_fw.RedfishFirmware, '_boot_observation', autospec=True,
+            return_value={'state': None, 'state_time': None,
+                          'reset': None, 'power': 'On'})
+        self.mock_observation = observation.start()
+        self.addCleanup(observation.stop)
+        self.config(firmware_update_inventory_wait=0, group='redfish')
+        snapshot = mock.patch.object(
+            drac_fw, 'snapshot_lc_jobs', autospec=True,
+            side_effect=lambda task: {
+                'supported': False, 'baseline': [], 'jobs': {}})
+        snapshot.start()
+        self.addCleanup(snapshot.stop)
 
     def test_get_properties(self):
         with task_manager.acquire(self.context, self.node.uuid,
@@ -670,7 +668,6 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
                 'NetworkAdapter %(net_adp_id)s',
                 {'serial_number': 'SN12345', 'net_adp_id': 'NIC1'})
 
-
     @mock.patch.object(redfish_utils, 'LOG', autospec=True)
     @mock.patch.object(redfish_utils, '_get_connection', autospec=True)
     def test_missing_updateservice(self, conn_mock, log_mock):
@@ -813,83 +810,172 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
         self.node.save()
         self._test_invalid_settings_service()
 
+    # --- state object helpers -------------------------------------
+
+    def _make_verify(self, jids=(), lc='pending',
+                     boot='pending', new_boot_observed=False,
+                     os_boot_started_at=None):
+        """Build a verify state dict for tests."""
+        return {
+            'jids': list(jids),
+            'lc': lc,
+            'boot': boot,
+            'new_boot_observed': new_boot_observed,
+            'os_boot_started_at': os_boot_started_at,
+        }
+
+    def _make_segment(self, length, current=None, batched=True):
+        """Build a segment dict for tests."""
+        return {'length': length, 'current': current, 'batched': batched,
+                'started_at': timeutils.utcnow().isoformat(),
+                'jobs': {'supported': False, 'baseline': [], 'jobs': {}}}
+
+    def _make_bmc(self, version_before=None, wait_start=None,
+                  check_start=None, checking=False, reboot_requested=False):
+        """Build a BMC bookkeeping dict for tests."""
+        return {'version_before': version_before, 'wait_start': wait_start,
+                'check_start': check_start, 'checking': checking,
+                'reboot_requested': reboot_requested}
+
+    def _make_state(self, settings, state=None, started_at=None,
+                    entered_at=None, grouping=False, segment=None,
+                    reboot_time=None, bmc=None, verify=None,
+                    cleanup=None):
+        """Build a redfish_fw_update state object for tests."""
+        now = str(timeutils.utcnow().isoformat())
+        return {
+            'version': redfish_fw.STATE_VERSION,
+            'state': state,
+            'entered_at': entered_at or now,
+            'started_at': started_at or now,
+            'settings': settings,
+            'cleanup': cleanup,
+            'grouping': grouping,
+            'segment': segment,
+            'reboot_time': reboot_time,
+            'bmc': bmc,
+            'verify': verify,
+        }
+
+    def _set_state(self, node=None, save=True, **kwargs):
+        """Store a state object on a node and return it."""
+        node = self.node if node is None else node
+        state = self._make_state(**kwargs)
+        node.set_driver_internal_info(redfish_fw.FIRMWARE_UPDATE_STATE,
+                                      state)
+        if save:
+            node.save()
+        return state
+
+    def _get_state(self, node=None):
+        """Read the state object back off a node."""
+        node = self.node if node is None else node
+        return node.driver_internal_info.get(
+            redfish_fw.FIRMWARE_UPDATE_STATE)
+
     @mock.patch.object(time, 'sleep', lambda seconds: None)
     def _generate_new_driver_internal_info(self, components=[], invalid=False,
                                            add_wait=False, wait=1):
-        bmc_component = {'component': 'bmc', 'url': 'https://bmc/v1.0.1'}
-        bios_component = {'component': 'bios', 'url': 'https://bios/v1.0.1'}
-        if add_wait:
-            wait_start_time = timeutils.utcnow() -\
-                datetime.timedelta(minutes=1)
-            bmc_component['wait_start_time'] = wait_start_time.isoformat()
-            bios_component['wait_start_time'] = wait_start_time.isoformat()
-            bmc_component['wait'] = wait
-            bios_component['wait'] = wait
-
         self.node.clean_step = {'priority': 100, 'interface': 'bios',
                                 'step': 'apply_configuration',
                                 'argsinfo': {'settings': []}}
-
-        updates = []
-        if 'bmc' in components:
-            self.node.clean_step['argsinfo']['settings'].append(
-                bmc_component)
-            bmc_component['task_monitor'] = '/task/1'
-            updates.append(bmc_component)
-        if 'bios' in components:
-            self.node.clean_step['argsinfo']['settings'].append(
-                bios_component)
-            bios_component['task_monitor'] = '/task/2'
-            updates.append(bios_component)
-
-        if invalid:
-            self.node.provision_state = states.CLEANING
-            self.node.driver_internal_info = {'something': 'else'}
-        else:
-            self.node.provision_state = states.CLEANING
-            self.node.driver_internal_info = {
-                'redfish_fw_updates': updates,
-            }
-        self.node.save()
+        self.node.provision_state = states.CLEANING
+        self._generate_sequential_state(
+            self.node.clean_step, components, invalid, add_wait, wait)
 
     def _generate_new_driver_internal_info_service(self, components=[],
                                                    invalid=False,
                                                    add_wait=False, wait=1):
-        bmc_component = {'component': 'bmc', 'url': 'https://bmc/v1.0.1'}
-        bios_component = {'component': 'bios', 'url': 'https://bios/v1.0.1'}
-        if add_wait:
-            wait_start_time = timeutils.utcnow() -\
-                datetime.timedelta(minutes=1)
-            bmc_component['wait_start_time'] = wait_start_time.isoformat()
-            bios_component['wait_start_time'] = wait_start_time.isoformat()
-            bmc_component['wait'] = wait
-            bios_component['wait'] = wait
-
         self.node.service_step = {'priority': 100, 'interface': 'bios',
                                   'step': 'apply_configuration',
                                   'argsinfo': {'settings': []}}
+        self.node.provision_state = states.SERVICING
+        self._generate_sequential_state(
+            self.node.service_step, components, invalid, add_wait, wait)
+
+    def _generate_sequential_state(self, step, components, invalid,
+                                   add_wait, wait):
+        """Seed a node with a single-component segment being polled."""
+        bmc_component = {'component': 'bmc', 'url': 'https://bmc/v1.0.1'}
+        bios_component = {'component': 'bios', 'url': 'https://bios/v1.0.1'}
+        wait_start = None
+        if add_wait:
+            wait_start = (timeutils.utcnow()
+                          - datetime.timedelta(minutes=1)).isoformat()
+            bmc_component['wait'] = wait
+            bios_component['wait'] = wait
 
         updates = []
         if 'bmc' in components:
-            self.node.service_step['argsinfo']['settings'].append(
-                bmc_component)
+            step['argsinfo']['settings'].append(bmc_component)
             bmc_component['task_monitor'] = '/task/1'
             updates.append(bmc_component)
         if 'bios' in components:
-            self.node.service_step['argsinfo']['settings'].append(
-                bios_component)
+            step['argsinfo']['settings'].append(bios_component)
             bios_component['task_monitor'] = '/task/2'
             updates.append(bios_component)
 
         if invalid:
-            self.node.provision_state = states.SERVICING
             self.node.driver_internal_info = {'something': 'else'}
+            self.node.save()
+            return
+
+        self.node.driver_internal_info = {}
+        self._set_state(
+            settings=updates, state=redfish_fw.STATE_WAITING_BMC,
+            segment=self._make_segment(1, batched=False),
+            bmc=self._make_bmc(wait_start=wait_start))
+
+    def _setup_batched_post_reboot_verify(
+            self, jids=('1', '2'), vendor=None, service=True, lc='pending',
+            boot='pending', new_boot_observed=True, started=None,
+            os_boot_started_at=None):
+        """Set up node state as if all batch apply tasks just completed.
+
+        Both settings entries have already had 'task_monitor' popped,
+        matching the state the update is in right as the applying state
+        hands over to the verify states (still_running == 0).
+
+        :returns: the settings list, as stored in the state object.
+        """
+        if vendor is not None:
+            props = self.node.properties.copy()
+            props['vendor'] = vendor
+            self.node.properties = props
+
+        settings = [
+            {'component': 'bios', 'url': 'http://bios/v1.0.0'},
+            {'component': 'nic:NIC.1-1', 'url': 'http://nic/v2.0.0'},
+        ]
+        if service:
+            self.node.provision_state = states.SERVICEWAIT
+            self.node.service_step = {'step': 'update',
+                                      'interface': 'firmware'}
         else:
-            self.node.provision_state = states.SERVICING
-            self.node.driver_internal_info = {
-                'redfish_fw_updates': updates,
-            }
-        self.node.save()
+            self.node.provision_state = states.CLEANWAIT
+            self.node.clean_step = {'step': 'update',
+                                    'interface': 'firmware'}
+        if lc == 'pending':
+            state = redfish_fw.STATE_VERIFYING_APPLY
+        else:
+            state = redfish_fw.STATE_VERIFYING_BOOT
+        self.node.driver_internal_info = {}
+        self._set_state(
+            settings=settings, state=state, grouping=True,
+            segment=self._make_segment(2),
+            reboot_time=started or (
+                timeutils.utcnow() - datetime.timedelta(seconds=60)
+            ).isoformat(),
+            verify=self._make_verify(
+                list(jids), lc=lc, boot=boot,
+                new_boot_observed=new_boot_observed,
+                os_boot_started_at=os_boot_started_at))
+        return settings
+
+    def _boot_reply(self, value):
+        self.mock_observation.return_value = {
+            'state': value.value if isinstance(value, sushy.BootProgressStates)
+            else value, 'reset': None, 'state_time': None, 'power': 'On'}
 
     @mock.patch.object(task_manager, 'acquire', autospec=True)
     def _test__query_methods(self, acquire_mock):
@@ -905,18 +991,23 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
 
         firmware._check_node_redfish_firmware_update = mock.Mock()
         firmware._clear_updates = mock.Mock()
+        in_progress = self.node.driver_internal_info.get(
+            redfish_fw.FIRMWARE_UPDATE_STATE)
 
         # _query_update_status
+        self.node.provision_state = states.CLEANWAIT
         firmware._query_update_status(mock_manager, self.context)
-        if not self.node.driver_internal_info.get('redfish_fw_updates'):
+        if not in_progress:
             firmware._check_node_redfish_firmware_update.assert_not_called()
         else:
             firmware._check_node_redfish_firmware_update.\
                 assert_called_once_with(task)
 
         # _query_update_failed
+        self.node.provision_state = states.CLEANFAIL
+        self.node.maintenance = True
         firmware._query_update_failed(mock_manager, self.context)
-        if not self.node.driver_internal_info.get('redfish_fw_updates'):
+        if not in_progress:
             firmware._clear_updates.assert_not_called()
         else:
             firmware._clear_updates.assert_called_once_with(self.node)
@@ -929,9 +1020,60 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
         self._generate_new_driver_internal_info(invalid=True)
         self._test__query_methods()
 
+    def test_status_callback_ignores_a_node_that_failed_after_selection(self):
+        self.node.provision_state = states.SERVICEFAIL
+        self.node.maintenance = True
+        self.node.save()
+        interface = redfish_fw.RedfishFirmware()
+        with task_manager.acquire(self.context, self.node.uuid) as task:
+            with mock.patch.object(interface,
+                                   '_check_node_redfish_firmware_update',
+                                   autospec=True) as poll:
+                callback = inspect.unwrap(
+                    redfish_fw.RedfishFirmware._query_update_status)
+                callback(interface, task, None, None)
+                poll.assert_not_called()
+
+    def test_failure_callback_does_not_clear_a_new_update(self):
+        self.node.provision_state = states.SERVICEWAIT
+        self.node.save()
+        interface = redfish_fw.RedfishFirmware()
+        with task_manager.acquire(self.context, self.node.uuid) as task:
+            with mock.patch.object(interface, '_clear_updates',
+                                   autospec=True) as cleanup:
+                callback = inspect.unwrap(
+                    redfish_fw.RedfishFirmware._query_update_failed)
+                callback(interface, task, None, None)
+                cleanup.assert_not_called()
+
+    @mock.patch.object(manager_utils, 'node_power_action', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_task_monitor', autospec=True)
+    def test_read_error_does_not_advance_state(self, monitor, service, power):
+        monitor.side_effect = exception.RedfishError(error='unauthorized')
+        for phase in (redfish_fw.STATE_STAGING, redfish_fw.STATE_APPLYING,
+                      redfish_fw.STATE_WAITING_BMC):
+            with self.subTest(phase=phase):
+                self._set_state(
+                    settings=[{'component': 'bmc', 'url': 'https://fw/image',
+                               'task_monitor': '/tasks/1'}], state=phase,
+                    segment=self._make_segment(1, current=0),
+                    bmc=self._make_bmc())
+                interface = redfish_fw.RedfishFirmware()
+                with task_manager.acquire(self.context,
+                                          self.node.uuid) as task:
+                    interface._check_node_redfish_firmware_update(task)
+                    self.assertEqual(phase,
+                                     self._get_state(task.node)['state'])
+                    self.assertIn('unauthorized',
+                                  self._get_state(task.node)['last_error'])
+        power.assert_not_called()
+        service.return_value.simple_update.assert_not_called()
+
     def _test__check_node_redfish_firmware_update(self):
         firmware = redfish_fw.RedfishFirmware()
-        firmware._continue_updates = mock.Mock()
+        firmware._continue_after_bmc = mock.Mock()
+        firmware._get_current_bmc_version = mock.Mock(return_value=None)
         with task_manager.acquire(self.context, self.node.uuid,
                                   shared=False) as task:
             task.upgrade_lock = mock.Mock()
@@ -967,7 +1109,7 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
                 mock_touch.assert_called_once_with()
 
     @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
-    def test_check_skips_touch_provisioning_on_conn_error(
+    def test_check_touches_provisioning_on_conn_error(
             self, mock_get_update_service):
         """Test touch_provisioning is NOT called when BMC connection fails.
 
@@ -989,7 +1131,7 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
                 firmware._check_node_redfish_firmware_update(task)
 
                 # Verify touch_provisioning was NOT called on connection error
-                mock_touch.assert_not_called()
+                mock_touch.assert_called_once_with()
 
     @mock.patch.object(redfish_fw.manager_utils, 'cleaning_error_handler',
                        autospec=True)
@@ -1010,8 +1152,10 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
         # Set start time to 3 hours ago (exceeds 2 hour default timeout)
         past_time = (timeutils.utcnow()
                      - datetime.timedelta(hours=3)).isoformat()
-        self.node.set_driver_internal_info('redfish_fw_update_start_time',
-                                           past_time)
+        state = self._get_state()
+        state['started_at'] = past_time
+        self.node.set_driver_internal_info(
+            redfish_fw.FIRMWARE_UPDATE_STATE, state)
         self.node.save()
 
         firmware = redfish_fw.RedfishFirmware()
@@ -1028,10 +1172,8 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
             # Verify the firmware update info was cleaned up
             task.node.refresh()
             self.assertIsNone(
-                task.node.driver_internal_info.get('redfish_fw_updates'))
-            self.assertIsNone(
                 task.node.driver_internal_info.get(
-                    'redfish_fw_update_start_time'))
+                    redfish_fw.FIRMWARE_UPDATE_STATE))
 
     @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
     @mock.patch.object(redfish_utils, 'get_task_monitor', autospec=True)
@@ -1043,8 +1185,10 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
         # Set start time to 1 hour ago (within 2 hour default timeout)
         past_time = (timeutils.utcnow()
                      - datetime.timedelta(hours=1)).isoformat()
-        self.node.set_driver_internal_info('redfish_fw_update_start_time',
-                                           past_time)
+        state = self._get_state()
+        state['started_at'] = past_time
+        self.node.set_driver_internal_info(
+            redfish_fw.FIRMWARE_UPDATE_STATE, state)
         self.node.save()
 
         # Mock task still in progress
@@ -1088,19 +1232,21 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
         get_us_mock.return_value = mock_update_service
         self._generate_new_driver_internal_info(['bmc'], add_wait=True)
 
-        task, interface = self._test__check_node_redfish_firmware_update()
-        debug_calls = [
-            mock.call('Finished waiting after firmware update '
-                      '%(firmware_image)s on node %(node)s. '
-                      'Elapsed time: %(seconds)s seconds',
-                      {'firmware_image': 'https://bmc/v1.0.1',
-                       'node': self.node.uuid, 'seconds': 60})]
-        log_mock.debug.assert_has_calls(debug_calls)
-        interface._continue_updates.assert_called_once_with(
-            task,
-            mock_update_service,
-            [{'component': 'bmc', 'url': 'https://bmc/v1.0.1',
-              'task_monitor': '/task/1'}])
+        firmware = redfish_fw.RedfishFirmware()
+        firmware._bmc_wait_completed = mock.Mock(return_value=None)
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            task.upgrade_lock = mock.Mock()
+            firmware._check_node_redfish_firmware_update(task)
+
+            debug_calls = [
+                mock.call('Finished waiting after firmware update '
+                          '%(firmware_image)s on node %(node)s. '
+                          'Elapsed time: %(seconds)s seconds',
+                          {'firmware_image': 'https://bmc/v1.0.1',
+                           'node': self.node.uuid, 'seconds': 60})]
+            log_mock.debug.assert_has_calls(debug_calls)
+            firmware._bmc_wait_completed.assert_called_once()
 
     @mock.patch.object(redfish_fw, 'LOG', autospec=True)
     @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
@@ -1118,19 +1264,37 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
                       {'firmware_image': 'https://bios/v1.0.1',
                        'node': self.node.uuid, 'seconds': 60})]
         log_mock.debug.assert_has_calls(debug_calls)
-        interface._continue_updates.assert_not_called()
+        interface._continue_after_bmc.assert_not_called()
+
+    @mock.patch.object(redfish_fw, 'LOG', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_task_monitor', autospec=True)
+    def test_check_update_task_monitor_not_found(self, tm_mock, get_us_mock,
+                                                 log_mock):
+        tm_mock.side_effect = exception.RedfishTaskMonitorNotFound()
+        self._generate_new_driver_internal_info(['bios'])
+
+        task, interface = self._test__check_node_redfish_firmware_update()
+
+        log_mock.warning.assert_called_once_with(
+            'Firmware update completed for node %(node)s, '
+            'firmware %(firmware_image)s, but success of the '
+            'update is unknown.  Assuming update was successful.',
+            {'node': self.node.uuid,
+             'firmware_image': 'https://bios/v1.0.1'})
+        # Non-Dell: _check_bmc_scheduled_firmware_update returns None,
+        # so we assume success and continue
+        interface._continue_after_bmc.assert_not_called()
 
     @mock.patch('ironic.drivers.modules.drac.firmware'
                 '.check_scheduled_idrac_job', autospec=True)
     @mock.patch.object(redfish_fw, 'LOG', autospec=True)
-    @mock.patch.object(manager_utils, 'node_power_action', autospec=True)
     @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
     @mock.patch.object(redfish_utils, 'get_task_monitor', autospec=True)
-    def test_check_update_task_monitor_not_found_bios_job_found(
-            self, tm_mock, get_us_mock, power_mock, log_mock,
-            has_job_mock):
-        """TaskMonitor gone + BIOS + scheduled job exists = reboot."""
-        tm_mock.side_effect = exception.RedfishError()
+    def test_check_update_task_monitor_not_found_dell_job_found(
+            self, tm_mock, get_us_mock, log_mock, has_job_mock):
+        """TaskMonitor gone + Dell + scheduled job exists = continue."""
+        tm_mock.side_effect = exception.RedfishTaskMonitorNotFound()
         has_job_mock.return_value = True
         props = self.node.properties.copy()
         props['vendor'] = 'Dell Inc.'
@@ -1140,27 +1304,17 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
 
         task, interface = self._test__check_node_redfish_firmware_update()
 
-        log_mock.warning.assert_any_call(
-            'Firmware update completed for node %(node)s, '
-            'firmware %(firmware_image)s, but success of the '
-            'update is unknown.  Assuming update was successful.',
-            {'node': self.node.uuid,
-             'firmware_image': 'https://bios/v1.0.1'})
-        power_mock.assert_called_once_with(task, states.REBOOT, mock.ANY)
-        interface._continue_updates.assert_not_called()
+        interface._continue_after_bmc.assert_not_called()
 
     @mock.patch('ironic.drivers.modules.drac.firmware'
                 '.check_scheduled_idrac_job', autospec=True)
     @mock.patch.object(redfish_fw, 'LOG', autospec=True)
-    @mock.patch.object(manager_utils, 'node_power_action', autospec=True)
-    @mock.patch.object(manager_utils, 'cleaning_error_handler', autospec=True)
     @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
     @mock.patch.object(redfish_utils, 'get_task_monitor', autospec=True)
-    def test_check_update_task_monitor_not_found_bios_no_job(
-            self, tm_mock, get_us_mock, clean_err_mock, power_mock,
-            log_mock, has_job_mock):
-        """TaskMonitor gone + BIOS + no scheduled job = failure."""
-        tm_mock.side_effect = exception.RedfishError()
+    def test_check_update_task_monitor_not_found_dell_no_job(
+            self, tm_mock, get_us_mock, log_mock, has_job_mock):
+        """TaskMonitor gone + Dell + no scheduled job = failure."""
+        tm_mock.side_effect = exception.RedfishTaskMonitorNotFound()
         has_job_mock.return_value = False
         props = self.node.properties.copy()
         props['vendor'] = 'Dell Inc.'
@@ -1170,64 +1324,22 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
 
         task, interface = self._test__check_node_redfish_firmware_update()
 
-        power_mock.assert_not_called()
-        interface._continue_updates.assert_not_called()
-        clean_err_mock.assert_called_once()
-
-    @mock.patch('ironic.drivers.modules.drac.firmware'
-                '.check_scheduled_idrac_job', autospec=True)
-    @mock.patch.object(redfish_fw, 'LOG', autospec=True)
-    @mock.patch.object(manager_utils, 'node_power_action', autospec=True)
-    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
-    @mock.patch.object(redfish_utils, 'get_task_monitor', autospec=True)
-    def test_check_update_task_monitor_not_found_bios_oem_unavailable(
-            self, tm_mock, get_us_mock, power_mock, log_mock,
-            has_job_mock):
-        """TaskMonitor gone + BIOS + OEM unavailable = fallback reboot."""
-        tm_mock.side_effect = exception.RedfishError()
-        has_job_mock.return_value = None
-        props = self.node.properties.copy()
-        props['vendor'] = 'Dell EMC'
-        self.node.properties = props
-        self.node.save()
-        self._generate_new_driver_internal_info(['bios'])
-
-        task, interface = self._test__check_node_redfish_firmware_update()
-
-        power_mock.assert_called_once_with(task, states.REBOOT, mock.ANY)
-        interface._continue_updates.assert_not_called()
-
-    @mock.patch.object(redfish_fw, 'LOG', autospec=True)
-    @mock.patch.object(manager_utils, 'node_power_action', autospec=True)
-    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
-    @mock.patch.object(redfish_utils, 'get_task_monitor', autospec=True)
-    def test_check_update_task_monitor_not_found_bios_non_dell(
-            self, tm_mock, get_us_mock, power_mock, log_mock):
-        """TaskMonitor gone + BIOS + non-Dell node = fallback reboot."""
-        tm_mock.side_effect = exception.RedfishError()
-        self._generate_new_driver_internal_info(['bios'])
-
-        task, interface = self._test__check_node_redfish_firmware_update()
-
-        power_mock.assert_called_once_with(task, states.REBOOT, mock.ANY)
-        interface._continue_updates.assert_not_called()
+        interface._continue_after_bmc.assert_not_called()
 
     @mock.patch.object(redfish_fw, 'LOG', autospec=True)
     @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
     @mock.patch.object(redfish_utils, 'get_task_monitor', autospec=True)
     def test_check_update_task_monitor_not_found_bmc(self, tm_mock,
                                                      get_us_mock, log_mock):
-        tm_mock.side_effect = exception.RedfishError()
+        tm_mock.side_effect = exception.RedfishTaskMonitorNotFound()
         self._generate_new_driver_internal_info(['bmc'])
 
         task, interface = self._test__check_node_redfish_firmware_update()
 
-        # Non-BIOS: should call _continue_updates directly
-        interface._continue_updates.assert_called_once_with(
-            task, get_us_mock.return_value,
-            [{'component': 'bmc', 'url': 'https://bmc/v1.0.1',
-              'task_monitor': '/task/1'}]
-        )
+        # A purged BMC task still requires version verification.
+        interface._continue_after_bmc.assert_not_called()
+        self.node.refresh()
+        self.assertTrue(self._get_state()['bmc']['checking'])
 
     @mock.patch.object(redfish_fw, 'LOG', autospec=True)
     @mock.patch.object(manager_utils, 'node_power_action', autospec=True)
@@ -1235,96 +1347,20 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
     @mock.patch.object(redfish_utils, 'get_task_monitor', autospec=True)
     def test_check_update_task_monitor_not_found_bios_already_rebooted(
             self, tm_mock, get_us_mock, power_mock, log_mock):
-        tm_mock.side_effect = exception.RedfishError()
+        tm_mock.side_effect = exception.RedfishTaskMonitorNotFound()
         self._generate_new_driver_internal_info(['bios'])
         # Simulate reboot already triggered on previous poll
-        settings = self.node.driver_internal_info['redfish_fw_updates']
-        settings[0]['bios_reboot_triggered'] = True
-        self.node.set_driver_internal_info('redfish_fw_updates', settings)
+        state = self._get_state()
+        state['settings'][0]['bios_reboot_triggered'] = True
+        self.node.set_driver_internal_info(
+            redfish_fw.FIRMWARE_UPDATE_STATE, state)
         self.node.save()
 
         task, interface = self._test__check_node_redfish_firmware_update()
 
         # Reboot already done: should fall through to _continue_updates
         power_mock.assert_not_called()
-        interface._continue_updates.assert_called_once()
-
-    @mock.patch.object(redfish_utils, 'get_system', autospec=True)
-    def test_check_scheduled_idrac_job_found(self, get_system_mock):
-        """Dell iDRAC OEM returns scheduled LC job matching JID."""
-        from ironic.drivers.modules.drac import firmware as drac_fw
-        manager_mock = mock.Mock()
-        oem_mock = manager_mock.get_oem_extension.return_value
-        oem_mock.job_collection.get_jobs.return_value = [
-            mock.Mock(identity='JID_839968767020', job_state='Scheduled',
-                      job_type='FirmwareUpdate', message='LC message',
-                      message_id='LC message')]
-        get_system_mock.return_value.managers = [manager_mock]
-
-        current_update = {
-            'task_monitor': '/redfish/v1/TaskService/TaskMonitors/'
-                            'JID_839968767020'}
-
-        with task_manager.acquire(self.context, self.node.uuid,
-                                  shared=False) as task:
-            result = drac_fw.check_scheduled_idrac_job(
-                task, current_update)
-
-        self.assertIs(result, True)
-        manager_mock.get_oem_extension.assert_called_once_with('Dell')
-
-    @mock.patch.object(redfish_utils, 'get_system', autospec=True)
-    def test_check_scheduled_idrac_job_not_found(self, get_system_mock):
-        """Dell iDRAC OEM returns no matching scheduled LC job."""
-        from ironic.drivers.modules.drac import firmware as drac_fw
-        manager_mock = mock.Mock()
-        oem_mock = manager_mock.get_oem_extension.return_value
-        oem_mock.job_collection.get_jobs.return_value = []
-        get_system_mock.return_value.managers = [manager_mock]
-
-        current_update = {
-            'task_monitor': '/redfish/v1/TaskService/TaskMonitors/'
-                            'JID_839968767020'}
-
-        with task_manager.acquire(self.context, self.node.uuid,
-                                  shared=False) as task:
-            result = drac_fw.check_scheduled_idrac_job(
-                task, current_update)
-
-        self.assertIs(result, False)
-
-    @mock.patch.object(redfish_utils, 'get_system', autospec=True)
-    def test_check_scheduled_idrac_job_oem_not_available(
-            self, get_system_mock):
-        """Non-Dell hardware: OEM extension not found returns None."""
-        from ironic.drivers.modules.drac import firmware as drac_fw
-        manager_mock = mock.Mock()
-        manager_mock.get_oem_extension.side_effect = (
-            sushy.exceptions.OEMExtensionNotFoundError())
-        get_system_mock.return_value.managers = [manager_mock]
-
-        current_update = {
-            'task_monitor': '/redfish/v1/TaskService/TaskMonitors/'
-                            'JID_839968767020'}
-
-        with task_manager.acquire(self.context, self.node.uuid,
-                                  shared=False) as task:
-            result = drac_fw.check_scheduled_idrac_job(
-                task, current_update)
-
-        self.assertIsNone(result)
-
-    def test_check_scheduled_idrac_job_no_task_monitor(self):
-        """No task_monitor URI returns None."""
-        from ironic.drivers.modules.drac import firmware as drac_fw
-        current_update = {'task_monitor': ''}
-
-        with task_manager.acquire(self.context, self.node.uuid,
-                                  shared=False) as task:
-            result = drac_fw.check_scheduled_idrac_job(
-                task, current_update)
-
-        self.assertIsNone(result)
+        interface._continue_after_bmc.assert_not_called()
 
     @mock.patch.object(redfish_fw, 'LOG', autospec=True)
     @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
@@ -1346,7 +1382,7 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
 
         log_mock.debug.assert_has_calls(debug_calls)
 
-        interface._continue_updates.assert_not_called()
+        interface._continue_after_bmc.assert_not_called()
 
     @mock.patch.object(redfish_fw, 'LOG', autospec=True)
     @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
@@ -1381,7 +1417,7 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
                            'firmware_image': 'https://bmc/v1.0.1'})]
 
             log_mock.debug.assert_has_calls(debug_calls)
-            interface._continue_updates.assert_not_called()
+            interface._continue_after_bmc.assert_not_called()
 
     @mock.patch.object(redfish_fw, 'LOG', autospec=True)
     @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
@@ -1411,7 +1447,7 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
                        'firmware_image': 'https://bmc/v1.0.1'})]
 
         log_mock.debug.assert_has_calls(debug_calls)
-        interface._continue_updates.assert_not_called()
+        interface._continue_after_bmc.assert_not_called()
 
     @mock.patch.object(manager_utils, 'cleaning_error_handler', autospec=True)
     @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
@@ -1438,7 +1474,7 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
 
         task.upgrade_lock.assert_called_once_with()
         cleaning_error_handler_mock.assert_called_once()
-        interface._continue_updates.assert_not_called()
+        interface._continue_after_bmc.assert_not_called()
 
     @mock.patch.object(manager_utils, 'servicing_error_handler',
                        autospec=True)
@@ -1469,10 +1505,10 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
 
         task.upgrade_lock.assert_called_once_with()
         servicing_error_handler_mock.assert_called_once()
-        interface._continue_updates.assert_not_called()
+        interface._continue_after_bmc.assert_not_called()
 
     @mock.patch.object(redfish_fw.RedfishFirmware,
-                       '_handle_bmc_update_completion', autospec=True)
+                       '_bmc_update_completion', autospec=True)
     @mock.patch.object(redfish_fw, 'LOG', autospec=True)
     @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
     @mock.patch.object(redfish_utils, 'get_task_monitor', autospec=True)
@@ -1505,14 +1541,14 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
         # in _continue_updates before power operations, not in
         # _handle_task_completion
 
-        # BMC updates now go through _handle_bmc_update_completion
-        bmc_completion_mock.assert_called_once_with(
-            interface, task, get_us_mock.return_value,
+        # BMC updates now go through _bmc_update_completion
+        bmc_completion_mock.assert_called_once()
+        args = bmc_completion_mock.call_args[0]
+        self.assertIs(task, args[1])
+        self.assertEqual(
             [{'component': 'bmc', 'url': 'https://bmc/v1.0.1',
-              'task_monitor': '/task/1'}],
-            {'component': 'bmc', 'url': 'https://bmc/v1.0.1',
-             'task_monitor': '/task/1'}
-        )
+              'task_monitor': '/task/1'}], args[2]['settings'])
+        self.assertIs(get_us_mock.return_value, args[3])
 
     @mock.patch.object(firmware_utils, 'download_to_temp', autospec=True)
     @mock.patch.object(firmware_utils, 'stage', autospec=True)
@@ -1578,31 +1614,57 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
         update_service_mock = mock.Mock()
         firmware = redfish_fw.RedfishFirmware()
 
-        updates = self.node.driver_internal_info.get('redfish_fw_updates')
+        state = self._get_state()
 
         with task_manager.acquire(self.context, self.node.uuid,
-                                  shared=True) as task:
-            firmware._continue_updates(
-                task,
-                update_service_mock,
-                updates
-            )
+                                  shared=False) as task:
+            if state['settings'][0]['component'] == 'bmc':
+                firmware._continue_after_bmc(task, state, update_service_mock)
+                if not state['settings'][0].get('wait'):
+                    self._complete_bmc_recovery(
+                        firmware, task, state, update_service_mock)
+            else:
+                # This helper starts after application and boot verification.
+                state['state'] = redfish_fw.STATE_VERIFYING_INVENTORY
+                self._ensure_cache_mock(firmware)
+                firmware._handle_verifying_inventory(
+                    task, state, update_service_mock)
             return task
+
+    def _ensure_cache_mock(self, interface):
+        if not hasattr(interface.cache_firmware_components, 'mock'):
+            interface.cache_firmware_components = mock.Mock(
+                spec=interface.cache_firmware_components)
+
+    def _complete_bmc_recovery(self, interface, task, state, service):
+        """Drive separate recovery handlers in focused unit tests."""
+        self._ensure_cache_mock(interface)
+        next_state = interface._handle_validating_bmc(task, state, service)
+        if next_state:
+            interface._transition(task, state, next_state)
+            next_state = interface._handle_verifying_inventory(
+                task, state, service)
+            if next_state:
+                interface._transition(task, state, next_state)
+                interface._handle_starting(task, state, service)
+
+    def _finish_and_start(self, interface, task, state, service):
+        # The fixture represents a segment whose inventory is already verified.
+        state['state'] = redfish_fw.STATE_VERIFYING_INVENTORY
+        next_state = interface._finish_segment(task, state)
+        if next_state:
+            interface._transition(task, state, next_state)
+            interface._handle_starting(task, state, service)
 
     @mock.patch.object(redfish_fw, 'LOG', autospec=True)
     def test_continue_update_waitting(self, log_mock):
         self._generate_new_driver_internal_info(['bmc', 'bios'],
                                                 add_wait=True, wait=120)
         self._test_continue_updates()
-        debug_call = [
-            mock.call('Waiting at %(time)s for %(seconds)s seconds '
-                      'after %(component)s firmware update %(url)s '
-                      'on node %(node)s',
-                      {'time': mock.ANY, 'seconds': 120,
-                       'component': 'bmc', 'url': 'https://bmc/v1.0.1',
-                       'node': self.node.uuid})
-        ]
-        log_mock.debug.assert_has_calls(debug_call)
+        self.node.refresh()
+        self.assertEqual(redfish_fw.STATE_VALIDATING_BMC,
+                         self._get_state()['state'])
+        self.assertEqual(2, len(self._get_state()['settings']))
 
     @mock.patch.object(redfish_fw.RedfishFirmware,
                        '_validate_resources_stability', autospec=True)
@@ -1645,60 +1707,103 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
         log_mock.info.assert_has_calls(info_call)
 
     @mock.patch.object(redfish_fw.RedfishFirmware,
+                       'cache_firmware_components', autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware,
                        '_validate_resources_stability', autospec=True)
-    @mock.patch.object(redfish_fw, 'LOG', autospec=True)
-    @mock.patch.object(manager_utils, 'node_power_action', autospec=True)
-    @mock.patch.object(redfish_utils, 'get_system_collection', autospec=True)
-    def test_continue_updates_more_updates(self, get_system_collection_mock,
-                                           node_power_action_mock,
-                                           log_mock,
-                                           validate_mock):
-        cfg.CONF.set_override('firmware_update_wait_unresponsive_bmc', 0,
-                              'redfish')
-        self._generate_new_driver_internal_info(['bmc', 'bios'])
+    @mock.patch.object(manager_utils, 'notify_conductor_resume_clean',
+                       autospec=True)
+    def test_continue_updates_last_non_bmc_no_validation(
+            self, cond_resume_clean_mock, validate_mock, cache_mock):
+        """A non-BMC update resumes without the BMC stability wait.
 
-        task_monitor_mock = mock.Mock()
-        task_monitor_mock.task_monitor_uri = '/task/2'
-        update_service_mock = mock.Mock()
-        update_service_mock.simple_update.return_value = task_monitor_mock
+        Only a BMC firmware update can leave the BMC's web service
+        flapping; a BIOS update does not touch it.
+        """
+        self._generate_new_driver_internal_info(['bios'])
+        task = self._test_continue_updates()
+
+        cond_resume_clean_mock.assert_called_once_with(task)
+        validate_mock.assert_not_called()
+        cache_mock.assert_called_once_with(mock.ANY, task)
+
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       'cache_firmware_components', autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       '_validate_resources_stability', autospec=True)
+    @mock.patch.object(manager_utils, 'notify_conductor_resume_clean',
+                       autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       '_get_current_bmc_version', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
+    def test_bmc_completion_validates_stability(
+            self, get_us_mock, get_bmc_version_mock, cond_resume_clean_mock,
+            validate_mock, cache_mock):
+        """A completed BMC update validates before resuming the step."""
+        settings = [{'component': 'bmc', 'url': 'http://bmc/v1.0.1',
+                     'task_monitor': '/task/1'}]
+        get_bmc_version_mock.return_value = '2.0.0'
 
         firmware = redfish_fw.RedfishFirmware()
-        updates = self.node.driver_internal_info.get('redfish_fw_updates')
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            task.node.clean_step = {'step': 'update',
+                                    'interface': 'firmware'}
+            state = self._set_state(
+                node=task.node, save=False, settings=settings,
+                state=redfish_fw.STATE_WAITING_BMC,
+                segment=self._make_segment(1, batched=False),
+                bmc=self._make_bmc(version_before='1.0.0'))
+
+            firmware._bmc_update_completion(
+                task, state, get_us_mock.return_value)
+            self.assertEqual(redfish_fw.STATE_VALIDATING_BMC, state['state'])
+            self._complete_bmc_recovery(
+                firmware, task, state, get_us_mock.return_value)
+
+            validate_mock.assert_called_once_with(firmware, task.node)
+            cond_resume_clean_mock.assert_called_once_with(task)
+
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       '_start_batched_segment', autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       '_validate_resources_stability', autospec=True)
+    @mock.patch.object(redfish_fw, 'LOG', autospec=True)
+    def test_continue_updates_more_updates(self, log_mock,
+                                           validate_mock,
+                                           mock_execute_batched):
+        self._generate_new_driver_internal_info(['bmc', 'bios'])
+        self.node.set_driver_internal_info(
+            async_steps.CLEANING_REBOOT, False)
+        self.node.save()
+
+        update_service_mock = mock.Mock()
+
+        firmware = redfish_fw.RedfishFirmware()
+        state = self._get_state()
 
         with task_manager.acquire(self.context, self.node.uuid,
                                   shared=True) as task:
             task.node.save = mock.Mock()
 
-            firmware._continue_updates(task, update_service_mock, updates)
+            firmware._continue_after_bmc(task, state, update_service_mock)
+            self._complete_bmc_recovery(
+                firmware, task, state, update_service_mock)
 
-            debug_calls = [
-                mock.call('Applying new firmware %(url)s for '
-                          '%(component)s on node %(node_uuid)s',
-                          {'url': 'https://bios/v1.0.1', 'component': 'bios',
-                           'node_uuid': self.node.uuid})
-            ]
-            log_mock.debug.assert_has_calls(debug_calls)
-            self.assertEqual(
-                [{'component': 'bios', 'url': 'https://bios/v1.0.1',
-                  'task_monitor': '/task/2', 'power_timeout': 300}],
-                task.node.driver_internal_info['redfish_fw_updates'])
-            update_service_mock.simple_update.assert_called_once_with(
-                'https://bios/v1.0.1')
-            # NOTE(iurygregory): node.save() is called twice:
-            # 1. Inside _execute_firmware_update via setup methods
-            # 2. In _continue_updates after _execute_firmware_update returns
-            self.assertEqual(task.node.save.call_count, 2)
+            # After popping BMC, remaining [bios] enters batch path
+            mock_execute_batched.assert_called_once()
+            batched_state = mock_execute_batched.call_args[0][2]
+            self.assertEqual(1, len(batched_state['settings']))
+            self.assertEqual('bios',
+                             batched_state['settings'][0]['component'])
             # Verify BMC validation was called before continuing to next update
             validate_mock.assert_called_once_with(firmware, task.node)
-            node_power_action_mock.assert_called_once_with(task, states.REBOOT,
-                                                           300)
 
     @mock.patch.object(redfish_utils, 'get_system', autospec=True)
     @mock.patch.object(redfish_utils, 'get_system_collection', autospec=True)
     @mock.patch.object(time, 'sleep', lambda seconds: None)
-    def test__execute_firmware_update_no_targets(self,
-                                                 get_system_collection_mock,
-                                                 system_mock):
+    def test__submit_simple_update_no_targets(self,
+                                              get_system_collection_mock,
+                                              system_mock):
         self._generate_new_driver_internal_info(['bios'])
         with open('ironic/tests/json_samples/'
                   'systems_collection_single.json') as f:
@@ -1714,18 +1819,19 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
         update_service_mock.simple_update.return_value = task_monitor_mock
         firmware = redfish_fw.RedfishFirmware()
 
-        settings = [{'component': 'bios', 'url': 'https://bios/v1.0.1'}]
-        firmware._execute_firmware_update(self.node, update_service_mock,
-                                          settings)
+        fw_upd = {'component': 'bios', 'url': 'https://bios/v1.0.1'}
+        firmware._submit_simple_update(
+            self.node, self._make_state([fw_upd]), update_service_mock,
+            fw_upd)
         update_service_mock.simple_update.assert_called_once_with(
             'https://bios/v1.0.1')
 
     @mock.patch.object(redfish_utils, 'get_system', autospec=True)
     @mock.patch.object(redfish_utils, 'get_system_collection', autospec=True)
     @mock.patch.object(time, 'sleep', lambda seconds: None)
-    def test__execute_firmware_update_targets(self,
-                                              get_system_collection_mock,
-                                              system_mock):
+    def test__submit_simple_update_targets(self,
+                                           get_system_collection_mock,
+                                           system_mock):
         self._generate_new_driver_internal_info(['bios'])
         with open('ironic/tests/json_samples/'
                   'systems_collection_dual.json') as f:
@@ -1741,23 +1847,15 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
         update_service_mock.simple_update.return_value = task_monitor_mock
         firmware = redfish_fw.RedfishFirmware()
 
-        settings = [{'component': 'bios', 'url': 'https://bios/v1.0.1'}]
-        firmware._execute_firmware_update(self.node, update_service_mock,
-                                          settings)
+        fw_upd = {'component': 'bios', 'url': 'https://bios/v1.0.1'}
+        firmware._submit_simple_update(
+            self.node, self._make_state([fw_upd]), update_service_mock,
+            fw_upd)
         update_service_mock.simple_update.assert_called_once_with(
             'https://bios/v1.0.1', targets=[mock.ANY])
 
-    @mock.patch.object(deploy_utils, 'set_async_step_flags', autospec=True)
-    @mock.patch.object(redfish_utils, 'get_manager', autospec=True)
-    @mock.patch.object(redfish_utils, 'get_system', autospec=True)
     @mock.patch.object(redfish_utils, 'get_system_collection', autospec=True)
-    def test__execute_firmware_update_unresponsive_bmc(self,
-                                                       get_sys_collec_mock,
-                                                       system_mock,
-                                                       manager_mock,
-                                                       set_async_mock):
-        cfg.CONF.set_override('firmware_update_wait_unresponsive_bmc', 1,
-                              'redfish')
+    def test__submit_simple_update_bmc(self, get_sys_collec_mock):
         self._generate_new_driver_internal_info(['bmc'])
         with open(
             'ironic/tests/json_samples/systems_collection_single.json'
@@ -1767,43 +1865,22 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
         system_collection_mock.get_members.return_value = resp_obj['Members']
         get_sys_collec_mock.return_value = system_collection_mock
 
-        # Mock BMC version reading for setup
-        mock_manager = mock.Mock()
-        mock_manager.firmware_version = '1.0.0'
-        manager_mock.return_value = mock_manager
-
         task_monitor_mock = mock.Mock()
         task_monitor_mock.task_monitor_uri = '/task/2'
         update_service_mock = mock.Mock()
         update_service_mock.simple_update.return_value = task_monitor_mock
         firmware = redfish_fw.RedfishFirmware()
-        settings = [{'component': 'bmc', 'url': 'https://bmc/v1.2.3'}]
-        firmware._execute_firmware_update(self.node, update_service_mock,
-                                          settings)
+        fw_upd = {'component': 'bmc', 'url': 'https://bmc/v1.2.3'}
+        firmware._submit_simple_update(
+            self.node, self._make_state([fw_upd]), update_service_mock,
+            fw_upd)
         update_service_mock.simple_update.assert_called_once_with(
             'https://bmc/v1.2.3')
-        # Verify BMC monitoring setup was called (internally by _execute)
-        set_async_mock.assert_called_once_with(
-            self.node, reboot=False, polling=True)
-    @mock.patch.object(deploy_utils, 'set_async_step_flags', autospec=True)
-    @mock.patch.object(redfish_utils, 'get_manager', autospec=True)
-    @mock.patch.object(redfish_utils, 'get_system', autospec=True)
+
     @mock.patch.object(redfish_utils, 'get_system_collection', autospec=True)
-    def test__execute_firmware_update_unresponsive_bmc_node_override(
-            self, get_sys_collec_mock, system_mock, manager_mock,
-            set_async_mock):
+    def test__submit_simple_update_bmc_node_override(
+            self, get_sys_collec_mock):
         self._generate_new_driver_internal_info(['bmc'])
-        # Set a specific value for firmware_update_unresponsive_bmc_wait for
-        # the node
-        with mock.patch('time.sleep', lambda x: None):
-            d_info = self.node.driver_info.copy()
-            d_info['firmware_update_unresponsive_bmc_wait'] = 1
-            self.node.driver_info = d_info
-            self.node.save()
-        self.assertNotEqual(
-            CONF.redfish.firmware_update_wait_unresponsive_bmc,
-            self.node.driver_info.get('firmware_update_unresponsive_bmc_wait')
-        )
         with open(
             'ironic/tests/json_samples/systems_collection_single.json'
         ) as f:
@@ -1812,28 +1889,23 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
         system_collection_mock.get_members.return_value = resp_obj['Members']
         get_sys_collec_mock.return_value = system_collection_mock
 
-        # Mock BMC version reading for setup
-        mock_manager = mock.Mock()
-        mock_manager.firmware_version = '1.0.0'
-        manager_mock.return_value = mock_manager
-
         task_monitor_mock = mock.Mock()
         task_monitor_mock.task_monitor_uri = '/task/2'
         update_service_mock = mock.Mock()
         update_service_mock.simple_update.return_value = task_monitor_mock
         firmware = redfish_fw.RedfishFirmware()
-        settings = [{'component': 'bmc', 'url': 'https://bmc/v1.2.3'}]
-        firmware._execute_firmware_update(self.node, update_service_mock,
-                                          settings)
+        fw_upd = {'component': 'bmc', 'url': 'https://bmc/v1.2.3'}
+        firmware._submit_simple_update(
+            self.node, self._make_state([fw_upd]), update_service_mock,
+            fw_upd)
         update_service_mock.simple_update.assert_called_once_with(
             'https://bmc/v1.2.3')
-        # Verify BMC monitoring setup was called (internally by _execute)
-        set_async_mock.assert_called_once_with(
-            self.node, reboot=False, polling=True)
 
     def test__validate_resources_stability_success(self):
         """Test successful BMC resource validation with consecutive success."""
         firmware = redfish_fw.RedfishFirmware()
+        self._generate_new_driver_internal_info(['bmc'])
+        self.config(firmware_update_validation_interval=0, group='redfish')
 
         with task_manager.acquire(self.context, self.node.uuid,
                                   shared=True) as task:
@@ -1843,7 +1915,6 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
                                    autospec=True) as manager_mock, \
                  mock.patch.object(redfish_utils, 'get_chassis',
                                    autospec=True) as chassis_mock, \
-                 mock.patch.object(time, 'time', autospec=True) as time_mock, \
                  mock.patch.object(time, 'sleep',
                                    autospec=True) as sleep_mock:
 
@@ -1853,25 +1924,23 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
                 net_adapters = chassis_mock.return_value.network_adapters
                 net_adapters.get_members.return_value = []
 
-                # Mock time progression to simulate consecutive successes
-                time_mock.side_effect = [0, 1, 2, 3]  # 3 successful attempts
-
                 # Should complete successfully after 3 consecutive successes
-                firmware._validate_resources_stability(task.node)
+                results = [firmware._validate_resources_stability(task.node)
+                           for _ in range(3)]
+                self.assertEqual([False, False, True], results)
 
                 # Verify all resources were checked 3 times (required success)
                 self.assertEqual(system_mock.call_count, 3)
                 self.assertEqual(manager_mock.call_count, 3)
                 self.assertEqual(chassis_mock.call_count, 3)
 
-                # Verify sleep was called between validation attempts
-                expected_calls = [mock.call(
-                    CONF.redfish.firmware_update_validation_interval)] * 2
-                sleep_mock.assert_has_calls(expected_calls)
+                self.assertTrue(all(call == mock.call(0)
+                                    for call in sleep_mock.call_args_list))
 
     def test__validate_resources_stability_timeout(self):
         """Test BMC resource validation timeout when not achieved."""
         firmware = redfish_fw.RedfishFirmware()
+        self._generate_new_driver_internal_info(['bmc'])
 
         with task_manager.acquire(self.context, self.node.uuid,
                                   shared=True) as task:
@@ -1879,15 +1948,15 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
                                    autospec=True) as system_mock, \
                  mock.patch.object(redfish_utils, 'get_manager',
                                    autospec=True), \
-                 mock.patch.object(time, 'time', autospec=True) as time_mock, \
                  mock.patch.object(time, 'sleep', autospec=True):
 
                 # Mock system always failing
                 system_mock.side_effect = exception.RedfishConnectionError(
                     'timeout')
 
-                # Mock time progression to exceed timeout
-                time_mock.side_effect = [0, 500]
+                self.assertFalse(firmware._validate_resources_stability(
+                    task.node))
+                self._expire_validation(task.node)
 
                 # Should raise RedfishError due to timeout
                 self.assertRaises(exception.RedfishError,
@@ -1900,10 +1969,11 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
         """Test BMC resource validation with intermittent failures."""
         cfg.CONF.set_override('firmware_update_required_successes', 3,
                               'redfish')
-        cfg.CONF.set_override('firmware_update_validation_interval', 10,
+        cfg.CONF.set_override('firmware_update_validation_interval', 0,
                               'redfish')
 
         firmware = redfish_fw.RedfishFirmware()
+        self._generate_new_driver_internal_info(['bmc'])
 
         with task_manager.acquire(self.context, self.node.uuid,
                                   shared=True) as task:
@@ -1913,7 +1983,6 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
                                    autospec=True) as manager_mock, \
                  mock.patch.object(redfish_utils, 'get_chassis',
                                    autospec=True) as chassis_mock, \
-                 mock.patch.object(time, 'time', autospec=True) as time_mock, \
                  mock.patch.object(time, 'sleep', autospec=True):
 
                 # Mock intermittent failures: success, success, fail,
@@ -1933,11 +2002,10 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
                 net_adapters = chassis_mock.return_value.network_adapters
                 net_adapters.get_members.return_value = []
 
-                # Mock time progression (6 attempts total)
-                time_mock.side_effect = [0, 10, 20, 30, 40, 50, 60]
-
                 # Should eventually succeed after counter reset
-                firmware._validate_resources_stability(task.node)
+                results = [firmware._validate_resources_stability(task.node)
+                           for _ in range(6)]
+                self.assertEqual([False] * 5 + [True], results)
 
                 # Verify all 6 attempts were made for system
                 self.assertEqual(system_mock.call_count, 6)
@@ -1945,33 +2013,33 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
                 self.assertEqual(manager_mock.call_count, 5)
                 self.assertEqual(chassis_mock.call_count, 5)
 
-                # Verify verbose logging about BMC recovery was called
-                expected_log_call = mock.call(
-                    'BMC resource validation failed for node %(node)s: '
-                    '%(error)s. This may indicate the BMC is still '
-                    'restarting or recovering from firmware update.',
-                    {'node': task.node.uuid, 'error': mock.ANY})
-                mock_log.debug.assert_has_calls([expected_log_call])
+                self.assertEqual(3, self._get_state(task.node)[
+                    'bmc']['validation']['successes'])
+
+    def _expire_validation(self, node):
+        self._get_state(node)['bmc']['validation']['started_at'] = (
+            timeutils.utcnow() - datetime.timedelta(seconds=500)).isoformat()
 
     def test__validate_resources_stability_manager_failure(self):
         """Test BMC resource validation when Manager resource fails."""
         firmware = redfish_fw.RedfishFirmware()
+        self._generate_new_driver_internal_info(['bmc'])
 
         with task_manager.acquire(self.context, self.node.uuid,
                                   shared=True) as task:
             with mock.patch.object(redfish_utils, 'get_system',
                                    autospec=True) as system_mock, \
                  mock.patch.object(redfish_utils, 'get_manager',
-                                   autospec=True) as manager_mock, \
-                 mock.patch.object(time, 'time', autospec=True) as time_mock:
+                                   autospec=True) as manager_mock:
 
                 # Mock system success, manager failure
                 system_mock.return_value = mock.Mock()
                 manager_mock.side_effect = exception.RedfishError(
                     'manager error')
 
-                # Mock time progression to exceed timeout
-                time_mock.side_effect = [0, 500]
+                self.assertFalse(firmware._validate_resources_stability(
+                    task.node))
+                self._expire_validation(task.node)
 
                 # Should raise RedfishError due to timeout
                 self.assertRaises(exception.RedfishError,
@@ -1981,6 +2049,7 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
     def test__validate_resources_stability_network_adapters_failure(self):
         """Test validation when NetworkAdapters resource fails."""
         firmware = redfish_fw.RedfishFirmware()
+        self._generate_new_driver_internal_info(['bmc'])
 
         with task_manager.acquire(self.context, self.node.uuid,
                                   shared=True) as task:
@@ -1989,8 +2058,7 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
                  mock.patch.object(redfish_utils, 'get_manager',
                                    autospec=True) as manager_mock, \
                  mock.patch.object(redfish_utils, 'get_chassis',
-                                   autospec=True) as chassis_mock, \
-                 mock.patch.object(time, 'time', autospec=True) as time_mock:
+                                   autospec=True) as chassis_mock:
 
                 # Mock system and manager success, NetworkAdapters failure
                 system_mock.return_value = mock.Mock()
@@ -1998,8 +2066,9 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
                 chassis_mock.side_effect = exception.RedfishError(
                     'chassis error')
 
-                # Mock time progression to exceed timeout
-                time_mock.side_effect = [0, 500]
+                self.assertFalse(firmware._validate_resources_stability(
+                    task.node))
+                self._expire_validation(task.node)
 
                 # Should raise RedfishError due to timeout
                 self.assertRaises(exception.RedfishError,
@@ -2010,10 +2079,11 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
         """Test BMC resource validation with custom configuration values."""
         cfg.CONF.set_override('firmware_update_required_successes', 5,
                               'redfish')
-        cfg.CONF.set_override('firmware_update_validation_interval', 5,
+        cfg.CONF.set_override('firmware_update_validation_interval', 0,
                               'redfish')
 
         firmware = redfish_fw.RedfishFirmware()
+        self._generate_new_driver_internal_info(['bmc'])
 
         with task_manager.acquire(self.context, self.node.uuid,
                                   shared=True) as task:
@@ -2023,7 +2093,6 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
                                    autospec=True) as manager_mock, \
                  mock.patch.object(redfish_utils, 'get_chassis',
                                    autospec=True) as chassis_mock, \
-                 mock.patch.object(time, 'time', autospec=True) as time_mock, \
                  mock.patch.object(time, 'sleep',
                                    autospec=True) as sleep_mock:
 
@@ -2033,24 +2102,24 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
                 net_adapters = chassis_mock.return_value.network_adapters
                 net_adapters.get_members.return_value = []
 
-                # Mock time progression (5 successful attempts)
-                time_mock.side_effect = [0, 5, 10, 15, 20, 25]
-
                 # Should complete successfully after 5 consecutive successes
-                firmware._validate_resources_stability(task.node)
+                results = [firmware._validate_resources_stability(task.node)
+                           for _ in range(5)]
+                self.assertEqual([False] * 4 + [True], results)
 
                 # Verify all resources checked 5 times (custom required)
                 self.assertEqual(system_mock.call_count, 5)
                 self.assertEqual(manager_mock.call_count, 5)
                 self.assertEqual(chassis_mock.call_count, 5)
 
-                # Verify sleep was called with custom interval
-                expected_calls = [mock.call(5)] * 4  # 4 sleeps between 5
-                sleep_mock.assert_has_calls(expected_calls)
+                self.assertTrue(all(call == mock.call(0)
+                                    for call in sleep_mock.call_args_list))
 
     def test__validate_resources_stability_network_adapters_none(self):
         """Test validation succeeds when network_adapters is None."""
         firmware = redfish_fw.RedfishFirmware()
+        self._generate_new_driver_internal_info(['bmc'])
+        self.config(firmware_update_validation_interval=0, group='redfish')
 
         with task_manager.acquire(self.context, self.node.uuid,
                                   shared=True) as task:
@@ -2060,7 +2129,6 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
                                    autospec=True) as manager_mock, \
                  mock.patch.object(redfish_utils, 'get_chassis',
                                    autospec=True) as chassis_mock, \
-                 mock.patch.object(time, 'time', autospec=True) as time_mock, \
                  mock.patch.object(time, 'sleep', autospec=True):
 
                 # Mock successful resource responses but network_adapters None
@@ -2068,11 +2136,10 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
                 manager_mock.return_value = mock.Mock()
                 chassis_mock.return_value.network_adapters = None
 
-                # Mock time progression to simulate consecutive successes
-                time_mock.side_effect = [0, 1, 2, 3]
-
                 # Should complete successfully (None network_adapters is OK)
-                firmware._validate_resources_stability(task.node)
+                results = [firmware._validate_resources_stability(task.node)
+                           for _ in range(3)]
+                self.assertEqual([False, False, True], results)
 
                 # Verify all resources were checked 3 times
                 self.assertEqual(system_mock.call_count, 3)
@@ -2082,6 +2149,8 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
     def test__validate_resources_stability_network_adapters_missing_attr(self):
         """Test validation succeeds when network_adapters is missing."""
         firmware = redfish_fw.RedfishFirmware()
+        self._generate_new_driver_internal_info(['bmc'])
+        self.config(firmware_update_validation_interval=0, group='redfish')
 
         with task_manager.acquire(self.context, self.node.uuid,
                                   shared=True) as task:
@@ -2091,7 +2160,6 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
                                    autospec=True) as manager_mock, \
                  mock.patch.object(redfish_utils, 'get_chassis',
                                    autospec=True) as chassis_mock, \
-                 mock.patch.object(time, 'time', autospec=True) as time_mock, \
                  mock.patch.object(time, 'sleep', autospec=True):
 
                 # Mock successful resource responses
@@ -2102,11 +2170,10 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
                     mock.PropertyMock(
                         side_effect=sushy.exceptions.MissingAttributeError))
 
-                # Mock time progression to simulate consecutive successes
-                time_mock.side_effect = [0, 1, 2, 3]
-
                 # Should complete successfully (missing network_adapters is OK)
-                firmware._validate_resources_stability(task.node)
+                results = [firmware._validate_resources_stability(task.node)
+                           for _ in range(3)]
+                self.assertEqual([False, False, True], results)
 
                 # Verify all resources were checked 3 times
                 self.assertEqual(system_mock.call_count, 3)
@@ -2117,12 +2184,12 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
     def test__validate_resources_stability_badrequest_error(self, mock_log):
         """Test BMC resource validation handles BadRequestError correctly."""
         firmware = redfish_fw.RedfishFirmware()
+        self._generate_new_driver_internal_info(['bmc'])
 
         with task_manager.acquire(self.context, self.node.uuid,
                                   shared=True) as task:
             with mock.patch.object(redfish_utils, 'get_system',
                                    autospec=True) as system_mock, \
-                 mock.patch.object(time, 'time', autospec=True) as time_mock, \
                  mock.patch.object(time, 'sleep', autospec=True):
 
                 # Mock BadRequestError from sushy with proper arguments
@@ -2131,32 +2198,26 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
                 system_mock.side_effect = sushy.exceptions.BadRequestError(
                     'http://test', mock_response, mock_response)
 
-                # Mock time progression: start at 0, try once at 10, timeout
-                # at 500, this allows at least one loop iteration to trigger
-                # the exception
-                time_mock.side_effect = [0, 10, 500]
+                self.assertFalse(firmware._validate_resources_stability(
+                    task.node))
+                self._expire_validation(task.node)
 
                 # Should raise RedfishError due to timeout
                 self.assertRaises(exception.RedfishError,
                                   firmware._validate_resources_stability,
                                   task.node)
 
-                # Verify verbose logging about BMC recovery was called
-                expected_log_call = mock.call(
-                    'BMC resource validation failed for node %(node)s: '
-                    '%(error)s. This may indicate the BMC is still '
-                    'restarting or recovering from firmware update.',
-                    {'node': task.node.uuid, 'error': mock.ANY})
-                mock_log.debug.assert_has_calls([expected_log_call])
+                self.assertIn('error', self._get_state(task.node)[
+                    'bmc']['validation'])
 
     @mock.patch.object(redfish_utils, 'get_manager', autospec=True)
     @mock.patch.object(redfish_utils, 'get_system', autospec=True)
     @mock.patch.object(deploy_utils, 'set_async_step_flags', autospec=True)
-    @mock.patch.object(redfish_fw.RedfishFirmware, '_execute_firmware_update',
+    @mock.patch.object(redfish_fw.RedfishFirmware, '_submit_simple_update',
                        autospec=True)
     @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
     def test_update_bmc_uses_configured_timeout(self, mock_get_update_service,
-                                                mock_execute_fw_update,
+                                                mock_submit_simple_update,
                                                 mock_set_async_flags,
                                                 mock_get_system,
                                                 mock_get_manager):
@@ -2172,9 +2233,6 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
         mock_manager.firmware_version = '1.0.0'
         mock_get_manager.return_value = mock_manager
 
-        # add task_monitor to the side effect
-        mock_execute_fw_update.side_effect = self._mock_exc_fwup_side_effect
-
         with task_manager.acquire(self.context, self.node.uuid,
                                   shared=False) as task:
             task.node.service_step = {'step': 'update',
@@ -2188,21 +2246,21 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
                 polling=True
             )
             # Verify BMC version check tracking is set up
-            info = task.node.driver_internal_info
-            fw_updates = info.get('redfish_fw_updates', [])
-            self.assertEqual(1, len(fw_updates))
-            self.assertIn('bmc_check_start_time', fw_updates[0])
-            self.assertIn('bmc_fw_version_before_update', info)
+            state = self._get_state(task.node)
+            self.assertEqual(redfish_fw.STATE_WAITING_BMC, state['state'])
+            self.assertEqual(1, len(state['settings']))
+            self.assertIsNotNone(state['bmc']['check_start'])
+            self.assertEqual('1.0.0', state['bmc']['version_before'])
             self.assertEqual(states.SERVICEWAIT, result)
 
     @mock.patch.object(redfish_utils, 'get_manager', autospec=True)
     @mock.patch.object(redfish_utils, 'get_system', autospec=True)
     @mock.patch.object(deploy_utils, 'set_async_step_flags', autospec=True)
-    @mock.patch.object(redfish_fw.RedfishFirmware, '_execute_firmware_update',
+    @mock.patch.object(redfish_fw.RedfishFirmware, '_submit_simple_update',
                        autospec=True)
     @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
     def test_update_bmc_uses_bmc_constant(self, mock_get_update_service,
-                                          mock_execute_fw_update,
+                                          mock_submit_simple_update,
                                           mock_set_async_flags,
                                           mock_get_system,
                                           mock_get_manager):
@@ -2219,9 +2277,6 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
         mock_manager.firmware_version = '1.0.0'
         mock_get_manager.return_value = mock_manager
 
-        # add task_monitor to the side effect
-        mock_execute_fw_update.side_effect = self._mock_exc_fwup_side_effect
-
         with task_manager.acquire(self.context, self.node.uuid,
                                   shared=False) as task:
             task.node.service_step = {'step': 'update',
@@ -2235,29 +2290,20 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
                 polling=True
             )
             # Verify BMC version check tracking is set up
-            info = task.node.driver_internal_info
-            fw_updates = info.get('redfish_fw_updates', [])
-            self.assertEqual(1, len(fw_updates))
-            self.assertIn('bmc_check_start_time', fw_updates[0])
-            self.assertIn('bmc_fw_version_before_update', info)
+            state = self._get_state(task.node)
+            self.assertEqual(redfish_fw.STATE_WAITING_BMC, state['state'])
+            self.assertEqual(1, len(state['settings']))
+            self.assertIsNotNone(state['bmc']['check_start'])
+            self.assertEqual('1.0.0', state['bmc']['version_before'])
             self.assertEqual(states.SERVICEWAIT, result)
 
-    @mock.patch.object(deploy_utils, 'set_async_step_flags', autospec=True)
-    @mock.patch.object(redfish_fw.RedfishFirmware, '_execute_firmware_update',
-                       autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       '_start_batched_segment', autospec=True)
     @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
     def test_update_non_bmc_uses_wait_parameter(self, mock_get_update_service,
-                                                mock_execute_fw_update,
-                                                mock_set_async_flags):
-        """Test non-BMC firmware update with wait parameter (obsolete)."""
-        # NOTE: This test is kept for historical reference but the wait
-        # parameter on BIOS updates is no longer used as BIOS reboots
-        # immediately when task starts rather than waiting
-        settings = [{'component': 'bios', 'url': 'http://bios/v1.0.0',
-                     'wait': 120}]
-
-        # add task_monitor to the side effect
-        mock_execute_fw_update.side_effect = self._mock_exc_fwup_side_effect
+                                                mock_execute_batched):
+        """Test non-BMC firmware update uses batched path."""
+        settings = [{'component': 'bios', 'url': 'http://bios/v1.0.0'}]
 
         with task_manager.acquire(self.context, self.node.uuid,
                                   shared=False) as task:
@@ -2265,79 +2311,55 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
                                       'interface': 'firmware'}
             result = task.driver.firmware.update(task, settings)
 
-            # Verify reboot=True is set for BIOS
-            mock_set_async_flags.assert_called_once_with(
-                task.node,
-                reboot=True,
-                polling=True
-            )
+            mock_execute_batched.assert_called_once()
             self.assertEqual(states.SERVICEWAIT, result)
 
-    @mock.patch.object(deploy_utils, 'set_async_step_flags', autospec=True)
-    @mock.patch.object(redfish_fw.RedfishFirmware, '_execute_firmware_update',
-                       autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       '_start_batched_segment', autospec=True)
     @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
     def test_update_non_bmc_no_wait_parameter(self, mock_get_update_service,
-                                              mock_execute_fw_update,
-                                              mock_set_async_flags):
+                                              mock_execute_batched):
         """Test non-BMC firmware update without wait parameter."""
         settings = [{'component': 'bios', 'url': 'http://bios/v1.0.0'}]
 
-        # add task_monitor to the side effect
-        mock_execute_fw_update.side_effect = self._mock_exc_fwup_side_effect
-
         with task_manager.acquire(self.context, self.node.uuid,
                                   shared=False) as task:
             task.node.service_step = {'step': 'update',
                                       'interface': 'firmware'}
             result = task.driver.firmware.update(task, settings)
 
-            # Verify reboot=True is set for BIOS
-            mock_set_async_flags.assert_called_once_with(
-                task.node,
-                reboot=True,
-                polling=True
-            )
+            mock_execute_batched.assert_called_once()
             self.assertEqual(states.SERVICEWAIT, result)
 
-    @mock.patch.object(deploy_utils, 'set_async_step_flags', autospec=True)
-    @mock.patch.object(redfish_fw.RedfishFirmware, '_execute_firmware_update',
-                       autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       '_start_batched_segment', autospec=True)
     @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
     def test_update_mixed_components_with_bmc(self, mock_get_update_service,
-                                              mock_execute_fw_update,
-                                              mock_set_async_flags):
-        """Test mixed component update with BIOS and BMC."""
+                                              mock_execute_batched):
+        """Test mixed component update with BIOS first uses batch path."""
         settings = [
-            {'component': 'bios', 'url': 'http://bios/v1.0.0', 'wait': 120},
+            {'component': 'bios', 'url': 'http://bios/v1.0.0'},
             {'component': 'bmc', 'url': 'http://bmc/v1.0.0', 'wait': 60}
         ]
 
-        # add task_monitor to the side effect
-        mock_execute_fw_update.side_effect = self._mock_exc_fwup_side_effect
-
         with task_manager.acquire(self.context, self.node.uuid,
                                   shared=False) as task:
             task.node.service_step = {'step': 'update',
                                       'interface': 'firmware'}
             result = task.driver.firmware.update(task, settings)
 
-            # First component is BIOS, so reboot=True
-            mock_set_async_flags.assert_called_once_with(
-                task.node,
-                reboot=True,
-                polling=True
-            )
+            # First component is BIOS, so batch path
+            mock_execute_batched.assert_called_once()
             self.assertEqual(states.SERVICEWAIT, result)
 
     @mock.patch.object(deploy_utils, 'set_async_step_flags', autospec=True)
     @mock.patch.object(redfish_utils, 'get_manager', autospec=True)
     @mock.patch.object(redfish_utils, 'get_system', autospec=True)
-    @mock.patch.object(redfish_fw.RedfishFirmware, '_execute_firmware_update',
+    @mock.patch.object(redfish_fw.RedfishFirmware, '_submit_simple_update',
                        autospec=True)
     @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
     def test_update_bmc_with_explicit_wait(self, mock_get_update_service,
-                                           mock_execute_fw_update,
+                                           mock_submit_simple_update,
                                            mock_get_system,
                                            mock_get_manager,
                                            mock_set_async_flags):
@@ -2354,9 +2376,6 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
         mock_manager.firmware_version = '1.0.0'
         mock_get_manager.return_value = mock_manager
 
-        # add task_monitor to the side effect
-        mock_execute_fw_update.side_effect = self._mock_exc_fwup_side_effect
-
         with task_manager.acquire(self.context, self.node.uuid,
                                   shared=False) as task:
             task.node.service_step = {'step': 'update',
@@ -2370,19 +2389,18 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
                 polling=True
             )
             # Verify wait time is stored
-            info = task.node.driver_internal_info
-            fw_updates = info['redfish_fw_updates']
-            self.assertEqual(90, fw_updates[0]['wait'])
+            state = self._get_state(task.node)
+            self.assertEqual(90, state['settings'][0]['wait'])
             self.assertEqual(states.SERVICEWAIT, result)
 
     @mock.patch.object(deploy_utils, 'set_async_step_flags', autospec=True)
     @mock.patch.object(redfish_utils, 'get_manager', autospec=True)
     @mock.patch.object(redfish_utils, 'get_system', autospec=True)
-    @mock.patch.object(redfish_fw.RedfishFirmware, '_execute_firmware_update',
+    @mock.patch.object(redfish_fw.RedfishFirmware, '_submit_simple_update',
                        autospec=True)
     @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
     def test_update_bmc_no_immediate_reboot(self, mock_get_update_service,
-                                            mock_execute_fw_update,
+                                            mock_submit_simple_update,
                                             mock_get_system,
                                             mock_get_manager,
                                             mock_set_async_flags):
@@ -2397,9 +2415,6 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
         mock_manager = mock.Mock()
         mock_manager.firmware_version = '1.0.0'
         mock_get_manager.return_value = mock_manager
-
-        # add task_monitor to the side effect
-        mock_execute_fw_update.side_effect = self._mock_exc_fwup_side_effect
 
         with task_manager.acquire(self.context, self.node.uuid,
                                   shared=False) as task:
@@ -2417,24 +2432,18 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
             self.assertEqual(states.SERVICEWAIT, result)
 
             # Verify BMC version check tracking is set up
-            info = task.node.driver_internal_info
-            fw_updates = info.get('redfish_fw_updates', [])
-            self.assertEqual(1, len(fw_updates))
-            self.assertIn('bmc_check_start_time', fw_updates[0])
-            self.assertIn('bmc_fw_version_before_update', info)
+            state = self._get_state(task.node)
+            self.assertEqual(1, len(state['settings']))
+            self.assertIsNotNone(state['bmc']['check_start'])
+            self.assertEqual('1.0.0', state['bmc']['version_before'])
 
-    @mock.patch.object(deploy_utils, 'set_async_step_flags', autospec=True)
-    @mock.patch.object(redfish_fw.RedfishFirmware, '_execute_firmware_update',
-                       autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       '_start_batched_segment', autospec=True)
     @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
     def test_update_nic_no_immediate_reboot(self, mock_get_update_service,
-                                            mock_execute_fw_update,
-                                            mock_set_async_flags):
-        """Test NIC firmware update sets reboot flag, waits for task."""
+                                            mock_execute_batched):
+        """Test NIC firmware update uses batched path."""
         settings = [{'component': 'nic:BCM57414', 'url': 'http://nic/v1.0.0'}]
-
-        # add task_monitor to the side effect
-        mock_execute_fw_update.side_effect = self._mock_exc_fwup_side_effect
 
         with task_manager.acquire(self.context, self.node.uuid,
                                   shared=False) as task:
@@ -2442,28 +2451,17 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
                                       'interface': 'firmware'}
             result = task.driver.firmware.update(task, settings)
 
-            # Verify reboot=False for NIC updates (task monitoring logic
-            # will decide whether to trigger a reboot)
-            mock_set_async_flags.assert_called_once_with(
-                task.node,
-                reboot=False,
-                polling=True
-            )
+            mock_execute_batched.assert_called_once()
             # Verify we return wait state to keep step active
             self.assertEqual(states.SERVICEWAIT, result)
 
-    @mock.patch.object(deploy_utils, 'set_async_step_flags', autospec=True)
-    @mock.patch.object(redfish_fw.RedfishFirmware, '_execute_firmware_update',
-                       autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       '_start_batched_segment', autospec=True)
     @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
     def test_update_bios_sets_reboot_flag(self, mock_get_update_service,
-                                          mock_execute_fw_update,
-                                          mock_set_async_flags):
-        """Test BIOS firmware update sets reboot flag."""
+                                          mock_execute_batched):
+        """Test BIOS firmware update uses batched path."""
         settings = [{'component': 'bios', 'url': 'http://bios/v1.0.0'}]
-
-        # add task_monitor to the side effect
-        mock_execute_fw_update.side_effect = self._mock_exc_fwup_side_effect
 
         with task_manager.acquire(self.context, self.node.uuid,
                                   shared=False) as task:
@@ -2472,18 +2470,13 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
                                       'interface': 'firmware'}
             result = task.driver.firmware.update(task, settings)
 
-            # Verify reboot=True for BIOS updates
-            mock_set_async_flags.assert_called_once_with(
-                task.node,
-                reboot=True,
-                polling=True
-            )
+            mock_execute_batched.assert_called_once()
             # Verify we return wait state to keep step active
             self.assertEqual(states.SERVICEWAIT, result)
 
     @mock.patch.object(timeutils, 'utcnow', autospec=True)
     @mock.patch.object(timeutils, 'parse_isotime', autospec=True)
-    @mock.patch.object(redfish_fw.RedfishFirmware, '_continue_updates',
+    @mock.patch.object(redfish_fw.RedfishFirmware, '_continue_after_bmc',
                        autospec=True)
     @mock.patch.object(deploy_utils, 'set_async_step_flags', autospec=True)
     @mock.patch.object(redfish_fw.RedfishFirmware,
@@ -2501,40 +2494,37 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
         mock_parse_isotime.return_value = start_time
         mock_utcnow.return_value = current_time
         settings = [{'component': 'bmc', 'url': 'http://bmc/v1.0.0',
-                     'wait': 300, 'task_monitor': '/tasks/1',
-                     'bmc_check_start_time': '2025-01-01T00:00:00.000000'}]
+                     'wait': 300, 'task_monitor': '/tasks/1'}]
 
         with task_manager.acquire(self.context, self.node.uuid,
                                   shared=False) as task:
             # Set up node with BMC version checking in progress
-            task.node.set_driver_internal_info(
-                'redfish_fw_updates', settings)
+            state = self._set_state(
+                node=task.node, save=False, settings=settings,
+                state=redfish_fw.STATE_WAITING_BMC,
+                segment=self._make_segment(1, batched=False),
+                bmc=self._make_bmc(
+                    check_start='2025-01-01T00:00:00.000000'))
 
             # Mock BMC is unresponsive
             mock_get_bmc_version.return_value = None
 
             # Call the BMC update completion handler
             firmware_interface = redfish_fw.RedfishFirmware()
-            firmware_interface._handle_bmc_update_completion(
-                task, mock_get_update_service.return_value,
-                settings, settings[0])
+            firmware_interface._bmc_update_completion(
+                task, state, mock_get_update_service.return_value)
 
             # Verify reboot flag is set
-            info = task.node.driver_internal_info
-            self.assertTrue(info.get('firmware_reboot_requested'))
+            self.assertTrue(state['bmc']['reboot_requested'])
 
-            # Verify async flags updated with reboot=True
-            mock_set_async_flags.assert_called_once_with(
-                task.node,
-                reboot=True,
-                polling=True
-            )
+            # Reboot flags are set only after BMC recovery succeeds.
+            mock_set_async_flags.assert_not_called()
 
-            # Verify _continue_updates was called
+            # Verify the update continued
             mock_continue_updates.assert_called_once()
 
     @mock.patch.object(manager_utils, 'node_power_action', autospec=True)
-    @mock.patch.object(redfish_fw.RedfishFirmware, '_continue_updates',
+    @mock.patch.object(redfish_fw.RedfishFirmware, '_continue_after_bmc',
                        autospec=True)
     @mock.patch.object(redfish_fw.RedfishFirmware,
                        '_get_current_bmc_version', autospec=True)
@@ -2543,10 +2533,12 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
             self, mock_get_update_service, mock_get_bmc_version,
             mock_continue_updates, mock_power_action):
         """Test BMC version change with multiple components triggers reboot."""
+        self.mock_read_boot_progress.return_value = (
+            sushy.BootProgressStates.OS_RUNNING)
+        self.mock_watch_boot.return_value = True
         settings = [
             {'component': 'bmc', 'url': 'http://bmc/v1.0.0',
-             'wait': 300, 'task_monitor': '/tasks/1',
-             'bmc_check_start_time': '2025-01-01T00:00:00.000000'},
+             'wait': 300, 'task_monitor': '/tasks/1'},
             {'component': 'nic:BCM57414', 'url': 'http://nic/v1.0.0',
              'task_monitor': '/tasks/2'}
         ]
@@ -2554,42 +2546,40 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
         with task_manager.acquire(self.context, self.node.uuid,
                                   shared=False) as task:
             # Set up node with BMC version before update
-            task.node.set_driver_internal_info(
-                'bmc_fw_version_before_update', '1.0.0')
-            task.node.set_driver_internal_info(
-                'redfish_fw_updates', settings)
+            state = self._set_state(
+                node=task.node, save=False, settings=settings,
+                state=redfish_fw.STATE_WAITING_BMC,
+                segment=self._make_segment(1, batched=False),
+                bmc=self._make_bmc(
+                    version_before='1.0.0',
+                    check_start='2025-01-01T00:00:00.000000'))
 
             # Mock BMC version has changed
             mock_get_bmc_version.return_value = '2.0.0'
 
             # Call the BMC update completion handler
             firmware_interface = redfish_fw.RedfishFirmware()
-            firmware_interface._handle_bmc_update_completion(
-                task, mock_get_update_service.return_value,
-                settings, settings[0])
+            firmware_interface._bmc_update_completion(
+                task, state, mock_get_update_service.return_value)
 
             # Verify version check was called
             mock_get_bmc_version.assert_called_once_with(
                 firmware_interface, task.node)
 
-            # Verify bmc_update_completed flag is set
-            info = task.node.driver_internal_info
-            fw_updates = info.get('redfish_fw_updates', [])
-            self.assertTrue(fw_updates[0].get('bmc_update_completed'))
+            # The version decision requests recovery, not an immediate reset.
+            self.assertTrue(state['bmc']['reboot_requested'])
+            self.assertIsNone(state['reboot_time'])
+            self.assertIsNone(state['verify'])
+            self.mock_watch_boot.assert_not_called()
+            self.assertEqual('1.0.0', state['bmc']['version_before'])
 
-            # Verify bmc_fw_version_before_update is removed
-            self.assertNotIn('bmc_fw_version_before_update', info)
+            # Verify settings were kept
+            self.assertEqual(2, len(state['settings']))
 
-            # Verify settings were saved
-            self.assertEqual(2, len(fw_updates))
+            mock_power_action.assert_not_called()
+            mock_continue_updates.assert_called_once()
 
-            # Verify reboot was triggered
-            mock_power_action.assert_called_once_with(task, states.REBOOT)
-
-            # Verify _continue_updates was NOT called (reboot happens first)
-            mock_continue_updates.assert_not_called()
-
-    @mock.patch.object(redfish_fw.RedfishFirmware, '_continue_updates',
+    @mock.patch.object(redfish_fw.RedfishFirmware, '_continue_after_bmc',
                        autospec=True)
     @mock.patch.object(manager_utils, 'node_power_action', autospec=True)
     @mock.patch.object(redfish_fw.RedfishFirmware,
@@ -2601,237 +2591,42 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
         """Test BMC version change as last component continues updates."""
         settings = [
             {'component': 'bmc', 'url': 'http://bmc/v1.0.0',
-             'wait': 300, 'task_monitor': '/tasks/1',
-             'bmc_check_start_time': '2025-01-01T00:00:00.000000'}
+             'wait': 300, 'task_monitor': '/tasks/1'}
         ]
 
         with task_manager.acquire(self.context, self.node.uuid,
                                   shared=False) as task:
             # Set up node with BMC version before update
-            task.node.set_driver_internal_info(
-                'bmc_fw_version_before_update', '1.0.0')
-            task.node.set_driver_internal_info(
-                'redfish_fw_updates', settings)
+            state = self._set_state(
+                node=task.node, save=False, settings=settings,
+                state=redfish_fw.STATE_WAITING_BMC,
+                segment=self._make_segment(1, batched=False),
+                bmc=self._make_bmc(
+                    version_before='1.0.0',
+                    check_start='2025-01-01T00:00:00.000000'))
 
             # Mock BMC version has changed
             mock_get_bmc_version.return_value = '2.0.0'
 
             # Call the BMC update completion handler
             firmware_interface = redfish_fw.RedfishFirmware()
-            firmware_interface._handle_bmc_update_completion(
-                task, mock_get_update_service.return_value,
-                settings, settings[0])
+            firmware_interface._bmc_update_completion(
+                task, state, mock_get_update_service.return_value)
 
             # Verify version check was called
             mock_get_bmc_version.assert_called_once_with(
                 firmware_interface, task.node)
 
-            # Verify bmc_fw_version_before_update is removed
-            info = task.node.driver_internal_info
-            self.assertNotIn('bmc_fw_version_before_update', info)
+            self.assertEqual('1.0.0', state['bmc']['version_before'])
 
-            # Verify bmc_update_completed flag is NOT set (last component)
-            fw_updates = info.get('redfish_fw_updates', [])
-            self.assertNotIn('bmc_update_completed', fw_updates[0])
-
-            # Verify reboot was NOT triggered (last component)
+            # Verify no reboot was issued (last component)
+            self.assertEqual(redfish_fw.STATE_WAITING_BMC, state['state'])
             mock_power_action.assert_not_called()
 
-            # Verify _continue_updates WAS called (proceeds to completion)
+            # Verify the update continued (proceeds to completion)
             mock_continue_updates.assert_called_once_with(
-                firmware_interface, task,
-                mock_get_update_service.return_value, settings)
-
-    @mock.patch.object(redfish_fw.RedfishFirmware, '_continue_updates',
-                       autospec=True)
-    @mock.patch.object(deploy_utils, 'set_async_step_flags', autospec=True)
-    @mock.patch.object(redfish_fw.RedfishFirmware,
-                       '_validate_resources_stability', autospec=True)
-    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
-    @mock.patch.object(redfish_utils, 'get_task_monitor', autospec=True)
-    def test_nic_completion_sets_reboot_flag(
-            self, mock_get_task_monitor, mock_get_update_service,
-            mock_validate_resources, mock_set_async_flags,
-            mock_continue_updates):
-        """Test NIC firmware task completion sets reboot request flag."""
-        settings = [{'component': 'nic:BCM57414',
-                     'url': 'http://nic/v1.0.0',
-                     'task_monitor': '/tasks/1'}]
-
-        with task_manager.acquire(self.context, self.node.uuid,
-                                  shared=False) as task:
-            # Set up node with NIC update in progress
-            # Set nic_needs_post_completion_reboot to simulate hardware
-            # that started update immediately but needs reboot after completion
-            settings[0]['nic_needs_post_completion_reboot'] = True
-            task.node.set_driver_internal_info(
-                'redfish_fw_updates', settings)
-
-            # Mock task completion
-            mock_task_monitor = mock.Mock()
-            mock_task_monitor.is_processing = False
-            mock_task = mock.Mock()
-            mock_task.task_state = sushy.TASK_STATE_COMPLETED
-            mock_task.task_status = sushy.HEALTH_OK
-            mock_task.messages = []
-            mock_task_monitor.get_task.return_value = mock_task
-            mock_get_task_monitor.return_value = mock_task_monitor
-
-            # Call the check method
-            firmware_interface = redfish_fw.RedfishFirmware()
-            firmware_interface._check_node_redfish_firmware_update(task)
-
-            # Verify reboot flag is set
-            info = task.node.driver_internal_info
-            self.assertTrue(info.get('firmware_reboot_requested'))
-
-            # Verify _continue_updates was called
-            mock_continue_updates.assert_called_once()
-
-    @mock.patch.object(redfish_fw.RedfishFirmware, '_continue_updates',
-                       autospec=True)
-    @mock.patch.object(deploy_utils, 'set_async_step_flags', autospec=True)
-    @mock.patch.object(redfish_fw.RedfishFirmware,
-                       '_validate_resources_stability', autospec=True)
-    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
-    @mock.patch.object(redfish_utils, 'get_task_monitor', autospec=True)
-    def test_nic_completion_reboot_already_triggered(
-            self, mock_get_task_monitor, mock_get_update_service,
-            mock_validate_resources, mock_set_async_flags,
-            mock_continue_updates):
-        """Test NIC completion when reboot was triggered during Starting."""
-        settings = [{'component': 'nic:BCM57414',
-                     'url': 'http://nic/v1.0.0',
-                     'task_monitor': '/tasks/1',
-                     'nic_reboot_triggered': True,
-                     'nic_starting_timestamp': '2025-01-01T00:00:00',
-                     'nic_needs_post_completion_reboot': True}]
-
-        with task_manager.acquire(self.context, self.node.uuid,
-                                  shared=False) as task:
-            task.node.set_driver_internal_info(
-                'redfish_fw_updates', settings)
-
-            mock_task_monitor = mock.Mock()
-            mock_task_monitor.is_processing = False
-            mock_task = mock.Mock()
-            mock_task.task_state = sushy.TASK_STATE_COMPLETED
-            mock_task.task_status = sushy.HEALTH_OK
-            mock_task.messages = []
-            mock_task_monitor.get_task.return_value = mock_task
-            mock_get_task_monitor.return_value = mock_task_monitor
-
-            firmware_interface = redfish_fw.RedfishFirmware()
-            firmware_interface._check_node_redfish_firmware_update(task)
-
-            # Reboot already happened - no reboot flag should be set
-            info = task.node.driver_internal_info
-            self.assertIsNone(info.get('firmware_reboot_requested'))
-
-            # All NIC-specific flags should be cleaned up
-            updated_settings = info['redfish_fw_updates']
-            self.assertNotIn('nic_reboot_triggered', updated_settings[0])
-            self.assertNotIn('nic_starting_timestamp', updated_settings[0])
-            self.assertNotIn('nic_needs_post_completion_reboot',
-                             updated_settings[0])
-
-            mock_continue_updates.assert_called_once()
-
-    @mock.patch.object(redfish_fw, 'LOG', autospec=True)
-    @mock.patch.object(redfish_fw.RedfishFirmware, '_continue_updates',
-                       autospec=True)
-    @mock.patch.object(deploy_utils, 'set_async_step_flags', autospec=True)
-    @mock.patch.object(redfish_fw.RedfishFirmware,
-                       '_validate_resources_stability', autospec=True)
-    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
-    @mock.patch.object(redfish_utils, 'get_task_monitor', autospec=True)
-    def test_nic_completion_no_flags_requests_reboot(
-            self, mock_get_task_monitor, mock_get_update_service,
-            mock_validate_resources, mock_set_async_flags,
-            mock_continue_updates, mock_log):
-        """Test NIC completion with no flags set requests reboot for safety."""
-        settings = [{'component': 'nic:BCM57414',
-                     'url': 'http://nic/v1.0.0',
-                     'task_monitor': '/tasks/1'}]
-
-        with task_manager.acquire(self.context, self.node.uuid,
-                                  shared=False) as task:
-            task.node.set_driver_internal_info(
-                'redfish_fw_updates', settings)
-
-            mock_task_monitor = mock.Mock()
-            mock_task_monitor.is_processing = False
-            mock_task = mock.Mock()
-            mock_task.task_state = sushy.TASK_STATE_COMPLETED
-            mock_task.task_status = sushy.HEALTH_OK
-            mock_task.messages = []
-            mock_task_monitor.get_task.return_value = mock_task
-            mock_get_task_monitor.return_value = mock_task_monitor
-
-            firmware_interface = redfish_fw.RedfishFirmware()
-            firmware_interface._check_node_redfish_firmware_update(task)
-
-            # Neither flag was set - reboot requested for safety
-            info = task.node.driver_internal_info
-            self.assertTrue(info.get('firmware_reboot_requested'))
-
-            # Verify warning was logged
-            mock_log.warning.assert_any_call(
-                'NIC firmware update task completed for node '
-                '%(node)s but no reboot flag was set (task may have '
-                'completed very quickly). Requesting reboot to ensure '
-                'firmware is applied.', {'node': task.node.uuid})
-
-            mock_continue_updates.assert_called_once()
-
-    @mock.patch.object(redfish_fw.RedfishFirmware, '_continue_updates',
-                       autospec=True)
-    @mock.patch.object(deploy_utils, 'set_async_step_flags', autospec=True)
-    @mock.patch.object(redfish_fw.RedfishFirmware,
-                       '_validate_resources_stability', autospec=True)
-    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
-    @mock.patch.object(redfish_utils, 'get_task_monitor', autospec=True)
-    def test_nic_completion_cleans_up_all_flags(
-            self, mock_get_task_monitor, mock_get_update_service,
-            mock_validate_resources, mock_set_async_flags,
-            mock_continue_updates):
-        """Test NIC completion cleans up all NIC-specific flags."""
-        settings = [{'component': 'nic:BCM57414',
-                     'url': 'http://nic/v1.0.0',
-                     'task_monitor': '/tasks/1',
-                     'nic_needs_post_completion_reboot': True,
-                     'nic_starting_timestamp': '2025-01-01T00:00:00',
-                     'nic_reboot_triggered': False}]
-
-        with task_manager.acquire(self.context, self.node.uuid,
-                                  shared=False) as task:
-            task.node.set_driver_internal_info(
-                'redfish_fw_updates', settings)
-
-            mock_task_monitor = mock.Mock()
-            mock_task_monitor.is_processing = False
-            mock_task = mock.Mock()
-            mock_task.task_state = sushy.TASK_STATE_COMPLETED
-            mock_task.task_status = sushy.HEALTH_OK
-            mock_task.messages = []
-            mock_task_monitor.get_task.return_value = mock_task
-            mock_get_task_monitor.return_value = mock_task_monitor
-
-            firmware_interface = redfish_fw.RedfishFirmware()
-            firmware_interface._check_node_redfish_firmware_update(task)
-
-            # needs_post_reboot was True, so reboot flag should be set
-            info = task.node.driver_internal_info
-            self.assertTrue(info.get('firmware_reboot_requested'))
-
-            # All NIC-specific flags should be cleaned up
-            updated_settings = info['redfish_fw_updates']
-            self.assertNotIn('nic_needs_post_completion_reboot',
-                             updated_settings[0])
-            self.assertNotIn('nic_starting_timestamp', updated_settings[0])
-            self.assertNotIn('nic_reboot_triggered', updated_settings[0])
-
-            mock_continue_updates.assert_called_once()
+                firmware_interface, task, state,
+                mock_get_update_service.return_value)
 
     @mock.patch.object(redfish_fw.RedfishFirmware,
                        '_validate_resources_stability', autospec=True)
@@ -2844,7 +2639,11 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
     def test_final_update_with_reboot_flag_triggers_reboot(
             self, mock_get_update_service, mock_clear_updates,
             mock_power_action, mock_resume_clean, validate_mock):
-        """Test final firmware update with reboot flag triggers reboot."""
+        """Final update with reboot flag enters the post-reboot verify
+
+        phase instead of resuming immediately (all vendors, not just
+        Dell).
+        """
         settings = [{'component': 'bmc', 'url': 'http://bmc/v1.0.0',
                      'task_monitor': '/tasks/1'}]
 
@@ -2854,24 +2653,34 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
             task.node.clean_step = {'step': 'update', 'interface': 'firmware'}
 
             # Set up final update with reboot requested
-            task.node.set_driver_internal_info(
-                'redfish_fw_updates', settings)
-            task.node.set_driver_internal_info(
-                'firmware_reboot_requested', True)
+            state = self._set_state(
+                node=task.node, save=False, settings=settings,
+                state=redfish_fw.STATE_WAITING_BMC,
+                segment=self._make_segment(1, batched=False),
+                bmc=self._make_bmc(reboot_requested=True))
 
-            # Call _continue_updates with last firmware
+            # Continue after the last BMC component
             firmware_interface = redfish_fw.RedfishFirmware()
-            firmware_interface._continue_updates(
-                task, mock_get_update_service.return_value, settings)
+            firmware_interface._continue_after_bmc(
+                task, state, mock_get_update_service.return_value)
+            self._complete_bmc_recovery(
+                firmware_interface, task, state,
+                mock_get_update_service.return_value)
 
             # Verify reboot was triggered
             mock_power_action.assert_called_once_with(task, states.REBOOT)
 
-            # Verify BMC validation was called before resuming conductor
+            # The step must NOT resume yet: the verify phase gates it.
             validate_mock.assert_called_once()
+            mock_resume_clean.assert_not_called()
+            mock_clear_updates.assert_not_called()
 
-            # Verify resume clean was called
-            mock_resume_clean.assert_called_once_with(task)
+            self.assertEqual(redfish_fw.STATE_REBOOTING, state['state'])
+            verify = state['verify']
+            self.assertEqual([], verify['jids'])
+            self.assertEqual('pending', verify['lc'])
+            self.assertEqual('pending', verify['boot'])
+            self.assertFalse(state['bmc']['reboot_requested'])
 
     @mock.patch.object(redfish_fw.RedfishFirmware,
                        '_validate_resources_stability', autospec=True)
@@ -2894,14 +2703,19 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
             task.node.clean_step = {'step': 'update', 'interface': 'firmware'}
 
             # Set up final update WITHOUT reboot requested
-            task.node.set_driver_internal_info(
-                'redfish_fw_updates', settings)
-            # Don't set firmware_reboot_requested
+            state = self._set_state(
+                node=task.node, save=False, settings=settings,
+                state=redfish_fw.STATE_WAITING_BMC,
+                segment=self._make_segment(1, batched=False),
+                bmc=self._make_bmc())
 
-            # Call _continue_updates with last firmware
+            # Continue after the last BMC component
             firmware_interface = redfish_fw.RedfishFirmware()
-            firmware_interface._continue_updates(
-                task, mock_get_update_service.return_value, settings)
+            firmware_interface._continue_after_bmc(
+                task, state, mock_get_update_service.return_value)
+            self._complete_bmc_recovery(
+                firmware_interface, task, state,
+                mock_get_update_service.return_value)
 
             # Verify reboot was NOT triggered
             mock_power_action.assert_not_called()
@@ -2912,274 +2726,2506 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
             # Verify resume clean was still called
             mock_resume_clean.assert_called_once_with(task)
 
-    @mock.patch.object(manager_utils, 'node_power_action', autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       '_start_batched_segment', autospec=True)
     @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
+    def test_update_allows_duplicates_without_batching(
+            self, mock_get_update_service, mock_execute_batched):
+        settings = [{'component': 'bios', 'url': 'http://bios/v1.0.0'},
+                    {'component': 'bios', 'url': 'http://bios/v2.0.0'}]
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            task.node.service_step = {'step': 'update',
+                                      'interface': 'firmware'}
+            task.driver.firmware.update(task, settings)
+            mock_execute_batched.assert_called_once()
+
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       '_start_batched_segment', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
+    def test_update_allows_wait_non_bmc_without_batching(
+            self, mock_get_update_service, start_batch):
+        settings = [{'component': 'bios', 'url': 'http://bios/v1.0.0',
+                     'wait': 120}]
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            task.node.service_step = {'step': 'update',
+                                      'interface': 'firmware'}
+            self.assertEqual(states.SERVICEWAIT, task.driver.firmware.update(
+                task, settings))
+            start_batch.assert_called_once()
+
+    @mock.patch.object(redfish_fw.RedfishFirmware, '_submit_simple_update',
+                       autospec=True)
+    @mock.patch.object(redfish_utils, 'get_manager', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_system', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
+    def test_update_allows_wait_without_batching(
+            self, mock_get_update_service, mock_get_system,
+            mock_get_manager, mock_submit_simple_update):
+        settings = [{'component': 'bmc', 'url': 'http://bmc/v1.0.0',
+                     'wait': 300}]
+        mock_system = mock.Mock()
+        mock_get_system.return_value = mock_system
+        mock_manager = mock.Mock()
+        mock_manager.firmware_version = '1.0.0'
+        mock_get_manager.return_value = mock_manager
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            task.node.service_step = {'step': 'update',
+                                      'interface': 'firmware'}
+            task.driver.firmware.update(task, settings)
+            mock_submit_simple_update.assert_called_once()
+
+    @mock.patch.object(firmware_utils, 'cleanup', autospec=True)
+    def test_clear_updates_leaves_no_firmware_keys(self, mock_cleanup):
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            self._set_state(
+                node=task.node, settings=[],
+                state=redfish_fw.STATE_VERIFYING_BOOT, grouping=True,
+                segment=self._make_segment(2), cleanup=['http'],
+                reboot_time=str(timeutils.utcnow().isoformat()),
+                verify=self._make_verify(['1', '2']))
+            task.driver.firmware._clear_updates(task.node)
+            info = task.node.driver_internal_info
+            self.assertNotIn(redfish_fw.FIRMWARE_UPDATE_STATE, info)
+            for key in redfish_fw.LEGACY_KEYS:
+                self.assertNotIn(key, info)
+            mock_cleanup.assert_called_once_with(task.node)
+
+    @mock.patch.object(firmware_utils, 'cleanup', autospec=True)
+    def test_clear_updates_removes_legacy_keys(self, mock_cleanup):
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            for key in redfish_fw.LEGACY_KEYS:
+                task.node.set_driver_internal_info(key, 'stale')
+            task.node.save()
+            task.driver.firmware._clear_updates(task.node)
+            info = task.node.driver_internal_info
+            for key in redfish_fw.LEGACY_KEYS:
+                self.assertNotIn(key, info)
+
+    @mock.patch.object(manager_utils, 'node_power_action', autospec=True)
     @mock.patch.object(redfish_utils, 'get_task_monitor', autospec=True)
-    def test_bios_reboot_on_task_starting(
-            self, mock_get_task_monitor, mock_get_update_service,
+    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
+    def test_check_batched_staging_reboot_builds_batch_verify(
+            self, mock_get_update_service, mock_get_task_monitor,
             mock_power_action):
-        """Test BIOS update triggers reboot when task reaches STARTING."""
-        settings = [{'component': 'bios', 'url': 'http://bios/v1.0.1',
+        """The consolidated reboot records all the segment's JIDs."""
+        self.mock_read_boot_progress.return_value = (
+            sushy.BootProgressStates.OS_RUNNING)
+        self.mock_watch_boot.return_value = True
+        settings = [
+            {'component': 'bios', 'url': 'http://bios/v1.0.0',
+             'task_monitor': '/tasks/JID_11'},
+            {'component': 'nic:NIC.1-1', 'url': 'http://nic/v2.0.0',
+             'task_monitor': '/tasks/JID_7'},
+        ]
+
+        mock_task = mock.Mock()
+        mock_task.task_state = sushy.TASK_STATE_COMPLETED
+        mock_task.task_status = sushy.HEALTH_OK
+        mock_monitor = mock.Mock()
+        mock_monitor.get_task.return_value = mock_task
+        mock_get_task_monitor.return_value = mock_monitor
+
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            task.node.service_step = {'step': 'update',
+                                      'interface': 'firmware'}
+            state = self._set_state(
+                node=task.node, settings=settings, grouping=True,
+                state=redfish_fw.STATE_STAGING,
+                segment=self._make_segment(2, current=1))
+
+            firmware_interface = redfish_fw.RedfishFirmware()
+            firmware_interface._handle_staging(
+                task, state, mock_get_update_service.return_value)
+
+            verify = state['verify']
+            self.assertEqual(['JID_11', 'JID_7'], verify['jids'])
+            self.assertEqual('pending', verify['lc'])
+            self.assertEqual('pending', verify['boot'])
+            self.assertIsNotNone(state['reboot_time'])
+
+            # The baseline is persisted; later polls observe the reset.
+            self.mock_watch_boot.assert_not_called()
+            self.assertEqual(self.mock_observation.return_value,
+                             verify['before'])
+            self.assertFalse(verify['new_boot_observed'])
+
+    @mock.patch.object(manager_utils, 'servicing_error_handler',
+                       autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware, '_clear_updates',
+                       autospec=True)
+    @mock.patch.object(redfish_utils, 'get_task_monitor', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
+    def test_check_batched_staging_task_failed(
+            self, mock_get_update_service, mock_get_task_monitor,
+            mock_clear_updates, mock_error_handler):
+        settings = [
+            {'component': 'bios', 'url': 'http://bios/v1.0.0',
+             'task_monitor': '/tasks/1'},
+            {'component': 'nic:NIC.1-1', 'url': 'http://nic/v2.0.0'},
+        ]
+
+        mock_task = mock.Mock()
+        mock_task.task_state = sushy.TASK_STATE_EXCEPTION
+        mock_task.task_status = sushy.HEALTH_CRITICAL
+        mock_msg = mock.Mock()
+        mock_msg.message = 'Firmware staging failed'
+        mock_msg.message_id = 'MSG001'
+        mock_task.messages = [mock_msg]
+        mock_monitor = mock.Mock()
+        mock_monitor.get_task.return_value = mock_task
+        mock_get_task_monitor.return_value = mock_monitor
+
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            task.node.service_step = {'step': 'update',
+                                      'interface': 'firmware'}
+            state = self._set_state(
+                node=task.node, settings=settings,
+                state=redfish_fw.STATE_STAGING,
+                segment=self._make_segment(1, current=0))
+
+            firmware_interface = redfish_fw.RedfishFirmware()
+            firmware_interface._handle_staging(
+                task, state, mock_get_update_service.return_value)
+
+            mock_clear_updates.assert_called_once()
+            mock_error_handler.assert_called_once()
+
+    @mock.patch.object(manager_utils, 'notify_conductor_resume_service',
+                       autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware, '_clear_updates',
+                       autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       '_validate_resources_stability', autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       'cache_firmware_components', autospec=True)
+    @mock.patch.object(redfish_utils, 'check_boot_progress', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_system', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_task_monitor', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
+    def test_check_batched_post_reboot_all_completed(
+            self, mock_get_update_service, mock_get_task_monitor,
+            mock_get_system, mock_boot_progress, mock_cache_fw,
+            mock_validate_stability, mock_clear_updates,
+            mock_resume_service):
+        """S1: validates resources before caching firmware components.
+
+        All tasks terminal now enters the post-reboot verify phase
+        (non-Dell: LC gate skipped) instead of finalizing immediately;
+        once BootProgress passes and there is nothing to converge on,
+        the segment still finalizes and resumes.
+        """
+        settings = [
+            {'component': 'bios', 'url': 'http://bios/v1.0.0',
+             'task_monitor': '/tasks/1'},
+            {'component': 'nic:NIC.1-1', 'url': 'http://nic/v2.0.0',
+             'task_monitor': '/tasks/2'},
+        ]
+
+        mock_task1 = mock.Mock()
+        mock_task1.task_state = sushy.TASK_STATE_COMPLETED
+        mock_task1.task_status = sushy.HEALTH_OK
+        mock_task2 = mock.Mock()
+        mock_task2.task_state = sushy.TASK_STATE_COMPLETED
+        mock_task2.task_status = sushy.HEALTH_OK
+
+        mock_monitor1 = mock.Mock()
+        mock_monitor1.get_task.return_value = mock_task1
+        mock_monitor2 = mock.Mock()
+        mock_monitor2.get_task.return_value = mock_task2
+
+        mock_get_task_monitor.side_effect = [mock_monitor1, mock_monitor2]
+        mock_boot_progress.return_value = (
+            redfish_utils.BOOT_PROGRESS_PASSED,
+            sushy.BootProgressStates.OS_RUNNING, False)
+
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            task.node.service_step = {'step': 'update',
+                                      'interface': 'firmware'}
+            self._set_state(
+                node=task.node, settings=settings, grouping=True,
+                state=redfish_fw.STATE_APPLYING,
+                segment=self._make_segment(2),
+                reboot_time=str(timeutils.utcnow().isoformat()),
+                verify=self._make_verify(['1', '2']))
+
+            firmware_interface = redfish_fw.RedfishFirmware()
+            firmware_interface._check_node_redfish_firmware_update(task)
+
+            # Terminal tasks alone do not establish reboot recovery.
+            mock_cache_fw.assert_not_called()
+            mock_clear_updates.assert_not_called()
+            mock_resume_service.assert_not_called()
+            self.assertEqual(redfish_fw.STATE_VERIFYING_BOOT,
+                             self._get_state(task.node)['state'])
+
+    # --- P7: batched post-reboot verify phase gate-outcome tests ---
+
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       '_finish_segment', autospec=True)
+    @mock.patch.object(redfish_utils, 'check_boot_progress', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_system', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
+    def test_check_batched_post_reboot_verify_missing_state_fails(
+            self, mock_get_us, mock_get_system, mock_boot_progress,
+            mock_finalize):
+        """Lost application evidence cannot be replaced with boot readiness."""
+        mock_boot_progress.return_value = (
+            redfish_utils.BOOT_PROGRESS_PASSED,
+            sushy.BootProgressStates.OS_RUNNING, False)
+        self._setup_batched_post_reboot_verify(vendor='HPE')
+        state = self._get_state()
+        state['verify'] = None
+        self.node.set_driver_internal_info(
+            redfish_fw.FIRMWARE_UPDATE_STATE, state)
+        self.node.save()
+
+        firmware_interface = redfish_fw.RedfishFirmware()
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            firmware_interface._check_node_redfish_firmware_update(task)
+
+            mock_boot_progress.assert_not_called()
+            mock_finalize.assert_not_called()
+            self.assertEqual(states.SERVICEFAIL, task.node.provision_state)
+
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       '_handle_applying', autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       '_run_lc_job_gate', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
+    def test_check_node_fw_update_verify_state_dispatches(
+            self, mock_get_us, mock_lc_gate, mock_applying):
+        """A verifying state is dispatched to its own gate handler."""
+        mock_lc_gate.return_value = True
+        settings = [{'component': 'bmc', 'url': 'http://bmc/v1',
                      'task_monitor': '/tasks/1'}]
+        self.node.driver_internal_info = {}
+        self._set_state(
+            settings=settings, state=redfish_fw.STATE_VERIFYING_APPLY,
+            segment=self._make_segment(1, batched=False),
+            reboot_time=str(timeutils.utcnow().isoformat()),
+            verify=self._make_verify(['1']))
 
+        firmware_interface = redfish_fw.RedfishFirmware()
         with task_manager.acquire(self.context, self.node.uuid,
                                   shared=False) as task:
-            # Set up node with BIOS update in progress
-            task.node.set_driver_internal_info('redfish_fw_updates', settings)
-            task.node.clean_step = {'step': 'update', 'interface': 'firmware'}
-
-            # Mock task monitor to return is_processing=True
-            mock_task_monitor = mock.Mock()
-            mock_task_monitor.is_processing = True
-            mock_get_task_monitor.return_value = mock_task_monitor
-
-            # Mock the task state as STARTING
-            mock_task = mock.Mock()
-            mock_task.task_state = sushy.TASK_STATE_STARTING
-            mock_task_monitor.get_task.return_value = mock_task
-
-            # Call the check method
-            firmware_interface = redfish_fw.RedfishFirmware()
             firmware_interface._check_node_redfish_firmware_update(task)
 
-            # Verify reboot was triggered
-            mock_power_action.assert_called_once_with(task, states.REBOOT, 0)
+            mock_lc_gate.assert_called_once()
+            mock_applying.assert_not_called()
 
-            # Verify the flag was set to prevent repeated reboots
-            updated_settings = task.node.driver_internal_info[
-                'redfish_fw_updates']
-            self.assertTrue(updated_settings[0].get('bios_reboot_triggered'))
-
-    @mock.patch.object(manager_utils, 'node_power_action', autospec=True)
     @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
-    @mock.patch.object(redfish_utils, 'get_task_monitor', autospec=True)
-    def test_bios_no_repeated_reboot_after_flag_set(
-            self, mock_get_task_monitor, mock_get_update_service,
-            mock_power_action):
-        """Test BIOS update doesn't reboot again after flag is set."""
-        settings = [{'component': 'bios', 'url': 'http://bios/v1.0.1',
-                     'task_monitor': '/tasks/1',
-                     'bios_reboot_triggered': True}]
+    @mock.patch.object(drac_fw, 'check_lc_jobs', autospec=True)
+    def test_check_batched_post_reboot_verify_lc_running_keeps_polling(
+            self, mock_check_lc, mock_get_us):
+        """LC job(s) still running for the segment -- keep polling."""
+        mock_check_lc.return_value = (drac_fw.LC_JOBS_RUNNING, 'JID_1')
+        self._setup_batched_post_reboot_verify(
+            jids=['JID_1', 'JID_2'], vendor='Dell Inc.')
 
+        firmware_interface = redfish_fw.RedfishFirmware()
         with task_manager.acquire(self.context, self.node.uuid,
                                   shared=False) as task:
-            # Set up node with BIOS update in progress and flag already set
-            task.node.set_driver_internal_info('redfish_fw_updates', settings)
-            task.node.clean_step = {'step': 'update', 'interface': 'firmware'}
-
-            # Mock task monitor to return is_processing=True
-            mock_tm = mock.Mock()
-            mock_tm.is_processing = True
-
-            mock_task = mock.Mock()
-            mock_task.task_state = sushy.TASK_STATE_RUNNING
-            mock_tm.get_task.return_value = mock_task
-
-            mock_get_task_monitor.return_value = mock_tm
-
-            # Call the check method
-            firmware_interface = redfish_fw.RedfishFirmware()
             firmware_interface._check_node_redfish_firmware_update(task)
 
-            # Verify reboot was NOT triggered again
-            mock_power_action.assert_not_called()
+            mock_check_lc.assert_called_once_with(
+                task, ['JID_1', 'JID_2'], mock.ANY, required=True)
+
+        self.node.refresh()
+        verify = self._get_state()['verify']
+        self.assertEqual('pending', verify['lc'])
+
+    @mock.patch.object(manager_utils, 'servicing_error_handler',
+                       autospec=True)
+    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
+    @mock.patch.object(drac_fw, 'check_lc_jobs', autospec=True)
+    def test_check_batched_post_reboot_verify_lc_error_fails(
+            self, mock_check_lc, mock_get_us, mock_error_handler):
+        """LC job reports an error for the segment -- fail the step."""
+        mock_check_lc.return_value = (
+            drac_fw.LC_JOBS_ERROR, 'JID_1: Failed - flash error')
+        self._setup_batched_post_reboot_verify(
+            jids=['JID_1', 'JID_2'], vendor='Dell Inc.')
+
+        firmware_interface = redfish_fw.RedfishFirmware()
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            firmware_interface._check_node_redfish_firmware_update(task)
+
+            mock_error_handler.assert_called_once()
+            self.assertIn('flash error', mock_error_handler.call_args[0][1])
+
+        self.node.refresh()
+        self.assertNotIn(redfish_fw.FIRMWARE_UPDATE_STATE,
+                         self.node.driver_internal_info)
+
+    @mock.patch.object(manager_utils, 'servicing_error_handler',
+                       autospec=True)
+    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
+    @mock.patch.object(drac_fw, 'check_lc_jobs', autospec=True)
+    def test_check_batched_post_reboot_verify_lc_timeout_fails(
+            self, mock_check_lc, mock_get_us, mock_error_handler):
+        """LC job(s) never finish for the segment -- fail, do not resume."""
+        self.config(firmware_update_post_reboot_verify_timeout=60,
+                    group='redfish')
+        mock_check_lc.return_value = (drac_fw.LC_JOBS_RUNNING, 'JID_1')
+        started = timeutils.utcnow() - datetime.timedelta(minutes=2)
+        self._setup_batched_post_reboot_verify(
+            jids=['JID_1', 'JID_2'], vendor='Dell Inc.',
+            started=started.isoformat())
+
+        firmware_interface = redfish_fw.RedfishFirmware()
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            firmware_interface._check_node_redfish_firmware_update(task)
+
+            mock_error_handler.assert_called_once()
+            self.assertIn('timed out',
+                          mock_error_handler.call_args[0][1])
+
+    @mock.patch.object(redfish_utils, 'check_boot_progress', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_system', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
+    @mock.patch.object(redfish_fw, 'LOG', autospec=True)
+    @mock.patch.object(drac_fw, 'check_lc_jobs', autospec=True)
+    def test_check_batched_post_reboot_verify_lc_unavailable_skips(
+            self, mock_check_lc, mock_log, mock_get_us,
+            mock_get_system, mock_boot_progress):
+        """LC gate unavailable for the segment -- skip it and warn."""
+        mock_check_lc.return_value = (
+            drac_fw.LC_JOBS_UNAVAILABLE, 'no OEM extension')
+        mock_boot_progress.return_value = (
+            redfish_utils.BOOT_PROGRESS_WAITING, 'Booting', False)
+        self._setup_batched_post_reboot_verify(
+            jids=['JID_1', 'JID_2'], vendor='Dell Inc.')
+
+        firmware_interface = redfish_fw.RedfishFirmware()
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            firmware_interface._check_node_redfish_firmware_update(task)
+
+            mock_check_lc.assert_called_once_with(
+                task, ['JID_1', 'JID_2'], mock.ANY, required=True)
+
+        self.node.refresh()
+        verify = self._get_state()['verify']
+        self.assertEqual('skipped', verify['lc'])
+        mock_log.warning.assert_any_call(mock.ANY, mock.ANY)
+
+    @mock.patch.object(redfish_utils, 'check_boot_progress', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_system', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
+    @mock.patch.object(drac_fw, 'check_lc_jobs', autospec=True)
+    def test_check_batched_post_reboot_verify_lc_done_passes_gate(
+            self, mock_check_lc, mock_get_us, mock_get_system,
+            mock_boot_progress):
+        """LC job(s) done for the segment -- the gate passes on the union
+
+        of the segment's JIDs.
+        """
+        mock_check_lc.return_value = (drac_fw.LC_JOBS_DONE, None)
+        mock_boot_progress.return_value = (
+            redfish_utils.BOOT_PROGRESS_WAITING, 'Booting', False)
+        self._setup_batched_post_reboot_verify(
+            jids=['JID_1', 'JID_2'], vendor='Dell Inc.')
+
+        firmware_interface = redfish_fw.RedfishFirmware()
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            firmware_interface._check_node_redfish_firmware_update(task)
+
+            mock_check_lc.assert_called_once_with(
+                task, ['JID_1', 'JID_2'], mock.ANY, required=True)
+
+        self.node.refresh()
+        verify = self._get_state()['verify']
+        self.assertEqual('passed', verify['lc'])
+        self.assertEqual('pending', verify['boot'])
+
+    @mock.patch.object(redfish_utils, 'get_system', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
+    def test_check_batched_post_reboot_verify_boot_waiting_keeps_polling(
+            self, mock_get_us, mock_get_system):
+        """BootProgress not yet at a target state -- keep polling."""
+        self._setup_batched_post_reboot_verify(
+            vendor='HPE', lc='skipped', boot='pending')
+        self._boot_reply(sushy.BootProgressStates.MEMORY)
+
+        firmware_interface = redfish_fw.RedfishFirmware()
+        with mock.patch.object(redfish_utils, 'check_boot_progress',
+                               autospec=True) as mock_boot:
+            mock_boot.return_value = (
+                redfish_utils.BOOT_PROGRESS_WAITING, 'Booting', False)
+            with task_manager.acquire(self.context, self.node.uuid,
+                                      shared=False) as task:
+                firmware_interface._check_node_redfish_firmware_update(
+                    task)
+
+        self.node.refresh()
+        verify = self._get_state()['verify']
+        self.assertEqual('pending', verify['boot'])
+
+    @mock.patch.object(redfish_fw.RedfishFirmware, '_clear_updates',
+                       autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       'cache_firmware_components', autospec=True)
+    @mock.patch.object(manager_utils, 'notify_conductor_resume_service',
+                       autospec=True)
+    @mock.patch.object(redfish_utils, 'check_boot_progress', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_system', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
+    def test_check_batched_post_reboot_verify_boot_unavailable_waits(
+            self, mock_get_us, mock_get_system, mock_boot_progress,
+            mock_resume, mock_cache_fw, mock_clear_updates):
+        """BootProgress unavailable, no other gate: wait the check delay
+
+        out rather than finalizing immediately after the reboot.
+        """
+        self.config(firmware_update_boot_check_delay=600, group='redfish')
+        mock_boot_progress.return_value = (
+            redfish_utils.BOOT_PROGRESS_UNAVAILABLE, None, False)
+        self._setup_batched_post_reboot_verify(
+            vendor='HPE', lc='skipped', boot='pending',
+            started=str(timeutils.utcnow().isoformat()))
+
+        firmware_interface = redfish_fw.RedfishFirmware()
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            firmware_interface._check_node_redfish_firmware_update(task)
+
+            mock_resume.assert_not_called()
+            mock_cache_fw.assert_not_called()
+            mock_clear_updates.assert_not_called()
+
+        self.node.refresh()
+        verify = self._get_state()['verify']
+        # The gate stays pending, so the wait spans polls instead of
+        # ending on the next one.
+        self.assertEqual('pending', verify['boot'])
+
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       '_validate_resources_stability', autospec=True)
+    @mock.patch.object(manager_utils, 'notify_conductor_resume_service',
+                       autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       'cache_firmware_components', autospec=True)
+    @mock.patch.object(redfish_utils, 'check_boot_progress', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_system', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
+    def test_check_batched_post_reboot_verify_boot_unavailable_delay_done(
+            self, mock_get_us, mock_get_system, mock_boot_progress,
+            mock_cache_fw, mock_resume, mock_validate):
+        """No gates available at all: delay elapsed, finalize and resume."""
+        self.config(firmware_update_boot_check_delay=30, group='redfish')
+        mock_boot_progress.return_value = (
+            redfish_utils.BOOT_PROGRESS_UNAVAILABLE, None, False)
+        started = timeutils.utcnow() - datetime.timedelta(minutes=1)
+        self._setup_batched_post_reboot_verify(
+            vendor='HPE', lc='skipped', boot='pending',
+            started=started.isoformat())
+
+        firmware_interface = redfish_fw.RedfishFirmware()
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            firmware_interface._check_node_redfish_firmware_update(task)
+
+            mock_resume.assert_called_once_with(task)
+            mock_cache_fw.assert_called_once_with(
+                firmware_interface, task)
+
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       '_validate_resources_stability', autospec=True)
+    @mock.patch.object(manager_utils, 'notify_conductor_resume_service',
+                       autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       'cache_firmware_components', autospec=True)
+    @mock.patch.object(drac_fw, 'check_lc_jobs', autospec=True)
+    @mock.patch.object(redfish_utils, 'check_boot_progress', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_system', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
+    def test_check_batched_post_reboot_unavailable_dell_lc_waits(
+            self, mock_get_us, mock_get_system, mock_boot_progress,
+            mock_check_lc, mock_cache_fw, mock_resume, mock_validate):
+        """LC completion does not prove that the host finished booting."""
+        self.config(firmware_update_boot_check_delay=3600, group='redfish')
+        mock_check_lc.return_value = (drac_fw.LC_JOBS_DONE, None)
+        mock_boot_progress.return_value = (
+            redfish_utils.BOOT_PROGRESS_UNAVAILABLE, None, False)
+        self._setup_batched_post_reboot_verify(
+            vendor='Dell Inc.', lc='pending', boot='pending',
+            started=str(timeutils.utcnow().isoformat()))
+
+        firmware_interface = redfish_fw.RedfishFirmware()
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            firmware_interface._check_node_redfish_firmware_update(task)
+
+            mock_resume.assert_not_called()
+            mock_cache_fw.assert_not_called()
 
     @mock.patch.object(redfish_fw, 'LOG', autospec=True)
-    @mock.patch.object(redfish_fw.RedfishFirmware, '_continue_updates',
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       '_validate_resources_stability', autospec=True)
+    @mock.patch.object(manager_utils, 'notify_conductor_resume_service',
                        autospec=True)
-    @mock.patch.object(manager_utils, 'node_power_action', autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       'cache_firmware_components', autospec=True)
+    @mock.patch.object(manager_utils, 'servicing_error_handler',
+                       autospec=True)
+    @mock.patch.object(redfish_utils, 'check_boot_progress', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_system', autospec=True)
     @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
-    @mock.patch.object(redfish_utils, 'get_task_monitor', autospec=True)
-    def test_bios_reboot_on_completion_without_prior_reboot(
-            self, mock_get_task_monitor, mock_get_update_service,
-            mock_power_action, mock_continue_updates, mock_log):
-        """Test BIOS task completion triggers reboot when not triggered before.
+    def test_check_batched_post_reboot_stuck_at_hardware_complete(
+            self, mock_get_us, mock_get_system, mock_boot_progress,
+            mock_error, mock_cache_fw, mock_resume, mock_validate,
+            mock_log):
+        """Reporting limitations must be explicit, not inferred from stalls."""
+        self.config(firmware_update_os_running_timeout=60, group='redfish')
+        mock_boot_progress.return_value = (
+            redfish_utils.BOOT_PROGRESS_WAITING,
+            sushy.BootProgressStates.HARDWARE_COMPLETE, True)
+        os_boot = timeutils.utcnow() - datetime.timedelta(minutes=2)
+        self._setup_batched_post_reboot_verify(
+            vendor='Supermicro', lc='skipped', boot='pending',
+            os_boot_started_at=os_boot.isoformat())
+        self._boot_reply(sushy.BootProgressStates.HARDWARE_COMPLETE)
 
-        This test verifies the alternate path where a BIOS firmware update
-        task completes very quickly (e.g., HPE iLO staging firmware) before
-        Ironic can trigger a reboot during the STARTING state. In this case,
-        when the task reaches COMPLETED state and bios_reboot_triggered is
-        not set, we should:
-        1. Trigger a reboot to apply the staged firmware
-        2. NOT call _continue_updates (return early)
-        3. Set the bios_reboot_triggered flag
-        """
-        settings = [{'component': 'bios', 'url': 'http://bios/v1.0.1',
-                     'task_monitor': '/tasks/1'}]
-
+        firmware_interface = redfish_fw.RedfishFirmware()
         with task_manager.acquire(self.context, self.node.uuid,
                                   shared=False) as task:
-            # Set up node with BIOS update in progress
-            # Note: bios_reboot_triggered is NOT set
-            task.node.set_driver_internal_info('redfish_fw_updates', settings)
-            task.node.clean_step = {'step': 'update', 'interface': 'firmware'}
-
-            # Mock task monitor showing task is completed
-            mock_task_monitor = mock.Mock()
-            mock_task_monitor.is_processing = False
-            mock_task = mock.Mock()
-            mock_task.task_state = sushy.TASK_STATE_COMPLETED
-            mock_task.task_status = sushy.HEALTH_OK
-            mock_task.messages = []
-            mock_task_monitor.get_task.return_value = mock_task
-            mock_get_task_monitor.return_value = mock_task_monitor
-
-            # Call the check method
-            firmware_interface = redfish_fw.RedfishFirmware()
             firmware_interface._check_node_redfish_firmware_update(task)
 
-            # Verify reboot WAS triggered
-            mock_power_action.assert_called_once_with(task, states.REBOOT, 0)
+            mock_error.assert_called_once()
+            mock_resume.assert_not_called()
+            mock_cache_fw.assert_not_called()
 
-            # Verify _continue_updates was NOT called (early return)
-            mock_continue_updates.assert_not_called()
+    @mock.patch.object(manager_utils, 'servicing_error_handler',
+                       autospec=True)
+    @mock.patch.object(redfish_utils, 'check_boot_progress', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_system', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
+    def test_check_batched_post_reboot_never_past_post_fails(
+            self, mock_get_us, mock_get_system, mock_boot_progress,
+            mock_error):
+        """Servicing: never leaving POST at the phase timeout fails.
 
-            # Verify the flag was set to prevent repeated reboots
-            updated_settings = task.node.driver_internal_info[
-                'redfish_fw_updates']
-            self.assertTrue(updated_settings[0].get('bios_reboot_triggered'))
+        This is the case the gate exists for: the node may still have
+        been flashing, so the segment must not finish and risk a
+        power-off.
+        """
+        self.config(firmware_update_post_reboot_verify_timeout=60,
+                    firmware_update_os_running_timeout=3600,
+                    group='redfish')
+        mock_boot_progress.return_value = (
+            redfish_utils.BOOT_PROGRESS_WAITING,
+            sushy.BootProgressStates.MEMORY, True)
+        started = timeutils.utcnow() - datetime.timedelta(minutes=2)
+        self._setup_batched_post_reboot_verify(
+            vendor='Supermicro', lc='skipped', boot='pending',
+            started=started.isoformat())
 
-            # Verify LOG.info was called with the correct message
-            mock_log.info.assert_any_call(
-                'BIOS firmware update task completed for node '
-                '%(node)s but reboot was not triggered yet. '
-                'Triggering reboot now to apply staged firmware.',
-                {'node': task.node.uuid})
+        firmware_interface = redfish_fw.RedfishFirmware()
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            firmware_interface._check_node_redfish_firmware_update(task)
+
+            mock_error.assert_called_once()
+            self.assertIn('timed out', mock_error.call_args[0][1])
+
+    @mock.patch.object(redfish_utils, 'check_boot_progress', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_system', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
+    def test_check_batched_post_reboot_gate_uses_periodic_observations(
+            self, mock_get_us, mock_get_system, mock_boot_progress):
+        """The gate hands the helper the configured check delay.
+
+        Both halves of the latch guard come from persisted state: the
+        delay from configuration, and whether the reboot was observed
+        from the watch that ran when it was issued.
+        """
+        self.config(firmware_update_boot_check_delay=900, group='redfish')
+        mock_boot_progress.return_value = (
+            redfish_utils.BOOT_PROGRESS_WAITING,
+            sushy.BootProgressStates.MEMORY, True)
+        started = str(timeutils.utcnow().isoformat())
+        self._setup_batched_post_reboot_verify(
+            vendor='HPE', service=False, lc='skipped', boot='pending',
+            new_boot_observed=True, started=started)
+        self._boot_reply(sushy.BootProgressStates.MEMORY)
+
+        firmware_interface = redfish_fw.RedfishFirmware()
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            firmware_interface._check_node_redfish_firmware_update(task)
+
+            mock_boot_progress.assert_not_called()
+            self.assertEqual('pending', self._get_state(task.node)[
+                'verify']['boot'])
+
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       '_validate_resources_stability', autospec=True)
+    @mock.patch.object(manager_utils, 'notify_conductor_resume_service',
+                       autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       'cache_firmware_components', autospec=True)
+    @mock.patch.object(redfish_utils, 'check_boot_progress', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_system', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
+    def test_check_batched_post_reboot_verify_boot_passed_finalizes(
+            self, mock_get_us, mock_get_system, mock_boot_progress,
+            mock_cache_fw, mock_resume, mock_validate):
+        """BootProgress reaches a target state -- finalize the segment."""
+        mock_boot_progress.return_value = (
+            redfish_utils.BOOT_PROGRESS_PASSED,
+            sushy.BootProgressStates.OS_RUNNING, False)
+        self._setup_batched_post_reboot_verify(
+            vendor='HPE', lc='skipped', boot='pending')
+        self._boot_reply(sushy.BootProgressStates.OS_RUNNING)
+
+        firmware_interface = redfish_fw.RedfishFirmware()
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            firmware_interface._check_node_redfish_firmware_update(task)
+
+            mock_cache_fw.assert_called_once_with(
+                firmware_interface, task)
+            mock_resume.assert_called_once_with(task)
+
+        self.node.refresh()
+        self.assertNotIn(redfish_fw.FIRMWARE_UPDATE_STATE,
+                         self.node.driver_internal_info)
+
+    @mock.patch.object(manager_utils, 'servicing_error_handler',
+                       autospec=True)
+    @mock.patch.object(redfish_utils, 'check_boot_progress', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_system', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
+    def test_check_batched_post_reboot_verify_boot_timeout_service_fails(
+            self, mock_get_us, mock_get_system, mock_boot_progress,
+            mock_error_handler):
+        """Servicing: the OS never booting on the new firmware fails."""
+        self.config(firmware_update_post_reboot_verify_timeout=60,
+                    group='redfish')
+        mock_boot_progress.return_value = (
+            redfish_utils.BOOT_PROGRESS_WAITING, 'Booting', False)
+        started = timeutils.utcnow() - datetime.timedelta(minutes=2)
+        self._setup_batched_post_reboot_verify(
+            vendor='HPE', service=True, lc='skipped', boot='pending',
+            started=started.isoformat())
+
+        firmware_interface = redfish_fw.RedfishFirmware()
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            firmware_interface._check_node_redfish_firmware_update(task)
+
+            mock_error_handler.assert_called_once()
+            self.assertIn('timed out',
+                          mock_error_handler.call_args[0][1])
+
+        self.node.refresh()
+        self.assertNotIn(redfish_fw.FIRMWARE_UPDATE_STATE,
+                         self.node.driver_internal_info)
+
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       '_validate_resources_stability', autospec=True)
+    @mock.patch.object(manager_utils, 'notify_conductor_resume_service',
+                       autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       'cache_firmware_components', autospec=True)
+    @mock.patch.object(manager_utils, 'servicing_error_handler',
+                       autospec=True)
+    @mock.patch.object(redfish_utils, 'check_boot_progress', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_system', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
+    def test_check_batched_post_reboot_verify_os_boot_started_waits(
+            self, mock_get_us, mock_get_system, mock_boot_progress,
+            mock_error_handler, mock_cache_fw, mock_resume, mock_validate):
+        """Servicing: OSBootStarted starts the bounded OSRunning wait.
+
+        Whether and when a BMC reports OSRunning is platform-specific
+        and not guaranteed by the Redfish schema, so the wait is
+        bounded on its own deadline rather than on the whole verify
+        phase.
+        """
+        self.config(firmware_update_os_running_timeout=300, group='redfish')
+        mock_boot_progress.return_value = (
+            redfish_utils.BOOT_PROGRESS_WAITING,
+            sushy.BootProgressStates.OS_BOOT_STARTED, True)
+        self._setup_batched_post_reboot_verify(
+            vendor='HPE', service=True, lc='skipped', boot='pending')
+        self._boot_reply(sushy.BootProgressStates.OS_BOOT_STARTED)
+
+        firmware_interface = redfish_fw.RedfishFirmware()
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            firmware_interface._check_node_redfish_firmware_update(task)
+
+            mock_error_handler.assert_not_called()
+            mock_cache_fw.assert_not_called()
+            mock_resume.assert_not_called()
+
+        self.node.refresh()
+        state = self.node.driver_internal_info[
+            redfish_fw.FIRMWARE_UPDATE_STATE]
+        self.assertEqual(redfish_fw.STATE_VERIFYING_BOOT, state['state'])
+        self.assertEqual('pending', state['verify']['boot'])
+        self.assertIsNotNone(state['verify']['os_boot_started_at'])
+
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       '_validate_resources_stability', autospec=True)
+    @mock.patch.object(manager_utils, 'notify_conductor_resume_service',
+                       autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       'cache_firmware_components', autospec=True)
+    @mock.patch.object(manager_utils, 'servicing_error_handler',
+                       autospec=True)
+    @mock.patch.object(redfish_utils, 'check_boot_progress', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_system', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
+    def test_check_batched_post_reboot_verify_os_running_timeout_fails(
+            self, mock_get_us, mock_get_system, mock_boot_progress,
+            mock_error_handler, mock_cache_fw, mock_resume, mock_validate):
+        """Servicing: OSRunning never reported within the option's time."""
+        self.config(firmware_update_os_running_timeout=60, group='redfish')
+        mock_boot_progress.return_value = (
+            redfish_utils.BOOT_PROGRESS_WAITING,
+            sushy.BootProgressStates.OS_BOOT_STARTED, True)
+        os_boot = timeutils.utcnow() - datetime.timedelta(minutes=2)
+        self._setup_batched_post_reboot_verify(
+            vendor='HPE', service=True, lc='skipped', boot='pending',
+            os_boot_started_at=os_boot.isoformat())
+        self._boot_reply(sushy.BootProgressStates.OS_BOOT_STARTED)
+
+        firmware_interface = redfish_fw.RedfishFirmware()
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            firmware_interface._check_node_redfish_firmware_update(task)
+
+            mock_error_handler.assert_called_once()
+            mock_cache_fw.assert_not_called()
+            mock_resume.assert_not_called()
 
     @mock.patch.object(redfish_fw, 'LOG', autospec=True)
-    @mock.patch.object(redfish_fw.RedfishFirmware, '_continue_updates',
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       '_validate_resources_stability', autospec=True)
+    @mock.patch.object(manager_utils, 'notify_conductor_resume_service',
                        autospec=True)
-    @mock.patch.object(manager_utils, 'node_power_action', autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       'cache_firmware_components', autospec=True)
+    @mock.patch.object(manager_utils, 'servicing_error_handler',
+                       autospec=True)
+    @mock.patch.object(redfish_utils, 'check_boot_progress', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_system', autospec=True)
     @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
-    @mock.patch.object(redfish_utils, 'get_task_monitor', autospec=True)
-    def test_bios_continue_after_completion_with_prior_reboot(
-            self, mock_get_task_monitor, mock_get_update_service,
-            mock_power_action, mock_continue_updates, mock_log):
-        """Test BIOS task completion continues when reboot already triggered.
+    def test_check_batched_post_reboot_verify_phase_timeout_first(
+            self, mock_get_us, mock_get_system, mock_boot_progress,
+            mock_error_handler, mock_cache_fw, mock_resume, mock_validate,
+            mock_log):
+        """The phase timeout still ends the wait when it fires first."""
+        self.config(firmware_update_post_reboot_verify_timeout=60,
+                    firmware_update_os_running_timeout=3600,
+                    group='redfish')
+        mock_boot_progress.return_value = (
+            redfish_utils.BOOT_PROGRESS_WAITING,
+            sushy.BootProgressStates.OS_BOOT_STARTED, True)
+        started = timeutils.utcnow() - datetime.timedelta(minutes=2)
+        os_boot = timeutils.utcnow() - datetime.timedelta(seconds=30)
+        self._setup_batched_post_reboot_verify(
+            vendor='HPE', service=True, lc='skipped', boot='pending',
+            started=started.isoformat(),
+            os_boot_started_at=os_boot.isoformat())
 
-        This test verifies the else path where a BIOS firmware update task
-        completes and the reboot was already triggered (during STARTING state).
-        In this case, when the task reaches COMPLETED state and
-        bios_reboot_triggered is already set, we should:
-        1. NOT trigger another reboot
-        2. Call _continue_updates to proceed with next firmware
-        3. Clean up the bios_reboot_triggered flag
+        firmware_interface = redfish_fw.RedfishFirmware()
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            firmware_interface._check_node_redfish_firmware_update(task)
+
+            mock_error_handler.assert_called_once()
+            mock_cache_fw.assert_not_called()
+            mock_resume.assert_not_called()
+
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       '_validate_resources_stability', autospec=True)
+    @mock.patch.object(manager_utils, 'notify_conductor_resume_service',
+                       autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       'cache_firmware_components', autospec=True)
+    @mock.patch.object(manager_utils, 'servicing_error_handler',
+                       autospec=True)
+    @mock.patch.object(redfish_utils, 'check_boot_progress', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_system', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
+    def test_check_batched_post_reboot_verify_os_running_timeout_zero(
+            self, mock_get_us, mock_get_system, mock_boot_progress,
+            mock_error_handler, mock_cache_fw, mock_resume, mock_validate):
+        """Zero disables the narrower deadline, not the readiness check."""
+        self.config(firmware_update_os_running_timeout=0, group='redfish')
+        mock_boot_progress.return_value = (
+            redfish_utils.BOOT_PROGRESS_WAITING,
+            sushy.BootProgressStates.OS_BOOT_STARTED, True)
+        self._setup_batched_post_reboot_verify(
+            vendor='HPE', service=True, lc='skipped', boot='pending')
+        self._boot_reply(sushy.BootProgressStates.OS_BOOT_STARTED)
+
+        firmware_interface = redfish_fw.RedfishFirmware()
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            firmware_interface._check_node_redfish_firmware_update(task)
+
+            mock_error_handler.assert_not_called()
+            mock_cache_fw.assert_not_called()
+            mock_resume.assert_not_called()
+
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       '_validate_resources_stability', autospec=True)
+    @mock.patch.object(manager_utils, 'notify_conductor_resume_service',
+                       autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       'cache_firmware_components', autospec=True)
+    @mock.patch.object(manager_utils, 'servicing_error_handler',
+                       autospec=True)
+    @mock.patch.object(redfish_utils, 'check_boot_progress', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_system', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
+    def test_check_batched_post_reboot_verify_os_running_before_timeout(
+            self, mock_get_us, mock_get_system, mock_boot_progress,
+            mock_error_handler, mock_cache_fw, mock_resume, mock_validate):
+        """OSRunning arriving within the wait passes the gate normally."""
+        self.config(firmware_update_os_running_timeout=300, group='redfish')
+        mock_boot_progress.return_value = (
+            redfish_utils.BOOT_PROGRESS_PASSED,
+            sushy.BootProgressStates.OS_RUNNING, True)
+        os_boot = timeutils.utcnow() - datetime.timedelta(seconds=30)
+        self._setup_batched_post_reboot_verify(
+            vendor='HPE', service=True, lc='skipped', boot='pending',
+            os_boot_started_at=os_boot.isoformat())
+        self._boot_reply(sushy.BootProgressStates.OS_RUNNING)
+
+        firmware_interface = redfish_fw.RedfishFirmware()
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            firmware_interface._check_node_redfish_firmware_update(task)
+
+            mock_error_handler.assert_not_called()
+            mock_cache_fw.assert_called_once_with(
+                firmware_interface, task)
+            mock_resume.assert_called_once_with(task)
+
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       '_validate_resources_stability', autospec=True)
+    @mock.patch.object(manager_utils, 'notify_conductor_resume_clean',
+                       autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       'cache_firmware_components', autospec=True)
+    @mock.patch.object(redfish_utils, 'check_boot_progress', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_system', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
+    def test_check_batched_post_reboot_verify_boot_timeout_clean_fails(
+            self, mock_get_us, mock_get_system, mock_boot_progress,
+            mock_cache_fw, mock_resume, mock_validate):
+        """Cleaning/deploy must not bypass a supported, stalled boot check."""
+        self.config(firmware_update_post_reboot_verify_timeout=60,
+                    group='redfish')
+        mock_boot_progress.return_value = (
+            redfish_utils.BOOT_PROGRESS_WAITING, 'Booting', False)
+        started = timeutils.utcnow() - datetime.timedelta(minutes=2)
+        self._setup_batched_post_reboot_verify(
+            vendor='HPE', service=False, lc='skipped', boot='pending',
+            started=started.isoformat())
+
+        firmware_interface = redfish_fw.RedfishFirmware()
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            firmware_interface._check_node_redfish_firmware_update(task)
+
+            mock_cache_fw.assert_not_called()
+            mock_resume.assert_not_called()
+            self.assertEqual(states.CLEANFAIL, task.node.provision_state)
+            self.assertTrue(task.node.maintenance)
+
+    @mock.patch.object(manager_utils, 'servicing_error_handler',
+                       autospec=True)
+    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
+    @mock.patch.object(drac_fw, 'check_lc_jobs', autospec=True)
+    def test_check_batched_post_reboot_verify_lc_error_clears_batch_verify(
+            self, mock_check_lc, mock_get_us, mock_error_handler):
+        """A gate failure goes through the batched failure path.
+
+        It must clear the whole state object (via _clear_updates) so
+        the staged-pending-components note logic and cleanup are shared
+        with the rest of the batched machine's failure handling.
         """
-        settings = [{'component': 'bios', 'url': 'http://bios/v1.0.1',
-                     'task_monitor': '/tasks/1',
-                     'bios_reboot_triggered': True}]  # Flag already set
+        mock_check_lc.return_value = (
+            drac_fw.LC_JOBS_ERROR, 'JID_1: Failed - flash error')
+        self._setup_batched_post_reboot_verify(
+            jids=['JID_1', 'JID_2'], vendor='Dell Inc.')
+
+        firmware_interface = redfish_fw.RedfishFirmware()
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            firmware_interface._check_node_redfish_firmware_update(task)
+
+        self.node.refresh()
+        info = self.node.driver_internal_info
+        self.assertNotIn(redfish_fw.FIRMWARE_UPDATE_STATE, info)
+        for key in redfish_fw.LEGACY_KEYS:
+            self.assertNotIn(key, info)
+
+    @mock.patch.object(manager_utils, 'servicing_error_handler',
+                       autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware, '_clear_updates',
+                       autospec=True)
+    @mock.patch.object(redfish_utils, 'get_task_monitor', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
+    def test_check_batched_post_reboot_task_failed(
+            self, mock_get_update_service, mock_get_task_monitor,
+            mock_clear_updates, mock_error_handler):
+        settings = [
+            {'component': 'bios', 'url': 'http://bios/v1.0.0',
+             'task_monitor': '/tasks/1'},
+            {'component': 'nic:NIC.1-1', 'url': 'http://nic/v2.0.0',
+             'task_monitor': '/tasks/2'},
+        ]
+
+        mock_task1 = mock.Mock()
+        mock_task1.task_state = sushy.TASK_STATE_COMPLETED
+        mock_task1.task_status = sushy.HEALTH_OK
+        mock_task2 = mock.Mock()
+        mock_task2.task_state = sushy.TASK_STATE_EXCEPTION
+        mock_task2.task_status = sushy.HEALTH_CRITICAL
+        mock_msg = mock.Mock()
+        mock_msg.message = 'Firmware update failed'
+        mock_msg.message_id = 'MSG001'
+        mock_task2.messages = [mock_msg]
+
+        mock_monitor1 = mock.Mock()
+        mock_monitor1.get_task.return_value = mock_task1
+        mock_monitor2 = mock.Mock()
+        mock_monitor2.get_task.return_value = mock_task2
+
+        mock_get_task_monitor.side_effect = [mock_monitor1, mock_monitor2]
 
         with task_manager.acquire(self.context, self.node.uuid,
                                   shared=False) as task:
-            # Set up node with BIOS update in progress
-            # Note: bios_reboot_triggered IS set (reboot already happened)
-            task.node.set_driver_internal_info('redfish_fw_updates', settings)
-            task.node.clean_step = {'step': 'update', 'interface': 'firmware'}
+            task.node.service_step = {'step': 'update',
+                                      'interface': 'firmware'}
+            self._set_state(
+                node=task.node, settings=settings, grouping=True,
+                state=redfish_fw.STATE_APPLYING,
+                segment=self._make_segment(2),
+                reboot_time=str(timeutils.utcnow().isoformat()),
+                verify=self._make_verify(['1', '2']))
 
-            # Mock task monitor showing task is completed
-            mock_task_monitor = mock.Mock()
-            mock_task_monitor.is_processing = False
-            mock_task = mock.Mock()
-            mock_task.task_state = sushy.TASK_STATE_COMPLETED
-            mock_task.task_status = sushy.HEALTH_OK
-            mock_task.messages = []
-            mock_task_monitor.get_task.return_value = mock_task
-            mock_get_task_monitor.return_value = mock_task_monitor
-
-            # Call the check method
             firmware_interface = redfish_fw.RedfishFirmware()
             firmware_interface._check_node_redfish_firmware_update(task)
 
-            # Verify reboot was NOT triggered (already happened)
-            mock_power_action.assert_not_called()
+            mock_clear_updates.assert_called_once()
+            mock_error_handler.assert_called_once()
 
-            # Verify _continue_updates WAS called
-            mock_continue_updates.assert_called_once_with(
-                firmware_interface, task, mock_get_update_service.return_value,
-                settings)
-
-            # Verify the flag was cleaned up (popped from settings)
-            updated_settings = task.node.driver_internal_info[
-                'redfish_fw_updates']
-            self.assertIsNone(updated_settings[0].get('bios_reboot_triggered'))
-
-            # Verify LOG.info was called with the correct message
-            mock_log.info.assert_any_call(
-                'BIOS firmware update task completed for node '
-                '%(node)s. System was already rebooted. '
-                'Proceeding with continuation.',
-                {'node': task.node.uuid})
-
-    @mock.patch.object(manager_utils, 'node_power_action', autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       '_finish_segment', autospec=True)
     @mock.patch.object(redfish_utils, 'get_task_monitor', autospec=True)
-    def test_bios_handle_task_starting_sets_flag_correctly(
-            self, mock_get_task_monitor, mock_power_action):
-        """Test _handle_bios_task_starting sets flag correctly with lock.
+    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
+    def test_check_batched_post_reboot_still_starting(
+            self, mock_get_update_service, mock_get_task_monitor,
+            mock_finalize):
+        settings = [
+            {'component': 'bios', 'url': 'http://bios/v1.0.0',
+             'task_monitor': '/tasks/1'},
+            {'component': 'nic:NIC.1-1', 'url': 'http://nic/v2.0.0',
+             'task_monitor': '/tasks/2'},
+        ]
 
-        This test verifies that when _handle_bios_task_starting is called:
-        1. The bios_reboot_triggered flag is set
-        2. task.node reflects the flag immediately after the method returns
+        mock_task1 = mock.Mock()
+        mock_task1.task_state = sushy.TASK_STATE_COMPLETED
+        mock_task1.task_status = sushy.HEALTH_OK
+        mock_task2 = mock.Mock()
+        mock_task2.task_state = sushy.TASK_STATE_STARTING
 
-        If node = task.node were captured BEFORE upgrade_lock (the bug),
-        this test would fail because task.node would be stale and not
-        have the flag.
+        mock_monitor1 = mock.Mock()
+        mock_monitor1.get_task.return_value = mock_task1
+        mock_monitor2 = mock.Mock()
+        mock_monitor2.get_task.return_value = mock_task2
 
-        With the correct order (upgrade_lock first, then node = task.node),
-        the test passes because changes are saved to the correct object.
-        """
-        settings = [{'component': 'bios', 'url': 'http://bios/v1.0.1',
-                     'task_monitor': '/tasks/1'}]
+        mock_get_task_monitor.side_effect = [mock_monitor1, mock_monitor2]
 
         with task_manager.acquire(self.context, self.node.uuid,
                                   shared=False) as task:
-            # Set up node with BIOS update in progress
-            task.node.set_driver_internal_info('redfish_fw_updates', settings)
-            task.node.clean_step = {'step': 'update', 'interface': 'firmware'}
+            task.node.service_step = {'step': 'update',
+                                      'interface': 'firmware'}
+            self._set_state(
+                node=task.node, settings=settings, grouping=True,
+                state=redfish_fw.STATE_APPLYING,
+                segment=self._make_segment(2),
+                reboot_time=str(timeutils.utcnow().isoformat()),
+                verify=self._make_verify(['1', '2']))
+
+            firmware_interface = redfish_fw.RedfishFirmware()
+            firmware_interface._check_node_redfish_firmware_update(task)
+
+            mock_finalize.assert_not_called()
+
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       '_handle_applying', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
+    def test_check_node_firmware_update_dispatches_applying(
+            self, mock_get_update_service, mock_handle):
+        mock_handle.return_value = None
+        settings = [
+            {'component': 'bios', 'url': 'http://bios/v1.0.0',
+             'task_monitor': '/tasks/1'},
+        ]
+
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            task.node.service_step = {'step': 'update',
+                                      'interface': 'firmware'}
+            self._set_state(
+                node=task.node, settings=settings,
+                state=redfish_fw.STATE_APPLYING,
+                segment=self._make_segment(1),
+                reboot_time=str(timeutils.utcnow().isoformat()),
+                verify=self._make_verify(['1']))
+
+            firmware_interface = redfish_fw.RedfishFirmware()
+            firmware_interface._check_node_redfish_firmware_update(task)
+
+            mock_handle.assert_called_once()
+
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       '_handle_staging', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
+    def test_check_node_firmware_update_dispatches_staging(
+            self, mock_get_update_service, mock_handle):
+        mock_handle.return_value = None
+        settings = [
+            {'component': 'bios', 'url': 'http://bios/v1.0.0',
+             'task_monitor': '/tasks/1'},
+            {'component': 'nic:NIC.1-1', 'url': 'http://nic/v2.0.0'},
+        ]
+
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            task.node.service_step = {'step': 'update',
+                                      'interface': 'firmware'}
+            self._set_state(
+                node=task.node, settings=settings, grouping=True,
+                state=redfish_fw.STATE_STAGING,
+                segment=self._make_segment(2, current=0))
+
+            firmware_interface = redfish_fw.RedfishFirmware()
+            firmware_interface._check_node_redfish_firmware_update(task)
+
+            mock_handle.assert_called_once()
+
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       '_handle_staging', autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       '_poll_bmc_update_task', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
+    def test_check_node_firmware_update_dispatches_waiting_bmc(
+            self, mock_get_update_service, mock_poll, mock_handle_staging):
+        """A BMC segment with no wait running polls its Redfish task."""
+        mock_poll.return_value = None
+        settings = [
+            {'component': 'bmc', 'url': 'http://bmc/v1.0.0',
+             'task_monitor': '/tasks/1'},
+        ]
+
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            task.node.service_step = {'step': 'update',
+                                      'interface': 'firmware'}
+            self._set_state(
+                node=task.node, settings=settings,
+                state=redfish_fw.STATE_WAITING_BMC,
+                segment=self._make_segment(1, batched=False),
+                bmc=self._make_bmc())
+
+            firmware_interface = redfish_fw.RedfishFirmware()
+            firmware_interface._check_node_redfish_firmware_update(task)
+
+            mock_poll.assert_called_once()
+            mock_handle_staging.assert_not_called()
+
+    def test_leading_batchable_run_all_non_bmc(self):
+        settings = [
+            {'component': 'bios', 'url': 'http://bios/v1.0.0'},
+            {'component': 'nic:NIC.1-1', 'url': 'http://nic/v2.0.0'},
+        ]
+        self.assertEqual(2, redfish_fw._leading_batchable_run(settings))
+
+    def test_leading_batchable_run_bmc_first(self):
+        settings = [
+            {'component': 'bmc', 'url': 'http://bmc/v1.0.0'},
+            {'component': 'bios', 'url': 'http://bios/v1.0.0'},
+            {'component': 'nic:NIC.1-1', 'url': 'http://nic/v2.0.0'},
+        ]
+        self.assertEqual(0, redfish_fw._leading_batchable_run(settings))
+
+    def test_leading_batchable_run_bmc_middle(self):
+        settings = [
+            {'component': 'bios', 'url': 'http://bios/v1.0.0'},
+            {'component': 'bmc', 'url': 'http://bmc/v1.0.0'},
+            {'component': 'nic:NIC.1-1', 'url': 'http://nic/v2.0.0'},
+        ]
+        self.assertEqual(1, redfish_fw._leading_batchable_run(settings))
+
+    def test_leading_batchable_run_bmc_last(self):
+        settings = [
+            {'component': 'bios', 'url': 'http://bios/v1.0.0'},
+            {'component': 'nic:NIC.1-1', 'url': 'http://nic/v2.0.0'},
+            {'component': 'bmc', 'url': 'http://bmc/v1.0.0'},
+        ]
+        self.assertEqual(2, redfish_fw._leading_batchable_run(settings))
+
+    def test_leading_batchable_run_single_component(self):
+        settings = [
+            {'component': 'bios', 'url': 'http://bios/v1.0.0'},
+        ]
+        self.assertEqual(1, redfish_fw._leading_batchable_run(settings))
+
+    @mock.patch.object(redfish_fw.RedfishFirmware, '_resume_step',
+                       autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware, '_clear_updates',
+                       autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       '_validate_resources_stability', autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       'cache_firmware_components', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_task_monitor', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
+    def test_finish_segment_no_remaining(
+            self, mock_get_update_service, mock_get_task_monitor,
+            mock_cache_fw, mock_validate_stability, mock_clear_updates,
+            mock_resume_step):
+        """All settings in one batch, nothing remaining after finalize."""
+        settings = [
+            {'component': 'bios', 'url': 'http://bios/v1.0.0'},
+            {'component': 'nic:NIC.1-1', 'url': 'http://nic/v2.0.0'},
+        ]
+
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            task.node.service_step = {'step': 'update',
+                                      'interface': 'firmware'}
+            state = self._set_state(
+                node=task.node, settings=settings, grouping=True,
+                state=redfish_fw.STATE_VERIFYING_BOOT,
+                segment=self._make_segment(2),
+                reboot_time=str(timeutils.utcnow().isoformat()),
+                verify=self._make_verify(['1', '2'], lc='passed',
+                                         boot='passed'))
+
+            firmware_interface = redfish_fw.RedfishFirmware()
+            firmware_interface._finish_segment(task, state)
+
+            # The segment ended on a gated reboot, so nothing is left
+            # to validate before the versions are cached.
+            mock_validate_stability.assert_not_called()
+            # Inventory was verified in its own state before this handoff.
+            mock_cache_fw.assert_not_called()
+            mock_clear_updates.assert_called_once()
+            mock_resume_step.assert_called_once()
+
+    @mock.patch.object(redfish_fw.RedfishFirmware, '_start_next_segment',
+                       autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware, '_clear_updates',
+                       autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       'cache_firmware_components', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
+    def test_finish_segment_hands_off_remaining(
+            self, mock_get_update_service, mock_cache_fw,
+            mock_clear_updates, mock_start_next):
+        """[bios, nic, bmc] — batch completes [bios, nic], hands off bmc."""
+        settings = [
+            {'component': 'bios', 'url': 'http://bios/v1.0.0'},
+            {'component': 'nic:NIC.1-1', 'url': 'http://nic/v2.0.0'},
+            {'component': 'bmc', 'url': 'http://bmc/v1.0.0'},
+        ]
+
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            task.node.service_step = {'step': 'update',
+                                      'interface': 'firmware'}
+            state = self._set_state(
+                node=task.node, settings=settings, grouping=True,
+                state=redfish_fw.STATE_VERIFYING_BOOT,
+                segment=self._make_segment(2),
+                reboot_time=str(timeutils.utcnow().isoformat()),
+                verify=self._make_verify(['1', '2'], lc='passed',
+                                         boot='passed'))
+
+            firmware_interface = redfish_fw.RedfishFirmware()
+            self._finish_and_start(firmware_interface, task, state,
+                                   mock_get_update_service.return_value)
+
+            mock_start_next.assert_called_once()
+            remaining = mock_start_next.call_args[0][2]['settings']
+            self.assertEqual(1, len(remaining))
+            self.assertEqual('bmc', remaining[0]['component'])
+            mock_cache_fw.assert_not_called()
+            mock_clear_updates.assert_not_called()
+            self.assertIsNone(state['segment'])
+            self.assertIsNone(state['reboot_time'])
+
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       '_start_batched_segment', autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       '_validate_resources_stability', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
+    def test_continue_updates_enters_batch_after_bmc(
+            self, mock_get_update_service, mock_validate_stability,
+            mock_execute_batched):
+        """After BMC sequential, remaining [bios, nic] enter batch path."""
+        settings = [
+            {'component': 'bmc', 'url': 'http://bmc/v1.0.0'},
+            {'component': 'bios', 'url': 'http://bios/v1.0.0'},
+            {'component': 'nic:NIC.1-1', 'url': 'http://nic/v2.0.0'},
+        ]
+
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            task.node.service_step = {'step': 'update',
+                                      'interface': 'firmware'}
+            state = self._set_state(
+                node=task.node, settings=settings, grouping=True,
+                state=redfish_fw.STATE_WAITING_BMC,
+                segment=self._make_segment(1, batched=False),
+                bmc=self._make_bmc())
+
+            firmware_interface = redfish_fw.RedfishFirmware()
+            mock_update_service = mock_get_update_service.return_value
+            firmware_interface._continue_after_bmc(
+                task, state, mock_update_service)
+            self._complete_bmc_recovery(
+                firmware_interface, task, state, mock_update_service)
+
+            mock_execute_batched.assert_called_once()
+            batched = mock_execute_batched.call_args[0][2]['settings']
+            self.assertEqual(2, len(batched))
+            self.assertEqual('bios', batched[0]['component'])
+
+    @mock.patch.object(manager_utils, 'node_power_action', autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       '_start_batched_segment', autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       '_validate_resources_stability', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
+    def test_continue_updates_single_remaining_uses_batch_path(
+            self, mock_get_update_service, mock_validate_stability,
+            mock_execute_batched, mock_power_action):
+        """After BMC sequential, single remaining [bios] uses batch path."""
+        settings = [
+            {'component': 'bmc', 'url': 'http://bmc/v1.0.0'},
+            {'component': 'bios', 'url': 'http://bios/v1.0.0'},
+        ]
+
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            task.node.service_step = {'step': 'update',
+                                      'interface': 'firmware'}
+            state = self._set_state(
+                node=task.node, settings=settings, grouping=True,
+                state=redfish_fw.STATE_WAITING_BMC,
+                segment=self._make_segment(1, batched=False),
+                bmc=self._make_bmc())
+
+            firmware_interface = redfish_fw.RedfishFirmware()
+            mock_update_service = mock_get_update_service.return_value
+            firmware_interface._continue_after_bmc(
+                task, state, mock_update_service)
+            self._complete_bmc_recovery(
+                firmware_interface, task, state, mock_update_service)
+
+            mock_execute_batched.assert_called_once()
+
+    @mock.patch.object(manager_utils, 'node_power_action', autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware, '_submit_simple_update',
+                       autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware, '_clear_updates',
+                       autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       '_validate_resources_stability', autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       'cache_firmware_components', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_manager', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_system', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
+    def test_finalize_batched_bios_nic_bmc_submits_bmc(
+            self, mock_get_update_service, mock_get_system,
+            mock_get_manager, mock_cache_fw,
+            mock_validate_stability, mock_clear_updates,
+            mock_submit_simple_update, mock_power_action):
+        """N1 regression: [bios, nic, bmc] -- BMC is submitted, not skipped.
+
+        _finish_segment pops batch [bios, nic], then hands [bmc] to
+        _start_next_segment which must submit it via
+        _submit_simple_update, NOT skip it.
+        """
+        settings = [
+            {'component': 'bios', 'url': 'http://bios/v1.0.0'},
+            {'component': 'nic:NIC.1-1', 'url': 'http://nic/v2.0.0'},
+            {'component': 'bmc', 'url': 'http://bmc/v1.0.0'},
+        ]
+        mock_system = mock.Mock()
+        mock_get_system.return_value = mock_system
+        mock_manager = mock.Mock()
+        mock_manager.firmware_version = '1.0.0'
+        mock_get_manager.return_value = mock_manager
+
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            task.node.service_step = {'step': 'update',
+                                      'interface': 'firmware'}
+            state = self._set_state(
+                node=task.node, settings=settings, grouping=True,
+                state=redfish_fw.STATE_VERIFYING_BOOT,
+                segment=self._make_segment(2),
+                reboot_time=str(timeutils.utcnow().isoformat()),
+                verify=self._make_verify(['1', '2'], lc='passed',
+                                         boot='passed'))
+
+            firmware_interface = redfish_fw.RedfishFirmware()
+            self._finish_and_start(firmware_interface, task, state,
+                                   mock_get_update_service.return_value)
+
+            mock_submit_simple_update.assert_called_once()
+            mock_clear_updates.assert_not_called()
+            mock_cache_fw.assert_not_called()
+
+    @mock.patch.object(manager_utils, 'node_power_action', autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware, '_submit_simple_update',
+                       autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware, '_clear_updates',
+                       autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       '_validate_resources_stability', autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       'cache_firmware_components', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_manager', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_system', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
+    def test_finalize_batched_bios_nic_bmc_bios2_nic2_three_phases(
+            self, mock_get_update_service, mock_get_system,
+            mock_get_manager, mock_cache_fw,
+            mock_validate_stability, mock_clear_updates,
+            mock_submit_simple_update, mock_power_action):
+        """N1 regression: three-phase segmentation.
+
+        [bios, nic, bmc, bios2, nic2] -- after batch [bios, nic] completes,
+        BMC submitted via sequential path.
+        """
+        settings = [
+            {'component': 'bios', 'url': 'http://bios/v1.0.0'},
+            {'component': 'nic:NIC.1-1', 'url': 'http://nic/v2.0.0'},
+            {'component': 'bmc', 'url': 'http://bmc/v1.0.0'},
+            {'component': 'bios', 'url': 'http://bios2/v2.0.0'},
+            {'component': 'nic:NIC.Slot.2', 'url': 'http://nic2/v2.0.0'},
+        ]
+        mock_system = mock.Mock()
+        mock_get_system.return_value = mock_system
+        mock_manager = mock.Mock()
+        mock_manager.firmware_version = '1.0.0'
+        mock_get_manager.return_value = mock_manager
+
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            task.node.service_step = {'step': 'update',
+                                      'interface': 'firmware'}
+            state = self._set_state(
+                node=task.node, settings=settings, grouping=True,
+                state=redfish_fw.STATE_VERIFYING_BOOT,
+                segment=self._make_segment(2),
+                reboot_time=str(timeutils.utcnow().isoformat()),
+                verify=self._make_verify(['1', '2'], lc='passed',
+                                         boot='passed'))
+
+            firmware_interface = redfish_fw.RedfishFirmware()
+            self._finish_and_start(firmware_interface, task, state,
+                                   mock_get_update_service.return_value)
+
+            mock_submit_simple_update.assert_called_once()
+            mock_clear_updates.assert_not_called()
+            mock_cache_fw.assert_not_called()
+
+    # --- R2 tests: async step flags, error dispatch, cache parity ---
+
+    def _test_batch_reboot_async_flags(self, step_attr, reboot_flag,
+                                       polling_flag, mock_power_action,
+                                       mock_get_task_monitor):
+        """Verify consolidated reboot sets correct async flags."""
+        settings = [
+            {'component': 'bios', 'url': 'http://bios/v1.0.0',
+             'task_monitor': '/tasks/1'},
+            {'component': 'nic:NIC.1-1', 'url': 'http://nic/v2.0.0',
+             'task_monitor': '/tasks/2'},
+        ]
+
+        mock_task = mock.Mock()
+        mock_task.task_state = sushy.TASK_STATE_COMPLETED
+        mock_task.task_status = sushy.HEALTH_OK
+        mock_monitor = mock.Mock()
+        mock_monitor.get_task.return_value = mock_task
+        mock_get_task_monitor.return_value = mock_monitor
+
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            setattr(task.node, step_attr,
+                    {'step': 'update', 'interface': 'firmware'})
+            state = self._set_state(
+                node=task.node, settings=settings, grouping=True,
+                state=redfish_fw.STATE_STAGING,
+                segment=self._make_segment(2, current=1), save=False)
+            task.node.set_driver_internal_info(
+                'agent_secret_token', 'test-token')
             task.node.save()
 
-            # Mock task monitor showing STARTING state
-            mock_task_monitor = mock.Mock()
-            mock_task = mock.Mock()
-            mock_task.task_state = sushy.TASK_STATE_STARTING
-            mock_task_monitor.get_task.return_value = mock_task
-            mock_get_task_monitor.return_value = mock_task_monitor
+            firmware_interface = redfish_fw.RedfishFirmware()
+            firmware_interface._handle_staging(task, state, mock.Mock())
 
-            # Mock upgrade_lock to simulate what happens in production:
-            # Replace task.node with a fresh copy from DB
-            original_upgrade_lock = task.upgrade_lock
-            def mock_upgrade_lock():
-                original_upgrade_lock()
-                # Simulate production behavior: replace task.node
-                # with fresh copy
-                task.node = objects.Node.get(self.context, task.node.uuid)
+            info = task.node.driver_internal_info
+            self.assertTrue(info.get(polling_flag))
+            self.assertTrue(info.get(reboot_flag))
+            self.assertNotIn('agent_secret_token', info)
+            mock_power_action.assert_called_once_with(
+                task, states.REBOOT, mock.ANY)
 
-            with mock.patch.object(task, 'upgrade_lock',
-                                   side_effect=mock_upgrade_lock,
-                                   autospec=True):
-                # Call the actual method being tested
-                firmware_interface = redfish_fw.RedfishFirmware()
-                result = firmware_interface._handle_bios_task_starting(
-                    task, mock_task_monitor, settings, settings[0])
+    @mock.patch.object(manager_utils, 'node_power_action', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_task_monitor', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
+    def test_batch_reboot_sets_flags_cleaning(
+            self, mock_get_update_service, mock_get_task_monitor,
+            mock_power_action):
+        self._test_batch_reboot_async_flags(
+            'clean_step', async_steps.CLEANING_REBOOT,
+            async_steps.CLEANING_POLLING, mock_power_action,
+            mock_get_task_monitor)
 
-            # Verify reboot was triggered
-            self.assertTrue(result,
-                            'Method should return True when reboot triggered')
-            mock_power_action.assert_called_once()
+    @mock.patch.object(manager_utils, 'node_power_action', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_task_monitor', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
+    def test_batch_reboot_sets_flags_servicing(
+            self, mock_get_update_service, mock_get_task_monitor,
+            mock_power_action):
+        self._test_batch_reboot_async_flags(
+            'service_step', async_steps.SERVICING_REBOOT,
+            async_steps.SERVICING_POLLING, mock_power_action,
+            mock_get_task_monitor)
 
-            # CRITICAL TEST: Verify task.node has the flag
-            # If the order were wrong (node captured before upgrade_lock),
-            # task.node would be a stale object without the flag
-            current_settings = task.node.driver_internal_info.get(
-                'redfish_fw_updates', [{}])
-            self.assertTrue(
-                current_settings[0].get('bios_reboot_triggered'),
-                'Flag must be in task.node after method returns. '
-                'If this fails, node was captured before upgrade_lock.')
+    @mock.patch.object(manager_utils, 'node_power_action', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_task_monitor', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
+    def test_batch_reboot_sets_flags_deploying(
+            self, mock_get_update_service, mock_get_task_monitor,
+            mock_power_action):
+        self._test_batch_reboot_async_flags(
+            'deploy_step', async_steps.DEPLOYMENT_REBOOT,
+            async_steps.DEPLOYMENT_POLLING, mock_power_action,
+            mock_get_task_monitor)
 
-            # Verify the flag is also persisted to DB
-            task.node.refresh()
-            refreshed_settings = task.node.driver_internal_info.get(
-                'redfish_fw_updates', [{}])
-            self.assertTrue(
-                refreshed_settings[0].get('bios_reboot_triggered'),
-                'Flag must be persisted to database')
+    @mock.patch.object(manager_utils, 'node_power_action', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_task_monitor', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
+    def test_batch_reboot_preserves_pregenerated_token(
+            self, mock_get_update_service, mock_get_task_monitor,
+            mock_power_action):
+        settings = [
+            {'component': 'bios', 'url': 'http://bios/v1.0.0',
+             'task_monitor': '/tasks/1'},
+            {'component': 'nic:NIC.1-1', 'url': 'http://nic/v2.0.0',
+             'task_monitor': '/tasks/2'},
+        ]
+
+        mock_task = mock.Mock()
+        mock_task.task_state = sushy.TASK_STATE_COMPLETED
+        mock_task.task_status = sushy.HEALTH_OK
+        mock_monitor = mock.Mock()
+        mock_monitor.get_task.return_value = mock_task
+        mock_get_task_monitor.return_value = mock_monitor
+
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            task.node.service_step = {'step': 'update',
+                                      'interface': 'firmware'}
+            state = self._set_state(
+                node=task.node, settings=settings, grouping=True,
+                state=redfish_fw.STATE_STAGING,
+                segment=self._make_segment(2, current=1), save=False)
+            task.node.set_driver_internal_info(
+                'agent_secret_token', 'pregen-token')
+            task.node.set_driver_internal_info(
+                'agent_secret_token_pregenerated', True)
+            task.node.save()
+
+            firmware_interface = redfish_fw.RedfishFirmware()
+            firmware_interface._handle_staging(task, state, mock.Mock())
+
+            info = task.node.driver_internal_info
+            self.assertEqual('pregen-token', info.get('agent_secret_token'))
+            self.assertTrue(info.get('agent_secret_token_pregenerated'))
+
+    def _test_bmc_completion_reboot_flags(self, step_attr, reboot_flag,
+                                          polling_flag,
+                                          mock_power_action,
+                                          mock_get_bmc_version,
+                                          mock_get_update_service):
+        """Verify BMC completion reboot sets correct async flags."""
+        self.config(firmware_update_required_successes=0, group='redfish')
+        settings = [
+            {'component': 'bmc', 'url': 'http://bmc/v1.0.0',
+             'wait': 300, 'task_monitor': '/tasks/1'},
+            {'component': 'nic:BCM57414', 'url': 'http://nic/v1.0.0',
+             'task_monitor': '/tasks/2'}
+        ]
+
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            setattr(task.node, step_attr,
+                    {'step': 'update', 'interface': 'firmware'})
+            state = self._set_state(
+                node=task.node, save=False, settings=settings,
+                state=redfish_fw.STATE_WAITING_BMC,
+                segment=self._make_segment(1, batched=False),
+                bmc=self._make_bmc(
+                    version_before='1.0.0',
+                    check_start='2025-01-01T00:00:00.000000'))
+            task.node.set_driver_internal_info(
+                'agent_secret_token', 'test-token')
+            task.node.save()
+
+            mock_get_bmc_version.return_value = '2.0.0'
+
+            firmware_interface = redfish_fw.RedfishFirmware()
+            firmware_interface._bmc_update_completion(
+                task, state, mock_get_update_service.return_value)
+            firmware_interface._handle_validating_bmc(
+                task, state, mock_get_update_service.return_value)
+
+            info = task.node.driver_internal_info
+            self.assertTrue(info.get(polling_flag))
+            self.assertTrue(info.get(reboot_flag))
+            self.assertNotIn('agent_secret_token', info)
+            mock_power_action.assert_called_once_with(task, states.REBOOT)
+
+    @mock.patch.object(manager_utils, 'node_power_action', autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       '_get_current_bmc_version', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
+    def test_bmc_completion_reboot_sets_flags_cleaning(
+            self, mock_get_update_service, mock_get_bmc_version,
+            mock_power_action):
+        self._test_bmc_completion_reboot_flags(
+            'clean_step', async_steps.CLEANING_REBOOT,
+            async_steps.CLEANING_POLLING,
+            mock_power_action, mock_get_bmc_version,
+            mock_get_update_service)
+
+    @mock.patch.object(manager_utils, 'node_power_action', autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       '_get_current_bmc_version', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
+    def test_bmc_completion_reboot_sets_flags_servicing(
+            self, mock_get_update_service, mock_get_bmc_version,
+            mock_power_action):
+        self._test_bmc_completion_reboot_flags(
+            'service_step', async_steps.SERVICING_REBOOT,
+            async_steps.SERVICING_POLLING,
+            mock_power_action, mock_get_bmc_version,
+            mock_get_update_service)
+
+    @mock.patch.object(manager_utils, 'node_power_action', autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       '_get_current_bmc_version', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
+    def test_bmc_completion_reboot_sets_flags_deploying(
+            self, mock_get_update_service, mock_get_bmc_version,
+            mock_power_action):
+        self._test_bmc_completion_reboot_flags(
+            'deploy_step', async_steps.DEPLOYMENT_REBOOT,
+            async_steps.DEPLOYMENT_POLLING,
+            mock_power_action, mock_get_bmc_version,
+            mock_get_update_service)
+
+    @mock.patch.object(manager_utils, 'node_history_record', autospec=True)
+    @mock.patch.object(redfish_fw, 'LOG', autospec=True)
+    def test_report_step_error_no_step_type(self, mock_log,
+                                            mock_history):
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            firmware_interface = redfish_fw.RedfishFirmware()
+            firmware_interface._report_step_error(
+                task, 'test error message')
+
+            mock_log.error.assert_called_once()
+            call_args = mock_log.error.call_args[0]
+            self.assertIn('No step type', call_args[0])
+            self.assertTrue(task.node.maintenance)
+            self.assertEqual('test error message',
+                             task.node.maintenance_reason)
+            mock_history.assert_called_once_with(
+                task.node, event='test error message', error=True)
+
+    @mock.patch.object(manager_utils, 'servicing_error_handler',
+                       autospec=True)
+    @mock.patch.object(manager_utils, 'deploying_error_handler',
+                       autospec=True)
+    def test_report_step_error_service_precedence(
+            self, mock_deploy_error, mock_service_error):
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            task.node.service_step = {'step': 'update',
+                                      'interface': 'firmware'}
+            task.node.deploy_step = {'step': 'update',
+                                     'interface': 'firmware'}
+
+            firmware_interface = redfish_fw.RedfishFirmware()
+            firmware_interface._report_step_error(
+                task, 'test error message')
+
+            mock_service_error.assert_called_once_with(
+                task, 'test error message', traceback=True)
+            mock_deploy_error.assert_not_called()
+
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       'cache_firmware_components', autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       '_validate_resources_stability', autospec=True)
+    @mock.patch.object(manager_utils, 'notify_conductor_resume_clean',
+                       autospec=True)
+    def test_continue_updates_last_calls_cache(
+            self, mock_resume_clean, mock_validate, mock_cache):
+        self._generate_new_driver_internal_info(['bmc'])
+        task = self._test_continue_updates()
+
+        mock_cache.assert_called_once()
+        mock_resume_clean.assert_called_once_with(task)
+
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       'cache_firmware_components', autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       '_validate_resources_stability', autospec=True)
+    @mock.patch.object(manager_utils, 'notify_conductor_resume_clean',
+                       autospec=True)
+    def test_continue_updates_last_cache_exception_retried(
+            self, mock_resume_clean, mock_validate, mock_cache):
+        mock_cache.side_effect = exception.RedfishError(error='cache failed')
+        self._generate_new_driver_internal_info(['bmc'])
+        self.assertRaises(exception.RedfishError, self._test_continue_updates)
+
+        mock_cache.assert_called_once()
+        mock_resume_clean.assert_not_called()
+
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       'cache_firmware_components', autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       '_validate_resources_stability', autospec=True)
+    @mock.patch.object(manager_utils, 'notify_conductor_resume_deploy',
+                       autospec=True)
+    def test_continue_updates_last_deploy(
+            self, mock_resume_deploy, mock_validate, mock_cache):
+        settings = [{'component': 'bios', 'url': 'http://bios/v1.0.0',
+                     'task_monitor': '/tasks/1'}]
+
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            task.node.deploy_step = {'step': 'update',
+                                     'interface': 'firmware'}
+            state = self._set_state(
+                node=task.node, settings=settings,
+                state=redfish_fw.STATE_WAITING_BMC,
+                segment=self._make_segment(1, batched=False),
+                bmc=self._make_bmc())
+
+            firmware_interface = redfish_fw.RedfishFirmware()
+            firmware_interface._continue_after_bmc(
+                task, state, mock.Mock())
+            self._complete_bmc_recovery(
+                firmware_interface, task, state, mock.Mock())
+
+            mock_cache.assert_called_once()
+            mock_resume_deploy.assert_called_once_with(task)
+
+    # --- M-6 guard tests ---
+
+    @mock.patch.object(redfish_fw.RedfishFirmware, '_submit_simple_update',
+                       autospec=True)
+    @mock.patch.object(redfish_utils, 'get_manager', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_system', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
+    def test_start_time_stamped_once_across_segments(
+            self, mock_get_update_service, mock_get_system,
+            mock_get_manager, mock_submit_simple_update):
+        settings = [{'component': 'bmc', 'url': 'http://bmc/v1.0.0'},
+                    {'component': 'bios', 'url': 'http://bios/v1.0.0'}]
+        mock_system = mock.Mock()
+        mock_get_system.return_value = mock_system
+        mock_manager = mock.Mock()
+        mock_manager.firmware_version = '1.0.0'
+        mock_get_manager.return_value = mock_manager
+
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            task.node.service_step = {'step': 'update',
+                                      'interface': 'firmware'}
+            task.driver.firmware.update(task, settings)
+
+            state = self._get_state(task.node)
+            original_stamp = state['started_at']
+            self.assertIsNotNone(original_stamp)
+
+            state['settings'] = [{'component': 'bios',
+                                  'url': 'http://bios/v1.0.0'}]
+            # The completed segment handed off through inventory verification.
+            state['state'] = redfish_fw.STATE_STARTING
+            firmware_interface = redfish_fw.RedfishFirmware()
+            firmware_interface._start_next_segment(
+                task, state, mock_get_update_service.return_value)
+
+            after_stamp = self._get_state(task.node)['started_at']
+            self.assertEqual(original_stamp, after_stamp)
+
+    @mock.patch.object(manager_utils, 'node_power_action', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_task_monitor', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
+    def test_batch_reboot_polling_true_even_when_ramdisk_disabled(
+            self, mock_get_update_service, mock_get_task_monitor,
+            mock_power_action):
+        settings = [
+            {'component': 'bios', 'url': 'http://bios/v1.0.0',
+             'task_monitor': '/tasks/1'},
+            {'component': 'nic:NIC.1-1', 'url': 'http://nic/v2.0.0',
+             'task_monitor': '/tasks/2'},
+        ]
+
+        mock_task = mock.Mock()
+        mock_task.task_state = sushy.TASK_STATE_COMPLETED
+        mock_task.task_status = sushy.HEALTH_OK
+        mock_monitor = mock.Mock()
+        mock_monitor.get_task.return_value = mock_task
+        mock_get_task_monitor.return_value = mock_monitor
+
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            task.node.clean_step = {'step': 'update',
+                                    'interface': 'firmware'}
+            task.node.provision_state = states.CLEANWAIT
+            task.node.set_driver_internal_info(
+                'cleaning_disable_ramdisk', True)
+            state = self._set_state(
+                node=task.node, settings=settings, grouping=True,
+                state=redfish_fw.STATE_STAGING,
+                segment=self._make_segment(2, current=1))
+
+            firmware_interface = redfish_fw.RedfishFirmware()
+            firmware_interface._handle_staging(task, state, mock.Mock())
+
+            info = task.node.driver_internal_info
+            self.assertTrue(info.get(async_steps.CLEANING_POLLING))
+            self.assertTrue(info.get(async_steps.CLEANING_REBOOT))
+
+    @mock.patch.object(manager_utils, 'node_power_action', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_task_monitor', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
+    def test_batch_reboot_polling_true_when_ramdisk_active(
+            self, mock_get_update_service, mock_get_task_monitor,
+            mock_power_action):
+        # provision_state CLEANWAIT with NO cleaning_disable_ramdisk:
+        # is_ramdisk_disabled() returns False here, so a reintroduced
+        # polling=is_ramdisk_disabled(node) bug would set polling=False
+        # and the assertion below would catch it.
+        settings = [
+            {'component': 'bios', 'url': 'http://bios/v1.0.0',
+             'task_monitor': '/tasks/1'},
+            {'component': 'nic:NIC.1-1', 'url': 'http://nic/v2.0.0',
+             'task_monitor': '/tasks/2'},
+        ]
+
+        mock_task = mock.Mock()
+        mock_task.task_state = sushy.TASK_STATE_COMPLETED
+        mock_task.task_status = sushy.HEALTH_OK
+        mock_monitor = mock.Mock()
+        mock_monitor.get_task.return_value = mock_task
+        mock_get_task_monitor.return_value = mock_monitor
+
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            task.node.clean_step = {'step': 'update',
+                                    'interface': 'firmware'}
+            task.node.provision_state = states.CLEANWAIT
+            state = self._set_state(
+                node=task.node, settings=settings, grouping=True,
+                state=redfish_fw.STATE_STAGING,
+                segment=self._make_segment(2, current=1))
+
+            firmware_interface = redfish_fw.RedfishFirmware()
+            firmware_interface._handle_staging(task, state, mock.Mock())
+
+            info = task.node.driver_internal_info
+            self.assertTrue(info.get(async_steps.CLEANING_POLLING))
+            self.assertTrue(info.get(async_steps.CLEANING_REBOOT))
+
+    # --- W-1 staged-pending disclosure tests ---
+
+    @mock.patch.object(manager_utils, 'servicing_error_handler',
+                       autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware, '_clear_updates',
+                       autospec=True)
+    @mock.patch.object(redfish_utils, 'get_task_monitor', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
+    def test_staged_pending_note_absent_in_phase2(
+            self, mock_get_update_service, mock_get_task_monitor,
+            mock_clear_updates, mock_error_handler):
+        settings = [
+            {'component': 'bios', 'url': 'http://bios/v1.0.0',
+             'task_monitor': '/tasks/1'},
+            {'component': 'nic:NIC.1-1', 'url': 'http://nic/v2.0.0',
+             'task_monitor': '/tasks/2'},
+        ]
+
+        mock_task = mock.Mock()
+        mock_task.task_state = sushy.TASK_STATE_EXCEPTION
+        mock_task.task_status = sushy.HEALTH_CRITICAL
+        mock_msg = mock.Mock()
+        mock_msg.message = 'Apply failed'
+        mock_msg.message_id = 'MSG001'
+        mock_task.messages = [mock_msg]
+        mock_monitor = mock.Mock()
+        mock_monitor.get_task.return_value = mock_task
+        mock_get_task_monitor.return_value = mock_monitor
+
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            task.node.service_step = {'step': 'update',
+                                      'interface': 'firmware'}
+            state = self._set_state(
+                node=task.node, settings=settings, grouping=True,
+                state=redfish_fw.STATE_APPLYING,
+                segment=self._make_segment(2),
+                reboot_time=str(timeutils.utcnow().isoformat()),
+                verify=self._make_verify(['1', '2']))
+
+            firmware_interface = redfish_fw.RedfishFirmware()
+            firmware_interface._handle_applying(task, state, mock.Mock())
+
+            mock_error_handler.assert_called_once()
+            error_msg = mock_error_handler.call_args[0][1]
+            self.assertNotIn('staged on the BMC', error_msg)
+
+    @mock.patch.object(manager_utils, 'servicing_error_handler',
+                       autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware, '_clear_updates',
+                       autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       '_submit_one_batched_component', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
+    def test_staged_pending_note_absent_on_first_component_failure(
+            self, mock_get_update_service, mock_submit,
+            mock_clear_updates, mock_error_handler):
+        settings = [
+            {'component': 'bios', 'url': 'http://bios/v1.0.0'},
+            {'component': 'nic:NIC.1-1', 'url': 'http://nic/v2.0.0'},
+            {'component': 'nic:NIC.Slot.2', 'url': 'http://nic2/v2.0.0'},
+        ]
+        mock_submit.side_effect = sushy.exceptions.SushyError(
+            message='SimpleUpdate failed')
+
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            task.node.service_step = {'step': 'update',
+                                      'interface': 'firmware'}
+            firmware_interface = redfish_fw.RedfishFirmware()
+            self.assertRaises(
+                sushy.exceptions.SushyError,
+                firmware_interface._start_batched_segment,
+                task, self._make_state(settings, grouping=True),
+                mock_get_update_service.return_value)
+
+    # --- P8: explicit state machine -------------------------------
+
+    def test_transitions_table_is_reachable_and_closed(self):
+        """Every declared state is reachable and has a handler."""
+        declared = set(redfish_fw._STATE_HANDLERS)
+        self.assertEqual(declared, set(redfish_fw._TRANSITIONS) - {None})
+        reachable = set()
+        for targets in redfish_fw._TRANSITIONS.values():
+            reachable |= set(targets)
+        self.assertEqual(declared, reachable)
+        for name in redfish_fw._STATE_HANDLERS.values():
+            self.assertTrue(hasattr(redfish_fw.RedfishFirmware, name))
+
+    def test_transition_stamps_state_and_entered_at(self):
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            state = self._set_state(
+                node=task.node, settings=[],
+                state=redfish_fw.STATE_REBOOTING,
+                segment=self._make_segment(1))
+            before = state['entered_at']
+
+            firmware_interface = redfish_fw.RedfishFirmware()
+            firmware_interface._transition(task, state,
+                                           redfish_fw.STATE_APPLYING)
+
+            self.assertEqual(redfish_fw.STATE_APPLYING, state['state'])
+            self.assertNotEqual(before, state['entered_at'])
+            stored = self._get_state(task.node)
+            self.assertEqual(redfish_fw.STATE_APPLYING, stored['state'])
+            self.assertEqual(state['entered_at'], stored['entered_at'])
+
+    @mock.patch.object(redfish_fw, 'LOG', autospec=True)
+    def test_transition_logs_the_move(self, log_mock):
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            state = self._set_state(
+                node=task.node, settings=[],
+                state=redfish_fw.STATE_APPLYING,
+                segment=self._make_segment(1))
+
+            firmware_interface = redfish_fw.RedfishFirmware()
+            firmware_interface._transition(
+                task, state, redfish_fw.STATE_VERIFYING_APPLY)
+
+            log_mock.info.assert_any_call(
+                'Node %(node)s: firmware update state %(old)s -> %(new)s',
+                {'node': self.node.uuid, 'old': redfish_fw.STATE_APPLYING,
+                 'new': redfish_fw.STATE_VERIFYING_APPLY})
+
+    def test_transition_rejects_undeclared_move(self):
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            state = self._set_state(
+                node=task.node, settings=[],
+                state=redfish_fw.STATE_STAGING,
+                segment=self._make_segment(1, current=0))
+
+            firmware_interface = redfish_fw.RedfishFirmware()
+            self.assertRaises(
+                exception.InvalidFirmwareUpdateState,
+                firmware_interface._transition, task, state,
+                redfish_fw.STATE_VERIFYING_BOOT)
+            self.assertEqual(redfish_fw.STATE_STAGING, state['state'])
+
+    def test_transition_rejects_start_from_no_state(self):
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            state = self._make_state([])
+            firmware_interface = redfish_fw.RedfishFirmware()
+            self.assertRaises(
+                exception.InvalidFirmwareUpdateState,
+                firmware_interface._transition, task, state,
+                redfish_fw.STATE_APPLYING)
+
+    # --- per-handler transition tests ------------------------------
+
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       '_start_batched_reboot', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_task_monitor', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
+    def test_handle_staging_last_component_reboots(
+            self, mock_get_us, mock_get_task_monitor, mock_reboot):
+        settings = [{'component': 'bios', 'url': 'http://bios/v1.0.0',
+                     'task_monitor': '/tasks/1'}]
+        mock_task = mock.Mock()
+        mock_task.task_state = sushy.TASK_STATE_COMPLETED
+        mock_task.task_status = sushy.HEALTH_OK
+        mock_get_task_monitor.return_value.get_task.return_value = mock_task
+
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            state = self._set_state(
+                node=task.node, settings=settings,
+                state=redfish_fw.STATE_STAGING,
+                segment=self._make_segment(1, current=0))
+            firmware_interface = redfish_fw.RedfishFirmware()
+            result = firmware_interface._handle_staging(
+                task, state, mock_get_us.return_value)
+
+        self.assertIsNone(result)
+        mock_reboot.assert_called_once()
+
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       '_validate_resources_stability', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
+    def test_handle_rebooting_returns_applying(self, mock_get_us,
+                                               mock_validate):
+        """The poll after the reboot starts polling the segment's tasks.
+
+        The reboot watch has already read from the BMC, which never
+        reset, so there is nothing to settle or validate first.
+        """
+        now = timeutils.utcnow()
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            state = self._set_state(
+                node=task.node, settings=[], grouping=True,
+                state=redfish_fw.STATE_REBOOTING,
+                segment=self._make_segment(0),
+                reboot_time=now.isoformat(),
+                verify=self._make_verify([]))
+            firmware_interface = redfish_fw.RedfishFirmware()
+            result = firmware_interface._handle_rebooting(
+                task, state, mock_get_us.return_value)
+
+        self.assertEqual(redfish_fw.STATE_APPLYING, result)
+        mock_validate.assert_not_called()
+
+    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
+    def test_handle_applying_no_tasks_returns_verifying_apply(
+            self, mock_get_us):
+        settings = [{'component': 'bmc', 'url': 'http://bmc/v1.0.0'}]
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            state = self._set_state(
+                node=task.node, settings=settings,
+                state=redfish_fw.STATE_APPLYING,
+                segment=self._make_segment(1, batched=False),
+                reboot_time=str(timeutils.utcnow().isoformat()),
+                verify=self._make_verify([]))
+            firmware_interface = redfish_fw.RedfishFirmware()
+            result = firmware_interface._handle_applying(
+                task, state, mock_get_us.return_value)
+
+        self.assertEqual(redfish_fw.STATE_VERIFYING_APPLY, result)
+
+    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
+    def test_handle_verifying_apply_returns_verifying_boot(self, mock_get_us):
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            state = self._set_state(
+                node=task.node, settings=[], grouping=True,
+                state=redfish_fw.STATE_VERIFYING_APPLY,
+                segment=self._make_segment(0),
+                reboot_time=str(timeutils.utcnow().isoformat()),
+                verify=self._make_verify(['1']))
+            firmware_interface = redfish_fw.RedfishFirmware()
+            result = firmware_interface._handle_verifying_apply(
+                task, state, mock_get_us.return_value)
+
+        # Non-Dell node: the LC gate is skipped, not run.
+        self.assertEqual(redfish_fw.STATE_VERIFYING_BOOT, result)
+        self.assertEqual('skipped', state['verify']['lc'])
+
+    @mock.patch.object(redfish_fw.RedfishFirmware, '_finish_segment',
+                       autospec=True)
+    @mock.patch.object(redfish_utils, 'check_boot_progress', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_system', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
+    def test_handle_verifying_boot_enters_inventory(
+            self, mock_get_us, mock_get_system, mock_boot_progress,
+            mock_finish):
+        mock_boot_progress.return_value = (
+            redfish_utils.BOOT_PROGRESS_PASSED,
+            sushy.BootProgressStates.OS_RUNNING, False)
+        self._boot_reply(sushy.BootProgressStates.OS_RUNNING)
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            state = self._set_state(
+                node=task.node, settings=[], grouping=True,
+                state=redfish_fw.STATE_VERIFYING_BOOT,
+                segment=self._make_segment(0),
+                reboot_time=(timeutils.utcnow()
+                             - datetime.timedelta(seconds=60)).isoformat(),
+                verify=self._make_verify(['1'], lc='skipped',
+                                         new_boot_observed=True))
+            firmware_interface = redfish_fw.RedfishFirmware()
+            result = firmware_interface._handle_verifying_boot(
+                task, state, mock_get_us.return_value)
+
+        self.assertEqual(redfish_fw.STATE_VERIFYING_INVENTORY, result)
+        self.assertEqual('passed', state['verify']['boot'])
+        mock_finish.assert_not_called()
+
+    @mock.patch.object(redfish_fw.RedfishFirmware, '_start_bmc_segment',
+                       autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       '_validate_resources_stability', autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       'cache_firmware_components', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
+    def test_finish_segment_starts_the_next_bmc_segment(
+            self, mock_get_us, mock_cache, mock_validate, mock_start_bmc):
+        settings = [
+            {'component': 'bios', 'url': 'http://bios/v1.0.0'},
+            {'component': 'bmc', 'url': 'http://bmc/v1.0.0'},
+        ]
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            state = self._set_state(
+                node=task.node, settings=settings, grouping=True,
+                state=redfish_fw.STATE_VERIFYING_BOOT,
+                segment=self._make_segment(1),
+                reboot_time=str(timeutils.utcnow().isoformat()),
+                verify=self._make_verify([], lc='skipped', boot='passed'))
+            firmware_interface = redfish_fw.RedfishFirmware()
+            self._finish_and_start(firmware_interface, task, state,
+                                   mock_get_us.return_value)
+
+        mock_start_bmc.assert_called_once()
+        self.assertEqual(1, len(state['settings']))
+        self.assertEqual('bmc', state['settings'][0]['component'])
+        mock_cache.assert_not_called()
+
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       '_validate_resources_stability', autospec=True)
+    @mock.patch.object(manager_utils, 'node_power_action', autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       '_get_current_bmc_version', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
+    def test_waiting_bmc_reboot_reaches_the_shared_verify_states(
+            self, mock_get_us, mock_get_bmc_version, mock_power,
+            mock_validate):
+        """976706: the BMC-then-host-reboot uses the same verify states."""
+        settings = [
+            {'component': 'bmc', 'url': 'http://bmc/v1.0.0',
+             'task_monitor': '/tasks/JID_1'},
+            {'component': 'nic:NIC.1-1', 'url': 'http://nic/v2.0.0'},
+        ]
+        mock_get_bmc_version.return_value = '2.0.0'
+        past = timeutils.utcnow() - datetime.timedelta(minutes=5)
+
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            task.node.service_step = {'step': 'update',
+                                      'interface': 'firmware'}
+            state = self._set_state(
+                node=task.node, settings=settings,
+                state=redfish_fw.STATE_WAITING_BMC,
+                segment=self._make_segment(1, batched=False),
+                bmc=self._make_bmc(version_before='1.0.0'))
+
+            firmware_interface = redfish_fw.RedfishFirmware()
+            firmware_interface._bmc_update_completion(
+                task, state, mock_get_us.return_value)
+            firmware_interface._handle_validating_bmc(
+                task, state, mock_get_us.return_value)
+
+            self.assertEqual(redfish_fw.STATE_REBOOTING, state['state'])
+            self.assertEqual(['JID_1'], state['verify']['jids'])
+            # The segment carries no task monitors: applying is a
+            # pass-through to the verify states.
+            self.assertNotIn('task_monitor', state['settings'][0])
+            self.assertEqual(0, len(
+                firmware_interface._staged_pending(state)))
+
+            state['reboot_time'] = past.isoformat()
+            result = firmware_interface._handle_rebooting(
+                task, state, mock_get_us.return_value)
+            self.assertEqual(redfish_fw.STATE_APPLYING, result)
+
+            firmware_interface._transition(task, state, result)
+            result = firmware_interface._handle_applying(
+                task, state, mock_get_us.return_value)
+            self.assertEqual(redfish_fw.STATE_VERIFYING_APPLY, result)
+
+    # --- per-state timeouts ----------------------------------------
+
+    def test_state_elapsed_rebooting_has_deadline(self):
+        past = timeutils.utcnow() - datetime.timedelta(seconds=30)
+        state = self._make_state(
+            [], state=redfish_fw.STATE_REBOOTING,
+            reboot_time=past.isoformat())
+        firmware_interface = redfish_fw.RedfishFirmware()
+        self.assertIn(redfish_fw.STATE_REBOOTING, redfish_fw._STATE_TIMEOUTS)
+        elapsed, limit = firmware_interface._state_elapsed(state)
+        self.assertGreaterEqual(elapsed.total_seconds(), 30)
+        self.assertEqual(
+            CONF.redfish.firmware_update_post_reboot_verify_timeout, limit)
+        self.assertFalse(firmware_interface._state_timed_out(state))
+
+    def test_state_elapsed_verifying_uses_reboot_time(self):
+        self.config(firmware_update_post_reboot_verify_timeout=60,
+                    group='redfish')
+        past = timeutils.utcnow() - datetime.timedelta(minutes=2)
+        firmware_interface = redfish_fw.RedfishFirmware()
+        for name in (redfish_fw.STATE_VERIFYING_APPLY,
+                     redfish_fw.STATE_VERIFYING_BOOT):
+            state = self._make_state([], state=name,
+                                     reboot_time=past.isoformat())
+            elapsed, limit = firmware_interface._state_elapsed(state)
+            self.assertEqual(60, limit)
+            self.assertGreaterEqual(elapsed.total_seconds(), 120)
+            self.assertTrue(firmware_interface._state_timed_out(state))
+
+    def test_state_timed_out_unbounded_when_timeout_disabled(self):
+        self.config(firmware_update_post_reboot_verify_timeout=0,
+                    group='redfish')
+        past = timeutils.utcnow() - datetime.timedelta(days=1)
+        state = self._make_state(
+            [], state=redfish_fw.STATE_VERIFYING_BOOT,
+            reboot_time=past.isoformat())
+        firmware_interface = redfish_fw.RedfishFirmware()
+        self.assertFalse(firmware_interface._state_timed_out(state))
+
+    def test_state_elapsed_waiting_bmc_uses_bmc_wait_start(self):
+        past = timeutils.utcnow() - datetime.timedelta(seconds=45)
+        state = self._make_state(
+            [{'component': 'bmc', 'url': 'http://bmc/v1', 'wait': 30}],
+            state=redfish_fw.STATE_WAITING_BMC,
+            bmc=self._make_bmc(wait_start=past.isoformat()))
+        firmware_interface = redfish_fw.RedfishFirmware()
+        elapsed, limit = firmware_interface._state_elapsed(state)
+        self.assertEqual(30, limit)
+        self.assertGreaterEqual(elapsed.seconds, 45)
+
+    def test_state_elapsed_without_anchor(self):
+        state = self._make_state([], state=redfish_fw.STATE_APPLYING)
+        firmware_interface = redfish_fw.RedfishFirmware()
+        elapsed, limit = firmware_interface._state_elapsed(state)
+        self.assertIsNone(elapsed)
+        self.assertEqual(
+            CONF.redfish.firmware_update_post_reboot_verify_timeout, limit)
+        self.assertFalse(firmware_interface._state_timed_out(state))
+
+    # --- legacy state migration ------------------------------------
+
+    def _legacy_info(self, **kwargs):
+        info = {'redfish_fw_updates': kwargs.pop('settings')}
+        info.update(kwargs)
+        return info
+
+    def _migrate(self, info):
+        self.node.driver_internal_info = info
+        self.node.save()
+        firmware_interface = redfish_fw.RedfishFirmware()
+        migrated = firmware_interface._migrate_legacy_state(self.node)
+        self.assertTrue(migrated)
+        remaining = self.node.driver_internal_info
+        for key in redfish_fw.LEGACY_KEYS:
+            self.assertNotIn(key, remaining)
+        return self._get_state()
+
+    def test_migrate_legacy_no_op_without_legacy_keys(self):
+        firmware_interface = redfish_fw.RedfishFirmware()
+        self.assertFalse(firmware_interface._migrate_legacy_state(self.node))
+
+    def test_migrate_legacy_no_op_when_already_migrated(self):
+        self._set_state(settings=[], state=redfish_fw.STATE_STAGING,
+                        segment=self._make_segment(1, current=0))
+        self.node.set_driver_internal_info('redfish_fw_updates', [])
+        self.node.save()
+        firmware_interface = redfish_fw.RedfishFirmware()
+        self.assertFalse(firmware_interface._migrate_legacy_state(self.node))
+
+    @mock.patch.object(redfish_fw, 'LOG', autospec=True)
+    def test_migrate_legacy_requires_recovery(self, log_mock):
+        started = (timeutils.utcnow()
+                   - datetime.timedelta(minutes=10)).isoformat()
+        settings = [
+            {'component': 'bios', 'url': 'http://bios/v1.0.0',
+             'task_monitor': '/tasks/1'},
+            {'component': 'nic:NIC.1-1', 'url': 'http://nic/v2.0.0',
+             'task_monitor': '/tasks/2'},
+        ]
+        state = self._migrate(self._legacy_info(
+            settings=settings,
+            redfish_fw_update_start_time=started,
+            firmware_cleanup=['http'],
+            firmware_batched_update=True,
+            firmware_allow_grouping=True,
+            firmware_batch_submitted=True,
+            firmware_batch_current_index=1,
+            firmware_batch_verify={'started': started, 'jids': ['JID_1'],
+                                   'lc': 'passed', 'boot': 'pending'}))
+
+        self.assertEqual(redfish_fw.STATE_RECOVERY_REQUIRED, state['state'])
+        self.assertEqual(redfish_fw.STATE_VERSION, state['version'])
+        self.assertEqual(started, state['started_at'])
+        self.assertEqual(['http'], state['cleanup'])
+        self.assertEqual(settings, state['settings'])
+        # Retain every requested component for diagnostics, not a success path.
+        self.assertEqual({'length': 2, 'current': None, 'batched': False},
+                         state['segment'])
+        self.assertIsNone(state['reboot_time'])
+        self.assertIsNone(state['bmc'])
+        self.assertIsNone(state['verify'])
+        log_mock.warning.assert_called_once()
+
+    def test_migrate_legacy_bmc_update(self):
+        state = self._migrate(self._legacy_info(
+            settings=[{'component': 'bmc', 'url': 'http://bmc/v1.0.0',
+                       'task_monitor': '/tasks/1', 'wait': 300,
+                       'wait_start_time': str(timeutils.utcnow().isoformat()),
+                       'bmc_version_checking': True}],
+            bmc_fw_version_before_update='1.0.0',
+            firmware_reboot_requested=True))
+
+        self.assertEqual(redfish_fw.STATE_RECOVERY_REQUIRED, state['state'])
+        self.assertEqual({'length': 1, 'current': None, 'batched': False},
+                         state['segment'])
+        self.assertIsNone(state['bmc'])
+        self.assertIsNone(state['verify'])
+
+    @mock.patch.object(task_manager, 'acquire', autospec=True)
+    def _assert_predicates_match(self, info, expected, acquire_mock):
+        firmware_interface = redfish_fw.RedfishFirmware()
+        manager = mock.Mock()
+        manager.iter_nodes.return_value = [
+            (self.node.uuid, 'redfish', '', info)]
+        task = mock.Mock(node=self.node,
+                         driver=mock.Mock(firmware=firmware_interface))
+        acquire_mock.return_value = mock.MagicMock(
+            __enter__=mock.MagicMock(return_value=task))
+        firmware_interface._check_node_redfish_firmware_update = mock.Mock()
+        firmware_interface._clear_updates = mock.Mock()
+
+        self.node.provision_state = states.CLEANWAIT
+        firmware_interface._query_update_status(manager, self.context)
+        self.node.provision_state = states.CLEANFAIL
+        self.node.maintenance = True
+        firmware_interface._query_update_failed(manager, self.context)
+
+        self.assertEqual(
+            expected,
+            firmware_interface._check_node_redfish_firmware_update.called)
+        self.assertEqual(expected, firmware_interface._clear_updates.called)
+
+    def test_periodic_predicate_matches_state_key(self):
+        self._assert_predicates_match(
+            {redfish_fw.FIRMWARE_UPDATE_STATE:
+                {'state': redfish_fw.STATE_STAGING}}, True)
+
+    def test_periodic_predicate_matches_legacy_key(self):
+        self._assert_predicates_match(
+            {redfish_fw.LEGACY_UPDATES: [{'component': 'bios'}]}, True)
+
+    def test_periodic_predicate_skips_node_without_update(self):
+        self._assert_predicates_match({}, False)
+
+    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware, '_handle_recovery_required',
+                       autospec=True)
+    def test_periodic_migrates_before_dispatching(self, mock_handle,
+                                                  mock_get_us):
+        mock_handle.return_value = None
+        self.node.driver_internal_info = {
+            'redfish_fw_updates': [
+                {'component': 'bios', 'url': 'http://bios/v1.0.0',
+                 'task_monitor': '/tasks/1'}],
+            'firmware_batched_update': True,
+            'firmware_batch_current_index': 0,
+        }
+        self.node.save()
+
+        firmware_interface = redfish_fw.RedfishFirmware()
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            firmware_interface._check_node_redfish_firmware_update(task)
+
+            mock_handle.assert_called_once()
+            state = mock_handle.call_args[0][2]
+            self.assertEqual(redfish_fw.STATE_RECOVERY_REQUIRED,
+                             state['state'])
+            mock_get_us.assert_not_called()
+            for key in redfish_fw.LEGACY_KEYS:
+                self.assertNotIn(key, task.node.driver_internal_info)
+
+    # --- reboot observation ----------------------------------------
+
+    @mock.patch.object(manager_utils, 'node_power_action', autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware, '_resume_step',
+                       autospec=True)
+    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
+    def test_legacy_recovery_fails_without_hardware_changes(
+            self, service, resume, power):
+        self.node.provision_state = states.SERVICEWAIT
+        self.node.service_step = {'interface': 'firmware', 'step': 'update'}
+        self.node.driver_internal_info = {'redfish_fw_updates': [
+            {'component': 'bios', 'task_monitor': '/tasks/JID_1'},
+            {'component': 'nic:1'}]}
+        self.node.save()
+        with task_manager.acquire(self.context, self.node.uuid) as task:
+            redfish_fw.RedfishFirmware()._check_node_redfish_firmware_update(
+                task)
+            self.assertEqual(states.SERVICEFAIL, task.node.provision_state)
+            self.assertTrue(task.node.maintenance)
+            self.assertIn('nic:1', task.node.last_error)
+            self.assertIn('Do not power-cycle', task.node.last_error)
+            self.assertNotIn(redfish_fw.FIRMWARE_UPDATE_STATE,
+                             task.node.driver_internal_info)
+        service.assert_not_called()
+        resume.assert_not_called()
+        power.assert_not_called()
+
+    def test_read_boot_progress(self):
+        # Stubbed out for every other test; exercise the real one here.
+        self.read_boot_progress_patcher.stop()
+        self.addCleanup(self.read_boot_progress_patcher.start)
+        firmware_interface = redfish_fw.RedfishFirmware()
+
+        with mock.patch.object(redfish_utils, 'get_system',
+                               autospec=True) as mock_get_system:
+            mock_get_system.return_value.boot_progress.last_state = (
+                sushy.BootProgressStates.OS_RUNNING)
+            self.assertEqual(
+                sushy.BootProgressStates.OS_RUNNING,
+                firmware_interface._read_boot_progress(self.node))
+
+    def test_read_boot_progress_absent(self):
+        self.read_boot_progress_patcher.stop()
+        self.addCleanup(self.read_boot_progress_patcher.start)
+        firmware_interface = redfish_fw.RedfishFirmware()
+
+        with mock.patch.object(redfish_utils, 'get_system',
+                               autospec=True) as mock_get_system:
+            mock_get_system.return_value.boot_progress = None
+            self.assertIsNone(
+                firmware_interface._read_boot_progress(self.node))
+
+    def test_read_boot_progress_unreachable(self):
+        # A BMC that cannot be reached before the reboot simply leaves
+        # the watch with nothing to compare against; it must not raise
+        # out of the reboot path.
+        self.read_boot_progress_patcher.stop()
+        self.addCleanup(self.read_boot_progress_patcher.start)
+        firmware_interface = redfish_fw.RedfishFirmware()
+
+        with mock.patch.object(redfish_utils, 'get_system',
+                               autospec=True) as mock_get_system:
+            mock_get_system.side_effect = exception.RedfishConnectionError(
+                node=self.node.uuid, error='unreachable')
+            self.assertIsNone(
+                firmware_interface._read_boot_progress(self.node))
+
+    def test_observe_reboot_uses_configured_window(self):
+        self.config(firmware_update_reboot_watch_timeout=45, group='redfish')
+        firmware_interface = redfish_fw.RedfishFirmware()
+
+        self.mock_watch_boot.return_value = True
+        self.assertTrue(firmware_interface._observe_reboot(
+            self.node, sushy.BootProgressStates.OS_RUNNING))
+
+        watch_args = self.mock_watch_boot.call_args[0]
+        self.assertIs(self.node, watch_args[0])
+        self.assertEqual(
+            sushy.BootProgressStates.OS_RUNNING, watch_args[1])
+        self.assertEqual((45, redfish_fw._REBOOT_WATCH_INTERVAL),
+                         watch_args[2:])
+
+    def test_record_reboot_observed_persists_only_when_seen(self):
+        state = self._set_state(
+            settings=[], state=redfish_fw.STATE_REBOOTING,
+            reboot_time=str(timeutils.utcnow().isoformat()),
+            verify=self._make_verify())
+        firmware_interface = redfish_fw.RedfishFirmware()
+
+        self.mock_watch_boot.return_value = False
+        firmware_interface._record_reboot_observed(
+            self.node, state, sushy.BootProgressStates.OS_RUNNING)
+        self.assertFalse(state['verify']['new_boot_observed'])
+
+        self.mock_watch_boot.return_value = True
+        firmware_interface._record_reboot_observed(
+            self.node, state, sushy.BootProgressStates.OS_RUNNING)
+        self.assertTrue(state['verify']['new_boot_observed'])
+        self.assertTrue(
+            self._get_state()['verify']['new_boot_observed'])
