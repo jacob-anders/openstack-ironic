@@ -1255,8 +1255,10 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
         from ironic.drivers.modules.drac import firmware as drac_fw
         manager_mock = mock.Mock()
         oem_mock = manager_mock.get_oem_extension.return_value
-        oem_mock.job_collection.get_unfinished_jobs.return_value = [
-            'JID_839968767020']
+        oem_mock.job_collection.get_jobs.return_value = [
+            mock.Mock(identity='JID_839968767020', job_state='Scheduled',
+                      job_type='FirmwareUpdate', message='LC message',
+                      message_id='LC message')]
         get_system_mock.return_value.managers = [manager_mock]
 
         current_update = {
@@ -1277,7 +1279,7 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
         from ironic.drivers.modules.drac import firmware as drac_fw
         manager_mock = mock.Mock()
         oem_mock = manager_mock.get_oem_extension.return_value
-        oem_mock.job_collection.get_unfinished_jobs.return_value = []
+        oem_mock.job_collection.get_jobs.return_value = []
         get_system_mock.return_value.managers = [manager_mock]
 
         current_update = {
@@ -1297,8 +1299,8 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
         """Non-Dell hardware: OEM extension not found returns None."""
         from ironic.drivers.modules.drac import firmware as drac_fw
         manager_mock = mock.Mock()
-        manager_mock.get_oem_extension.side_effect = Exception(
-            'OEM extension not found')
+        manager_mock.get_oem_extension.side_effect = (
+            sushy.exceptions.OEMExtensionNotFoundError())
         get_system_mock.return_value.managers = [manager_mock]
 
         current_update = {
