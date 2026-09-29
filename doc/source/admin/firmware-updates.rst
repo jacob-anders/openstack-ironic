@@ -1,16 +1,16 @@
 Firmware Updates
 ================
 
-The firmware update step allows one or more firmware updates to be applied
-to a node via cleaning or servicing. If multiple updates are specified, then
-they are applied
-sequentially in the order given. The server is rebooted once per update.
-If a failure occurs, the step immediately fails which may result
-in some updates not being applied. If the node is placed into maintenance
-mode while a firmware update step is running that is performing
-multiple firmware updates, the update in progress will complete, and processing
-of the remaining updates will pause.  When the node is taken out of maintenance
-mode, processing of the remaining updates will continue.
+The firmware update step applies one or more images via cleaning, servicing or
+deployment, in the order supplied by the operator. By default, each non-BMC
+component has its own host reboot. Operators can opt into grouping adjacent
+non-BMC components into one reboot, as described below. BMC updates have their
+own recovery phase.
+
+Failures after an update starts stop the sequence and place the node in
+maintenance, preserving host power and boot configuration. Images already
+staged on the BMC may remain scheduled for the next boot. Inspect the BMC jobs
+before recovery or retrying the step.
 
 .. note:: Only :doc:`/admin/drivers/redfish` supports firmware updates
    currently.
@@ -22,15 +22,185 @@ update was successful. This allows the BMC time to fully reset before further
 operations are carried out against it. To cause the step to wait after
 applying an update, an optional ``wait`` argument may be specified in the
 firmware image dictionary. The value of this argument indicates the number of
-seconds to wait following the update. If the ``wait`` argument is not
-specified, then this is equivalent to ``wait 0``, meaning that it will not
-wait and immediately proceed with the next firmware update if there is one,
-or complete the step if not.
+seconds for the component's wait. For BMC updates it controls the version-check
+timeout. For non-BMC updates it is a minimum settling interval after application
+and host recovery. A grouped segment uses the largest requested ``wait`` or
+:oslo.config:option:`redfish.firmware_update_inventory_wait`, whichever is
+greater. These waits never replace application or reboot verification.
+
+Grouping host reboots
+---------------------
+
+Set the boolean ``allow_grouping_reboots`` in the step's ``args`` to ``true`` to
+stage adjacent non-BMC images and apply them with one consolidated host reboot.
+Its default is ``false``. Supported component names remain ``bmc``, ``bios`` and
+``nic:<Id>``; grouping does not enable other component names.
+
+The recommended order is BMC first, followed by BIOS and NICs. Ironic neither
+reorders the list nor rejects a sub-optimal order solely because of its order.
+Each BMC entry ends the preceding non-BMC segment. For example,
+``[bios, nic:1, bmc, nic:2]`` has two separate non-BMC reboot segments. Duplicate
+components in the same non-BMC segment are rejected; repeats across a BMC
+boundary or in ungrouped updates are allowed.
+
+BMC recovery remains separate and can require its existing host handoff reboot
+when more components follow. The single-reboot guarantee applies to each
+non-BMC segment, not necessarily to the entire mixed BMC/non-BMC request.
+
+.. code-block:: json
+
+   [{
+     "interface": "firmware",
+     "step": "update",
+     "args": {
+       "allow_grouping_reboots": true,
+       "settings": [
+         {"component": "bmc", "url": "https://example.com/bmc.bin"},
+         {"component": "bios", "url": "https://example.com/bios.exe"},
+         {"component": "nic:NIC.Integrated.1-1-1",
+          "url": "https://example.com/nic.zip"}
+       ]
+     }
+   }]
+
+Grouped ``SimpleUpdate`` requests explicitly request ``OnReset`` through the
+standard ``@Redfish.OperationApplyTime`` action annotation. A rejected request
+fails the step rather than being retried without deferred application. On Dell,
+Ironic waits for an armed Lifecycle Controller job before staging another image;
+on HPE and other platforms it waits for staging task completion. A generic
+``Starting`` task alone does not authorize submitting another grouped image.
+
+Successful synchronous responses and observed successful task results are
+persisted separately from task monitor URIs. A task disappearing before success
+was observed leaves its outcome unknown. Ironic waits for supported OEM evidence
+or fails at the segment deadline; it neither stages the next grouped image nor
+reports completion based on a missing monitor alone.
+
+Reset-dependent BIOS tasks
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Some platforms keep an ungrouped BIOS task ``Pending`` or ``Running`` until the
+host receives its apply reset. For hardware documented to use these states for
+reset-dependent staging, set
+``driver_info/firmware_update_bios_pending_reset=compatibility``. This permits
+one reset after :oslo.config:option:`redfish.firmware_update_nic_starting_wait`;
+the task must subsequently succeed and normal application and boot checks apply.
+The default, ``auto``, does not interrupt ``Pending`` or ``Running`` tasks, which
+may represent active flashing on other hardware. Both policies retain the
+ungrouped ``Starting`` compatibility wait. This policy never authorizes another
+grouped submission or bypasses a supported Dell job check.
+
+NIC staging prerequisites
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Some platforms, notably HPE, expose ``NetworkAdapters`` only while an OS is
+running. Ironic waits for this visibility before staging any image in an HPE
+segment containing NIC updates. For day-0 workflows, boot IPA first, for example
+using fast-track after inspection. For servicing, keep the deployed OS running
+until the firmware step requests its reboot. Disabling the ramdisk does not
+remove this hardware prerequisite, and Ironic does not boot a tenant OS merely
+to satisfy it.
+
+Verification and timeouts
+-------------------------
+
+A terminal Redfish task may describe downloading and staging rather than
+application. Each segment retains its state until the available application,
+boot and inventory checks finish. Dell checks include every tracked firmware
+job and additional jobs discovered during POST. Failed jobs fail the step;
+missing jobs and unknown states do not establish success. Older supported sushy
+versions receive the same full job-state checks through a compatibility reader.
+
+Reboot observation compares reset timestamps and boot-progress transitions with
+the pre-reboot snapshot. A read failure is not proof of a reset. Servicing waits
+for ``OSRunning`` where reported. Cleaning and deploy also accept hardware
+initialization completion or setup, so a tenant OS boot is not required. BMC
+version checking and resource-stability validation run in their own phases.
+Known BMC job IDs remain mandatory through these phases and a host handoff
+reset. An unchanged BMC version, including a same-version reinstall, requires a
+positive task or job result; expiration of the version-check wait is insufficient.
+
+Inventory verification requires the requested components to be readable.
+Transient NIC, chassis and manager read failures, or missing requested entries
+in a supported inventory, retain the segment for retry until its deadline.
+An explicitly absent NetworkAdapters capability is logged as unsupported.
+Previously observed support, from cached inventory or the HPE staging
+prerequisite, is retained; temporary disappearance then requires recovery.
+Ordinary inventory discovery outside update verification remains best effort.
+
+The following ``[redfish]`` settings control asynchronous waits:
+
+* :oslo.config:option:`redfish.firmware_update_apply_timeout`: 1800 seconds for a
+  segment, including preparation, staging, application and inventory recovery.
+  Increase this for large or slow batches. It remains enabled when the overall
+  timeout is disabled.
+* :oslo.config:option:`redfish.firmware_update_post_reboot_verify_timeout`:
+  1800 seconds after an apply reboot. Setting it to zero disables this narrower
+  deadline, while the segment deadline remains enforced.
+* :oslo.config:option:`redfish.firmware_update_reboot_min_wait`: 60 seconds before
+  accepting host readiness. This minimum does not replace new-boot evidence.
+* :oslo.config:option:`redfish.firmware_update_boot_check_delay`: 600 seconds for
+  missing or explicitly limited boot telemetry. Budget for the entire batch's
+  POST and flashing duration, not just an ordinary boot, and keep the delay
+  within the segment deadline.
+* :oslo.config:option:`redfish.firmware_update_os_running_timeout`: 300 seconds
+  after observing the new boot finish POST during servicing. Expiry fails the
+  step. Zero uses the broader deadlines rather than skipping readiness.
+* :oslo.config:option:`redfish.firmware_update_inventory_wait`: 60 seconds after
+  application and recovery to allow inventory publication to catch up.
+* :oslo.config:option:`redfish.firmware_update_tasks_per_poll`: at most 16 task
+  monitors sampled per invocation, spreading large batches across polls.
+
+Sampling follows :oslo.config:option:`redfish.firmware_update_status_interval`.
+Resource-validation intervals are minimum intervals between periodic samples;
+they do not sleep inside a conductor worker. The old blocking
+``firmware_update_reboot_watch_timeout`` is deprecated and ignored by the
+firmware state machine.
+
+For a platform known to report only intermediate boot stages, explicitly set
+``driver_info/firmware_update_boot_progress=limited``. The default, ``auto``,
+requires reported readiness and uses the fallback delay only when boot progress
+is absent. A stalled supported check is never automatically classified as
+unsupported. Neither policy bypasses supported job or reset checks. A fallback
+delay cannot prove OS health.
+
+Firmware packages are vendor-specific. Ironic does not infer expected versions
+from filenames or image contents, and no expected-version input is required.
+It verifies available task/job outcomes and recovery, then refreshes inventory;
+this is not an exact comparison against an image's intended version.
+Same-version reinstalls are valid.
+
+State and failure recovery
+--------------------------
+
+The versioned ``driver_internal_info/redfish_fw_update`` object records the
+current phase, timestamps, remaining settings and per-segment observations.
+Normal host updates follow:
+
+.. code-block:: text
+
+   starting -> staging -> rebooting -> applying -> verifying_apply
+       -> verifying_boot -> verifying_inventory -> next segment or completion
+
+BMC segments use ``waiting_bmc`` and ``validating_bmc`` before inventory
+verification or their required host reboot. Submission and reboot intent are
+persisted before the request, so an ambiguous response is not automatically
+replayed. Legacy queues and unsupported state-schema versions require recovery
+rather than silently skipping unapplied components.
+
+If staging fails after another image has been staged, Ironic fails the whole
+step without a consolidated reboot. Read ``last_error`` and node history,
+inspect pending BMC Tasks/Jobs and remove queued images if appropriate before
+aborting servicing and retrying. Timeout does not mean flashing has stopped:
+do not power-cycle a node that may still be applying firmware. Failure handling
+preserves power even when cleaning or servicing failure power-off options are
+enabled.
 
 How it works
 ------------
 
-The ``update`` step can be used via cleaning or servicing, it accepts a JSON in
+The ``update`` step can be used via cleaning, servicing or deployment. It accepts
+JSON in
 the following format::
 
     [{
