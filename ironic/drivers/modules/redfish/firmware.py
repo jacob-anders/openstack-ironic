@@ -11,7 +11,6 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import time
 from urllib.parse import urlparse
 
 from oslo_log import log
@@ -37,16 +36,231 @@ LOG = log.getLogger(__name__)
 
 METRICS = metrics_utils.get_metrics_logger(__name__)
 
-# Temporary field names stored in node.driver_internal_info
-BMC_FW_VERSION_BEFORE_UPDATE = 'bmc_fw_version_before_update'
-FIRMWARE_REBOOT_REQUESTED = 'firmware_reboot_requested'
+# The single driver_internal_info entry holding the whole state of an
+# in-progress firmware update. Its value is a versioned dict:
+#
+#   version:     schema version of this dict (STATE_VERSION)
+#   state:       the current state, one of the STATE_* constants below
+#   entered_at:  ISO time the current state was entered
+#   started_at:  ISO time the firmware.update step started; the reference
+#                point for CONF.redfish.firmware_update_overall_timeout
+#   settings:    the firmware update dicts still to apply. Each entry
+#                carries 'component', 'url', and, once submitted,
+#                'task_monitor', 'submitted', 'staged', and 'power_timeout'.
+#                'synchronous' and 'task_success' retain positive outcomes
+#                independently of monitor presence; 'version_changed' records
+#                BMC version evidence once its completion gate passes.
+#                Dell entries also carry correlated job IDs. The transient
+#                jobs_before baseline is discarded once staging is verified.
+#   cleanup:     staging back-ends to clean up, as understood by
+#                firmware_utils.cleanup()
+#   grouping:    whether adjacent non-BMC updates share one reboot
+#   segment:     the components being applied together, as
+#                {'length': n, 'current': i or None, 'batched': bool};
+#                'current' is the index being staged, 'batched' tells a
+#                consolidated non-BMC segment from a single BMC one. Its
+#                started_at anchors the fixed deadline; jobs tracks Dell
+#                outcomes and poll_index bounds task reads per invocation.
+#   reboot_time: ISO time the apply reboot was issued; the reference
+#                point for the boot check delay and for
+#                CONF.redfish.firmware_update_post_reboot_verify_timeout
+#   bmc:         BMC version-check bookkeeping, or None. See
+#                _start_bmc_segment for the field meanings
+#   verify:      post-reboot verify state, or None. See _build_verify
+FIRMWARE_UPDATE_STATE = 'redfish_fw_update'
+STATE_VERSION = 2
 
-# Temporary field names stored in fw_upd/current_update settings dict
-NIC_NEEDS_POST_COMPLETION_REBOOT = 'nic_needs_post_completion_reboot'
-NIC_STARTING_TIMESTAMP = 'nic_starting_timestamp'
-NIC_REBOOT_TRIGGERED = 'nic_reboot_triggered'
-BIOS_REBOOT_TRIGGERED = 'bios_reboot_triggered'
-BMC_UPDATE_COMPLETED = 'bmc_update_completed'
+# A SimpleUpdate for settings[segment['current']] is in flight. Poll its
+# task until the BMC reports it staged, then submit the next component of
+# the segment or issue the consolidated apply reboot.
+STATE_STAGING = 'staging'
+# The apply reboot has been issued. Anchors the time it was issued,
+# which the verify gates measure from; the next poll starts polling the
+# segment's tasks.
+STATE_REBOOTING = 'rebooting'
+# Poll every task monitor of the segment until all are terminal.
+STATE_APPLYING = 'applying'
+# Dell Lifecycle Controller job gate.
+STATE_VERIFYING_APPLY = 'verifying_apply'
+# BootProgress gate; success enters inventory verification. Supported boot
+# checks cannot expire into success. The OS-running deadline is an additional
+# bound for servicing nodes that have completed POST.
+STATE_VERIFYING_BOOT = 'verifying_boot'
+# A BMC component is being applied: the BMC does not reboot the host, so
+# its completion is detected by watching the reported BMC version.
+STATE_WAITING_BMC = 'waiting_bmc'
+# An old conductor's bookkeeping cannot establish which images were applied.
+STATE_RECOVERY_REQUIRED = 'recovery_required'
+STATE_VALIDATING_BMC = 'validating_bmc'
+STATE_VERIFYING_INVENTORY = 'verifying_inventory'
+STATE_STARTING = 'starting'
+
+# Declared state machine. A move not listed here is a programming error.
+# None is the state of a node with no update in progress, so it is the
+# only source for the two states an update can start in.
+_TRANSITIONS = {
+    None: frozenset({STATE_STARTING, STATE_STAGING, STATE_WAITING_BMC,
+                     STATE_RECOVERY_REQUIRED}),
+    STATE_STARTING: frozenset({STATE_STAGING, STATE_WAITING_BMC}),
+    STATE_STAGING: frozenset({STATE_REBOOTING}),
+    STATE_REBOOTING: frozenset({STATE_APPLYING}),
+    STATE_APPLYING: frozenset({STATE_VERIFYING_APPLY}),
+    STATE_VERIFYING_APPLY: frozenset({STATE_VERIFYING_BOOT}),
+    STATE_VERIFYING_BOOT: frozenset({STATE_VERIFYING_INVENTORY}),
+    STATE_WAITING_BMC: frozenset({STATE_VALIDATING_BMC}),
+    STATE_VALIDATING_BMC: frozenset({STATE_REBOOTING,
+                                    STATE_VERIFYING_INVENTORY}),
+    STATE_VERIFYING_INVENTORY: frozenset({STATE_STARTING}),
+    STATE_RECOVERY_REQUIRED: frozenset(),
+}
+
+# States entered after the apply reboot has been issued. Nothing is
+# "staged and pending" on the BMC any more once the node has been told to
+# reboot: the components are being applied, not waiting to be.
+_REBOOTED_STATES = frozenset({STATE_REBOOTING, STATE_APPLYING,
+                              STATE_VERIFYING_APPLY, STATE_VERIFYING_BOOT,
+                              STATE_VERIFYING_INVENTORY})
+
+_STATE_HANDLERS = {
+    STATE_STAGING: '_handle_staging',
+    STATE_REBOOTING: '_handle_rebooting',
+    STATE_APPLYING: '_handle_applying',
+    STATE_VERIFYING_APPLY: '_handle_verifying_apply',
+    STATE_VERIFYING_BOOT: '_handle_verifying_boot',
+    STATE_WAITING_BMC: '_handle_waiting_bmc',
+    STATE_RECOVERY_REQUIRED: '_handle_recovery_required',
+    STATE_VALIDATING_BMC: '_handle_validating_bmc',
+    STATE_VERIFYING_INVENTORY: '_handle_verifying_inventory',
+    STATE_STARTING: '_handle_starting',
+}
+
+# Values for the 'lc' and 'boot' gates within the verify state dict.
+_VERIFY_PENDING = 'pending'
+_VERIFY_PASSED = 'passed'
+_VERIFY_SKIPPED = 'skipped'
+
+# driver_internal_info entry naming the staging back-ends to clean up.
+# Not part of the state object: firmware_utils.cleanup() and the Redfish
+# management interface both read this key directly, so the value tracked
+# in the state object is placed here only for the duration of a cleanup.
+STAGED_CLEANUP = 'firmware_cleanup'
+
+# driver_internal_info entries used before the state object existed.
+# Deleted once by _migrate_legacy_state; never written again.
+LEGACY_UPDATES = 'redfish_fw_updates'
+LEGACY_START_TIME = 'redfish_fw_update_start_time'
+LEGACY_BMC_VERSION = 'bmc_fw_version_before_update'
+LEGACY_REBOOT_REQUESTED = 'firmware_reboot_requested'
+LEGACY_BATCHED_UPDATE = 'firmware_batched_update'
+LEGACY_BATCH_SUBMITTED = 'firmware_batch_submitted'
+LEGACY_BATCH_CURRENT_INDEX = 'firmware_batch_current_index'
+LEGACY_BATCH_VERIFY = 'firmware_batch_verify'
+LEGACY_ALLOW_GROUPING = 'firmware_allow_grouping'
+LEGACY_KEYS = (LEGACY_UPDATES, LEGACY_START_TIME, STAGED_CLEANUP,
+               LEGACY_BMC_VERSION, LEGACY_REBOOT_REQUESTED,
+               LEGACY_BATCHED_UPDATE, LEGACY_BATCH_SUBMITTED,
+               LEGACY_BATCH_CURRENT_INDEX, LEGACY_BATCH_VERIFY,
+               LEGACY_ALLOW_GROUPING)
+
+
+def _verify_phase_timeout(state):
+    """Timeout of the post-reboot verify phase.
+
+    :param state: the state object (unused; the phase timeout is a
+        configuration value, not a per-node one).
+    :returns: the configured timeout in seconds.
+    """
+    return CONF.redfish.firmware_update_post_reboot_verify_timeout
+
+
+def _os_running_timeout(state):
+    """Bounded wait for OSRunning once OSBootStarted has been reported.
+
+    :param state: the state object (unused).
+    :returns: the timeout in seconds.
+    """
+    return CONF.redfish.firmware_update_os_running_timeout
+
+
+def _boot_check_delay(state):
+    """How long a target BootProgress state stays untrusted.
+
+    :param state: the state object (unused).
+    :returns: the delay in seconds.
+    """
+    return CONF.redfish.firmware_update_boot_check_delay
+
+
+def _bmc_wait_interval(state):
+    """Length of the wait currently running for a BMC component.
+
+    :param state: the state object.
+    :returns: the wait in seconds, or None when no wait is configured.
+    """
+    settings = state.get('settings') or [{}]
+    return settings[0].get('wait')
+
+
+# Per-state deadlines, as (path to the ISO timestamp the state is
+# measured from, callable returning the limit in seconds). Every state is
+# additionally bounded by the fixed segment deadline and overall timeout.
+_STATE_TIMEOUTS = {
+    STATE_REBOOTING: ('reboot_time', _verify_phase_timeout),
+    STATE_APPLYING: ('reboot_time', _verify_phase_timeout),
+    STATE_VERIFYING_APPLY: ('reboot_time', _verify_phase_timeout),
+    STATE_VERIFYING_BOOT: ('reboot_time', _verify_phase_timeout),
+    STATE_WAITING_BMC: ('bmc.wait_start', _bmc_wait_interval),
+}
+
+# Two further deadlines of verifying_boot, declared in the same shape
+# but outside _STATE_TIMEOUTS, which holds the one deadline bounding a
+# state as a whole: verifying_boot is bounded there by the verify phase,
+# and these run alongside it for two narrower cases. The first, from a
+# different anchor, is a servicing node that finished POST but was never
+# reported OSRunning. The second, from the same anchor, is how long the
+# gate declines to trust a target state it cannot tell apart from the
+# previous boot, and how long a node whose BMC reports no BootProgress
+# at all is held. Both are read through :meth:`_deadline_elapsed`.
+_OS_RUNNING_DEADLINE = ('verify.os_boot_started_at', _os_running_timeout)
+_BOOT_CHECK_DELAY = ('reboot_time', _boot_check_delay)
+
+
+def _state_anchor(state, path):
+    """Read a timestamp out of the state object by dotted path.
+
+    :param state: the state object.
+    :param path: a dotted path such as ``'reboot_time'``,
+        ``'bmc.wait_start'`` or ``'verify.os_boot_started_at'``.
+    :returns: the ISO timestamp string, or None when not set.
+    """
+    value = state
+    for part in path.split('.'):
+        if not isinstance(value, dict):
+            return None
+        value = value.get(part)
+    return value
+
+
+def _leading_batchable_run(settings, max_size=None):
+    """Length of the leading run of adjacent non-BMC components.
+
+    A reboot is shared by a maximal run of adjacent non-BMC components.
+    This function returns the length of that leading run, optionally
+    capped to max_size (used for batch-of-1 when grouping is disabled).
+
+    :param settings: list of firmware update dicts
+    :param max_size: optional upper bound on the returned run length
+    :returns: int — number of components in the leading batchable run
+    """
+    for i, s in enumerate(settings):
+        if max_size is not None and i >= max_size:
+            return max_size
+        component = s.get('component', '')
+        if redfish_utils.get_component_type(component) == redfish_utils.BMC:
+            return i
+    if max_size is not None:
+        return min(len(settings), max_size)
+    return len(settings)
 
 
 class RedfishFirmware(base.FirmwareInterface):
@@ -54,18 +268,204 @@ class RedfishFirmware(base.FirmwareInterface):
     _FW_SETTINGS_ARGSINFO = {
         'settings': {
             'description': (
-                'A list of dicts with firmware components to be updated'
+                'A list of dicts with firmware components to be updated. '
+                'A non-BMC wait is a minimum post-application settling '
+                'interval; a grouped segment uses the largest requested '
+                'interval. BMC wait controls version verification.'
             ),
             'required': True
         }
     }
+
+    def _segment_run_length(self, state):
+        """Select one non-BMC component for the next segment.
+
+        :param state: the state object
+        :returns: 1 for a leading non-BMC component, otherwise 0
+        """
+        settings = state.get('settings') or []
+        return _leading_batchable_run(settings, max_size=1)
+
+    def _staged_pending(self, state, exclude=None):
+        """Components the BMC accepted but has not yet applied.
+
+        Derived, not stored: 'task_monitor' is set only on a successful
+        SimpleUpdate, and the states in _REBOOTED_STATES are exactly
+        those entered once the consolidated reboot has been issued.
+
+        :param state: the state object
+        :param exclude: a settings dict to omit (the one that just failed)
+        :returns: list of component name strings, possibly empty
+        """
+        if state.get('state') in _REBOOTED_STATES:
+            return []
+        settings = state.get('settings') or []
+        run_length = self._segment_run_length(state)
+        return [s.get('component', '') for s in settings[:run_length]
+                if s.get('task_monitor') and s is not exclude]
+
+    def _staged_pending_note(self, node, state, exclude=None):
+        """Operator-facing suffix naming components still armed on the BMC.
+
+        :param node: the Ironic node object
+        :param state: the state object
+        :param exclude: a settings dict to omit (the one that just failed)
+        :returns: a string to append to an error message, or '' if nothing
+            is currently staged and pending
+        """
+        pending = self._staged_pending(state, exclude)
+        if not pending:
+            return ''
+        LOG.warning('Firmware update failed for node %(node)s with '
+                    'components already staged on the BMC: %(components)s. '
+                    'These remain scheduled to apply on the next host boot.',
+                    {'node': node.uuid, 'components': ', '.join(pending)})
+        return _(' Components already staged on the BMC and still scheduled '
+                 'to apply on the next host boot from any source: '
+                 '%(components)s. Power-cycling this node will apply them, '
+                 'and retrying firmware.update will stage them a second '
+                 'time.') % {'components': ', '.join(pending)}
+
+    # --- state object plumbing -------------------------------------
+
+    def _persist(self, node, state):
+        """Write the state object back to the node.
+
+        The only place, besides :meth:`_transition`, that a handler may
+        persist from.
+
+        :param node: the Ironic node object
+        :param state: the state object
+        """
+        node.set_driver_internal_info(FIRMWARE_UPDATE_STATE, state)
+        node.set_driver_internal_info(
+            async_steps.FIRMWARE_UPDATE_IN_PROGRESS, True)
+        node.save()
+
+    def _transition(self, task, state, new_state):
+        """Move the update to ``new_state`` and persist it.
+
+        :param task: a TaskManager instance
+        :param state: the state object (mutated in place)
+        :param new_state: the state to move to
+        :raises: exception.InvalidFirmwareUpdateState if the move is not
+            declared in ``_TRANSITIONS``
+        """
+        old_state = state.get('state')
+        if new_state not in _TRANSITIONS.get(old_state, frozenset()):
+            raise exception.InvalidFirmwareUpdateState(
+                node=task.node.uuid, old=old_state, new=new_state)
+        LOG.info('Node %(node)s: firmware update state %(old)s -> %(new)s',
+                 {'node': task.node.uuid, 'old': old_state,
+                  'new': new_state})
+        state['state'] = new_state
+        state['entered_at'] = str(timeutils.utcnow().isoformat())
+        self._persist(task.node, state)
+
+    def _deadline_elapsed(self, state, anchor_path, limit_fn):
+        """Time spent against a declared deadline.
+
+        :param state: the state object
+        :param anchor_path: dotted path of the deadline's timestamp
+        :param limit_fn: callable returning the limit in seconds
+        :returns: a tuple ``(elapsed, limit)``. ``elapsed`` is a
+            timedelta since the anchor, or None when it is not set.
+            ``limit`` is the deadline in seconds.
+        """
+        limit = limit_fn(state)
+        anchor = _state_anchor(state, anchor_path)
+        if anchor is None:
+            return None, limit
+        return timeutils.utcnow(True) - timeutils.parse_isotime(anchor), limit
+
+    def _state_elapsed(self, state):
+        """Time spent against the current state's deadline.
+
+        :param state: the state object
+        :returns: a tuple ``(elapsed, limit)``. ``elapsed`` is a
+            timedelta since the state's reference timestamp, or None
+            when the state has no deadline or the timestamp is not set.
+            ``limit`` is the deadline in seconds, or None.
+        """
+        anchor_path, limit_fn = _STATE_TIMEOUTS.get(
+            state.get('state'), (None, None))
+        if anchor_path is None:
+            return None, None
+        return self._deadline_elapsed(state, anchor_path, limit_fn)
+
+    def _state_timed_out(self, state):
+        """Whether the current state has exceeded its deadline.
+
+        A limit of zero or less means unbounded.
+
+        :param state: the state object
+        :returns: True if the deadline has passed, False otherwise
+        """
+        elapsed, limit = self._state_elapsed(state)
+        if elapsed is None or not limit or limit <= 0:
+            return False
+        return elapsed.total_seconds() >= limit
+
+    def _build_verify(self, jids, new_boot_observed=False):
+        """Build the post-reboot verify state for a segment.
+
+        :param jids: list of Dell LC job id (JID) strings covered by
+            this verify phase.
+        :param new_boot_observed: whether BootProgress was seen leaving
+            its pre-reboot value, proving the node reset.
+        :returns: a new verify state dict. The phase's reference
+            timestamp is the state object's ``reboot_time``;
+            ``os_boot_started_at`` is per-reboot bookkeeping, anchoring
+            the bounded wait for OSRunning once POST has finished.
+        """
+        return {
+            'jids': list(jids),
+            'lc': _VERIFY_PENDING,
+            'boot': _VERIFY_PENDING,
+            'new_boot_observed': new_boot_observed,
+            'os_boot_started_at': None,
+        }
+
+    def _fail(self, task, state, msg, exclude=None, note=True,
+              traceback=False):
+        """Fail the firmware update step and discard its state.
+
+        :param task: a TaskManager instance
+        :param state: the state object
+        :param msg: the error message; the staged-pending-components
+            note is appended to it when applicable
+        :param exclude: a settings dict to omit from that note (the one
+            that just failed)
+        :param note: whether the staged-pending-components note applies
+            to this failure at all
+        :param traceback: whether to include a traceback in the step
+            error
+        """
+        if note:
+            msg += self._staged_pending_note(task.node, state, exclude)
+        try:
+            self._report_step_error(task, msg, traceback=traceback)
+        finally:
+            self._clear_updates(task.node)
 
     def get_properties(self):
         """Return the properties of the interface.
 
         :returns: dictionary of <property name>:<property description> entries.
         """
-        return redfish_utils.COMMON_PROPERTIES.copy()
+        properties = redfish_utils.COMMON_PROPERTIES.copy()
+        properties['firmware_update_boot_progress'] = _(
+            'Boot progress policy: auto requires reported readiness; '
+            'limited uses firmware_update_boot_check_delay for hardware known '
+            'to report only intermediate boot stages. Neither policy skips '
+            'supported firmware job or reset checks.')
+        properties['firmware_update_bios_pending_reset'] = _(
+            'BIOS reset policy: auto waits for Pending and Running tasks; '
+            'compatibility permits an ungrouped BIOS task in Starting, '
+            'Pending or Running to receive its apply reset after the staging '
+            'wait. Use compatibility only for platforms documented to keep '
+            'these task states until reset, rather than while flashing.')
+        return properties
 
     def validate(self, task):
         """Validates the driver information needed by the redfish driver.
@@ -75,9 +475,23 @@ class RedfishFirmware(base.FirmwareInterface):
         :raises: MissingParameterValue on missing parameter(s)
         """
         redfish_utils.parse_driver_info(task.node)
+        self._validate_boot_policy(task.node)
+
+    def _validate_boot_policy(self, node):
+        policy = node.driver_info.get('firmware_update_boot_progress', 'auto')
+        if policy not in ('auto', 'limited'):
+            raise exception.InvalidParameterValue(_(
+                'firmware_update_boot_progress must be auto or limited'))
+        bios_policy = node.driver_info.get(
+            'firmware_update_bios_pending_reset', 'auto')
+        if bios_policy not in ('auto', 'compatibility'):
+            raise exception.InvalidParameterValue(_(
+                'firmware_update_bios_pending_reset must be auto or '
+                'compatibility'))
 
     @METRICS.timer('RedfishFirmware.cache_firmware_components')
-    def cache_firmware_components(self, task):
+    def cache_firmware_components(self, task, required_components=(),
+                                  known_supported_types=()):
         """Store or update Firmware Components on the given node.
 
         This method stores Firmware Components to the firmware_information
@@ -85,12 +499,20 @@ class RedfishFirmware(base.FirmwareInterface):
         of each Firmware Component.
 
         :param task: a TaskManager instance.
+        :param required_components: component names whose supported inventory
+            must be readable before updating the cache. Ordinary discovery
+            remains best effort; update verification retries transient errors.
+        :param known_supported_types: previously observed capabilities that
+            must not be reclassified as unsupported during recovery.
         :raises: UnsupportedDriverExtension, if the node's driver doesn't
             support getting Firmware Components from bare metal.
         """
 
         node_id = task.node.id
         settings = []
+        required_types = {redfish_utils.get_component_type(component)
+                          for component in required_components}
+        unsupported_types = set()
         # NOTE(iurygregory): currently we will only retrieve BIOS and BMC
         # firmware information through the redfish system and manager.
 
@@ -123,16 +545,32 @@ class RedfishFirmware(base.FirmwareInterface):
                           '%(node_uuid)s manager %(manager)s',
                           {'node_uuid': task.node.uuid,
                            'manager': manager.identity})
-        except exception.RedfishError:
+        except (exception.RedfishError, sushy.exceptions.SushyError):
+            if redfish_utils.BMC in required_types:
+                raise
             LOG.warning('No manager available to retrieve Firmware '
                         'from the bmc of node %s', task.node.uuid)
 
         nic_components = None
         try:
-            nic_components = self.retrieve_nic_components(task, system)
+            if redfish_utils.NIC in required_types:
+                nic_components = self.retrieve_nic_components(
+                    task, system, strict=True)
+            else:
+                nic_components = self.retrieve_nic_components(task, system)
+        except exception.UnsupportedDriverExtension:
+            if redfish_utils.NIC in known_supported_types:
+                raise exception.RedfishError(error=_(
+                    'Previously supported NetworkAdapters inventory is '
+                    'temporarily unavailable'))
+            unsupported_types.add(redfish_utils.NIC)
+            LOG.warning('NIC firmware inventory is unsupported on node %s',
+                        task.node.uuid)
         except (exception.RedfishError,
                 sushy.exceptions.BadRequestError,
                 sushy.exceptions.MissingAttributeError) as e:
+            if redfish_utils.NIC in required_types:
+                raise
             # NOTE(janders) if an exception is raised, log a warning
             # with exception details. This is important for HP hardware
             # which at the time of writing this are known to return 400
@@ -148,6 +586,16 @@ class RedfishFirmware(base.FirmwareInterface):
                       {'node_uuid': task.node.uuid})
         elif nic_components:
             settings.extend(nic_components)
+
+        available = {entry['component'] for entry in settings}
+        missing = [component for component in required_components
+                   if component not in available
+                   and redfish_utils.get_component_type(component)
+                   not in unsupported_types]
+        if missing:
+            raise exception.RedfishError(error=_(
+                'Firmware inventory is not yet available for: %s')
+                % ', '.join(missing))
 
         if not settings:
             error_msg = (_('Cannot retrieve firmware for node %s: no '
@@ -187,17 +635,21 @@ class RedfishFirmware(base.FirmwareInterface):
                 up_fw_cmp.serial_number = up_fw.get('serial_number')
                 up_fw_cmp.save()
 
-    def retrieve_nic_components(self, task, system):
+    def retrieve_nic_components(self, task, system, strict=False):
         """Helper function to retrieve all NICs components on a given node.
 
         :param task: a TaskManager instance.
         :param system: a Redfish System object
+        :param strict: propagate read failures and explicitly report absent
+            NetworkAdapters capability for update verification.
         :returns: a list of NIC components
         """
         nic_list = []
         try:
             chassis = redfish_utils.get_chassis(task.node, system)
         except exception.RedfishError:
+            if strict:
+                raise
             LOG.debug('No chassis available to retrieve NetworkAdapters '
                       'firmware information on node %(node_uuid)s',
                       {'node_uuid': task.node.uuid})
@@ -206,17 +658,23 @@ class RedfishFirmware(base.FirmwareInterface):
         try:
             network_adapters = chassis.network_adapters
             if network_adapters is None:
+                if strict:
+                    raise exception.UnsupportedDriverExtension(
+                        'NetworkAdapters is not supported')
                 LOG.debug('NetworkAdapters not available on chassis for '
                           'node %(node_uuid)s',
                           {'node_uuid': task.node.uuid})
                 return nic_list
-            adapters = network_adapters.get_members()
         except sushy.exceptions.MissingAttributeError:
+            if strict:
+                raise exception.UnsupportedDriverExtension(
+                    'NetworkAdapters is not supported')
             LOG.debug('NetworkAdapters not available on chassis for '
                       'node %(node_uuid)s',
                       {'node_uuid': task.node.uuid})
             return nic_list
 
+        adapters = network_adapters.get_members()
         for net_adp in adapters:
             for net_adp_ctrl in net_adp.controllers:
                 fw_pkg_v = net_adp_ctrl.firmware_package_version
@@ -274,61 +732,125 @@ class RedfishFirmware(base.FirmwareInterface):
             progress asynchronously of None if it is complete.
         """
         firmware_utils.validate_firmware_interface_update_args(settings)
+        self._validate_boot_policy(task.node)
+
         node = task.node
         update_service = redfish_utils.get_update_service(node)
 
         LOG.debug('Updating Firmware on node %(node_uuid)s with settings '
                   '%(settings)s',
                   {'node_uuid': node.uuid, 'settings': settings})
-        self._execute_firmware_update(node, update_service, settings)
 
-        # Store updated settings and start time for overall timeout tracking
-        node.set_driver_internal_info('redfish_fw_updates', settings)
-        node.set_driver_internal_info(
-            'redfish_fw_update_start_time',
-            timeutils.utcnow().isoformat())
-        node.save()
-
-        # Return wait state to keep the step active and let polling handle
-        # the monitoring and eventual completion/reboot
+        state = {
+            'version': STATE_VERSION,
+            'state': None,
+            'entered_at': None,
+            'started_at': str(timeutils.utcnow().isoformat()),
+            'settings': settings,
+            'cleanup': None,
+            'grouping': False,
+            'segment': None,
+            'reboot_time': None,
+            'bmc': None,
+            'verify': None,
+            'inventory_supported': sorted({
+                redfish_utils.get_component_type(component.component)
+                for component in objects.FirmwareComponentList.get_by_node_id(
+                    task.context, node.id)
+                if redfish_utils.get_component_type(component.component)}),
+        }
+        self._transition(task, state, STATE_STARTING)
+        if self._nic_inventory_ready(task, state):
+            self._start_next_segment(task, state, update_service)
+        else:
+            deploy_utils.set_async_step_flags(node, reboot=False, polling=True)
+            self._persist(node, state)
         return async_steps.get_return_state(node)
 
-    def _clean_temp_fields(self, node):
-        """Clean up temporary fields used during firmware update monitoring.
+    def _nic_inventory_ready(self, task, state):
+        """Wait for HPE NIC visibility before arming any image in its batch."""
+        run = state['settings'][:self._segment_run_length(state)]
+        if not any(redfish_utils.get_component_type(entry['component'])
+                   == redfish_utils.NIC for entry in run):
+            return True
+        vendor = redfish_utils.get_system_vendor(task.node).lower()
+        if (not ({'hp', 'hpe'} & set(vendor.split()))
+                and 'hewlett' not in vendor):
+            return True
+        error = ''
+        try:
+            system = redfish_utils.get_system(task.node)
+            chassis = redfish_utils.get_chassis(task.node, system)
+            adapters = chassis.network_adapters
+            if adapters is not None and adapters.get_members():
+                supported = state.setdefault('inventory_supported', [])
+                if redfish_utils.NIC not in supported:
+                    supported.append(redfish_utils.NIC)
+                return True
+        except (exception.RedfishError, sushy.exceptions.SushyError) as exc:
+            error = str(exc)
+        state['last_error'] = (
+            'HPE NetworkAdapters are not visible for NIC staging. Keep the '
+            'instance OS running during servicing, or boot IPA before '
+            'day-0 firmware updates. ' + error)
+        return False
 
-        This ensures no stale data interferes with new firmware updates.
+    def _start_next_segment(self, task, state, update_service):
+        """Start the next firmware update segment.
 
-        :param node: the Ironic node object
+        Starts either a consolidated non-BMC segment or a single BMC one
+        for the first component(s) left in ``state['settings']``.
+
+        :param task: a TaskManager instance
+        :param state: the state object
+        :param update_service: the sushy firmware update service
         """
-        # BMC-related temp fields
-        node.del_driver_internal_info(BMC_FW_VERSION_BEFORE_UPDATE)
-        # General firmware temp fields
-        node.del_driver_internal_info(FIRMWARE_REBOOT_REQUESTED)
+        if self._segment_run_length(state) > 0:
+            self._start_batched_segment(task, state, update_service)
+        else:
+            self._start_bmc_segment(task, state, update_service)
 
-    def _setup_bmc_update_monitoring(self, node, fw_upd):
-        """Set up monitoring for BMC firmware update.
+    def _start_bmc_segment(self, task, state, update_service):
+        """Submit a BMC component and start watching its version.
 
-        BMC updates do not reboot immediately. Instead, we check the BMC
-        version periodically. If the version changed, we continue without
-        reboot. If timeout expires without version change, we trigger a reboot.
+        BMC updates do not immediately reboot the host. Task/job outcomes and
+        the reported version establish completion before resource recovery.
+        An unchanged version requires positive task or job evidence.
 
-        :param node: the Ironic node object
-        :param fw_upd: firmware update settings dict
+        The ``bmc`` entry of the state object records ``version_before``
+        (the version reported before the update), ``wait_start`` (the
+        reference point of the wait currently running, refreshed on each
+        version-check poll), ``check_start`` (the reference point of the
+        overall version-check timeout), ``checking`` (whether the wait
+        that is running is a version-check poll rather than the initial
+        update wait) and ``reboot_requested`` (whether the segment must
+        reboot the host to apply the update).
+
+        :param task: a TaskManager instance
+        :param state: the state object
+        :param update_service: the sushy firmware update service
         """
-        # Clean any stale temp fields from previous updates
-        self._clean_temp_fields(node)
+        node = task.node
+        fw_upd = state['settings'][0]
+        state['segment'] = {'length': 1, 'current': None, 'batched': False,
+                            'started_at': (state.get('entered_at')
+                                           or timeutils.utcnow().isoformat())}
+        self._snapshot_segment_jobs(task, state)
+        state['reboot_time'] = None
+        state['verify'] = None
+        bmc = {'version_before': None, 'wait_start': None,
+               'check_start': None, 'checking': False,
+               'reboot_requested': False}
 
-        # Record current BMC version before update
         try:
             system = redfish_utils.get_system(node)
             manager = redfish_utils.get_manager(node, system)
             current_bmc_version = manager.firmware_version
-            node.set_driver_internal_info(
-                BMC_FW_VERSION_BEFORE_UPDATE, current_bmc_version)
+            bmc['version_before'] = current_bmc_version
             LOG.debug('BMC version before update for node %(node)s: '
                       '%(version)s',
                       {'node': node.uuid, 'version': current_bmc_version})
-        except Exception as e:
+        except (exception.RedfishError, sushy.exceptions.SushyError) as e:
             LOG.warning('Could not read BMC version before update for '
                         'node %(node)s: %(error)s',
                         {'node': node.uuid, 'error': e})
@@ -337,104 +859,24 @@ class RedfishFirmware(base.FirmwareInterface):
                  'Monitoring BMC version instead of immediate reboot.',
                  {'node': node.uuid})
 
-        # Use wait_interval or default reboot delay
         wait_interval = fw_upd.get('wait')
         if wait_interval is None:
             wait_interval = CONF.redfish.firmware_update_reboot_delay
         fw_upd['wait'] = wait_interval
-        # Set wait_start_time for polling interval and bmc_check_start_time
-        # for total timeout tracking (wait_start_time gets updated each poll)
         start_time = str(timeutils.utcnow().isoformat())
-        fw_upd['wait_start_time'] = start_time
-        fw_upd['bmc_check_start_time'] = start_time
-        # Mark this as a BMC update so we can handle timeouts properly
-        fw_upd['component_type'] = redfish_utils.BMC
+        bmc['wait_start'] = start_time
+        bmc['check_start'] = start_time
+        bmc['check_timeout'] = wait_interval
+        state['bmc'] = bmc
 
-        # BMC: Set async flags without immediate reboot
         deploy_utils.set_async_step_flags(
             node,
             reboot=False,
             polling=True
         )
-
-    def _setup_nic_update_monitoring(self, node):
-        """Set up monitoring for NIC firmware update.
-
-        NIC firmware behavior varies by hardware. Some NICs update immediately,
-        some need reboot to start. The handler will wait 30s and decide whether
-        to reboot.
-
-        :param node: the Ironic node object
-        """
-        # Clean any stale temp fields from previous updates
-        self._clean_temp_fields(node)
-
-        LOG.info('NIC firmware update for node %(node)s. Will monitor '
-                 'task state to determine if reboot is needed.',
-                 {'node': node.uuid})
-
-        # NIC: Set async flags with reboot disabled
-        # The task monitoring logic (_handle_nic_task_starting) will decide
-        # whether to trigger a reboot after observing the task state.
-        deploy_utils.set_async_step_flags(
-            node,
-            reboot=False,
-            polling=True
-        )
-
-    def _setup_bios_update_monitoring(self, node):
-        """Set up monitoring for BIOS firmware update.
-
-        BIOS updates require a reboot to apply, so we trigger it as soon
-        as the update task begins rather than waiting for completion.
-
-        :param node: the Ironic node object
-        """
-        # Clean any stale temp fields from previous updates
-        self._clean_temp_fields(node)
-
-        LOG.info('BIOS firmware update for node %(node)s. Will reboot '
-                 'when update task starts.',
-                 {'node': node.uuid})
-
-        # BIOS: Set async flags with reboot enabled
-        deploy_utils.set_async_step_flags(
-            node,
-            reboot=True,
-            polling=True
-        )
-
-    def _setup_default_update_monitoring(self, node, fw_upd):
-        """Set up monitoring for unknown/default firmware component types.
-
-        Default behavior for unknown component types uses standard reboot
-        handling with configurable wait interval.
-
-        :param node: the Ironic node object
-        :param fw_upd: firmware update settings dict
-        """
-        # Clean any stale temp fields from previous updates
-        self._clean_temp_fields(node)
-
-        component = fw_upd.get('component', '')
-        LOG.warning(
-            'Unknown component type %(component)s for node %(node)s. '
-            'Using default firmware update behavior.',
-            {'component': component, 'node': node.uuid})
-
-        wait_interval = fw_upd.get('wait')
-        if wait_interval is None:
-            wait_interval = (
-                node.driver_info.get('firmware_update_unresponsive_bmc_wait')
-                or CONF.redfish.firmware_update_wait_unresponsive_bmc)
-            fw_upd['wait'] = wait_interval
-
-        # Default: Set async flags with reboot enabled
-        deploy_utils.set_async_step_flags(
-            node,
-            reboot=True,
-            polling=True
-        )
+        self._transition(task, state, STATE_WAITING_BMC)
+        self._submit_simple_update(node, state, update_service, fw_upd)
+        self._persist(node, state)
 
     def _get_current_bmc_version(self, node):
         """Get current BMC firmware version.
@@ -460,193 +902,85 @@ class RedfishFirmware(base.FirmwareInterface):
                       '%(error)s', {'node': node.uuid, 'error': e})
             return None
 
-    def _handle_bmc_update_completion(self, task, update_service,
-                                      settings, current_update):
-        """Handle BMC firmware update completion with version checking.
-
-        For BMC updates, we don't reboot immediately. Instead, we check
-        the BMC version periodically. If the version changed, we continue
-        without reboot. If timeout expires without version change, we trigger
-        a reboot.
-
-        :param task: a TaskManager instance
-        :param update_service: the sushy firmware update service
-        :param settings: firmware update settings
-        :param current_update: the current firmware update being processed
-        """
-        # Upgrade the lock to ensure we are using the latest info from
-        # the node.
-        task.upgrade_lock()
+    def _bmc_update_completion(self, task, state, update_service):
+        """Verify the BMC version before entering asynchronous recovery."""
         node = task.node
-
-        # Try to get current BMC version
-        # Note: BMC may be unresponsive after firmware update - expected
+        bmc = state['bmc']
+        current_update = state['settings'][0]
+        if self._run_lc_job_gate(task, state, False):
+            return None
         current_version = self._get_current_bmc_version(node)
-        version_before = node.driver_internal_info.get(
-            BMC_FW_VERSION_BEFORE_UPDATE)
-
-        # If we can read the version and it changed, update is complete
-        if (current_version is not None
-                and version_before is not None
-                and current_version != version_before):
-            node.del_driver_internal_info(BMC_FW_VERSION_BEFORE_UPDATE)
-
-            # Check if more components are pending updates after BMC update
-            if len(settings) > 1:
-                # Upgrade the lock to ensure we are using the latest info from
-                # the node.
-                task.upgrade_lock()
-                # More components to update - trigger reboot before continuing
-                #  Some hardware can only execute NIC firmware updates after
-                # the host reboots following the BMC firmware update.
-
-                LOG.info('BMC firmware update complete for node %(node)s. '
-                         'More components pending - triggering reboot before '
-                         'continuing to next component.',
-                         {'node': node.uuid})
-                # Set flag to indicate reboot completed, ready to continue
-                # This ensures we reboot and continue with the next component
-                # update, this is required because we saw cases where NIC
-                # updates were not being executed after the BMC update.
-                current_update[BMC_UPDATE_COMPLETED] = True
-                node.set_driver_internal_info('redfish_fw_updates', settings)
-                node.save()
-
-                manager_utils.node_power_action(task, states.REBOOT)
-                return
-            else:
-                # Last component - no reboot needed
-                # Servicing/Cleaning will trigger one.
-                LOG.info('BMC firmware version for node %(node)s changed '
-                         'from %(old)s to %(new)s.  Update complete last '
-                         'component',
-                         {'node': node.uuid, 'old': version_before,
-                          'new': current_version})
-                node.save()
-                self._continue_updates(task, update_service, settings)
-            return
-
-        # Check if we've been checking for too long
-        check_start_time = current_update.get('bmc_check_start_time')
-
-        if check_start_time:
-            check_start = timeutils.parse_isotime(check_start_time)
-            elapsed_time = timeutils.utcnow(True) - check_start
-            timeout = current_update.get(
-                'wait', CONF.redfish.firmware_update_reboot_delay)
-            if elapsed_time.seconds >= timeout:
-                # Timeout: version didn't change or BMC unresponsive
-                if (current_version is not None
-                        and version_before is not None
-                        and current_version == version_before):
-                    # Version didn't change - skip reboot
-                    LOG.info(
-                        'BMC firmware version for node %(node)s did not '
-                        'change (still %(version)s). Update appears to be '
-                        'a no-op or does not require reboot. Continuing '
-                        'without reboot.',
-                        {'node': node.uuid, 'version': current_version})
-                else:
-                    # Version changed or we can't tell - reboot to apply
-                    LOG.warning(
-                        'BMC firmware version check timeout expired for '
-                        'node %(node)s after %(elapsed)s seconds. '
-                        'Will reboot to complete firmware update.',
-                        {'node': node.uuid, 'elapsed': elapsed_time.seconds})
-                    # Mark that reboot is needed
-                    node.set_driver_internal_info(
-                        FIRMWARE_REBOOT_REQUESTED, True)
-                    # Enable reboot flag now that we're ready to reboot
-                    deploy_utils.set_async_step_flags(
-                        node,
-                        reboot=True,
-                        polling=True
-                    )
-
-                node.del_driver_internal_info(BMC_FW_VERSION_BEFORE_UPDATE)
-                node.save()
-                self._continue_updates(task, update_service, settings)
-                return
-
-        # Continue checking - set wait to check again
-        wait_interval = (
+        version_before = bmc.get('version_before')
+        changed = (current_version is not None and version_before is not None
+                   and current_version != version_before)
+        check_start_time = bmc.get('check_start')
+        elapsed = (timeutils.utcnow(True)
+                   - timeutils.parse_isotime(check_start_time)
+                   if check_start_time else None)
+        timeout = bmc.get('check_timeout',
+                          CONF.redfish.firmware_update_reboot_delay)
+        positive = self._positive_task_outcome(current_update)
+        tracking = state['segment'].get('jobs') or {}
+        jobs = tracking.get('jobs', {})
+        positive = positive or (bool(jobs) and all(
+            outcome == 'Completed' for outcome in jobs.values()))
+        if changed or (positive and elapsed is not None
+                       and elapsed.total_seconds() >= timeout):
+            current_update['version_changed'] = changed
+            # A same-version reinstall needs a successful task/job, never just
+            # a timer. Any following component needs the BMC handoff reset.
+            bmc['reboot_requested'] = (
+                len(state['settings']) > 1
+                or current_version is None or version_before is None)
+            current_update.pop('wait', None)
+            bmc['wait_start'] = None
+            self._continue_after_bmc(task, state, update_service)
+            return None
+        current_update['wait'] = (
             CONF.redfish.firmware_update_bmc_version_check_interval)
-        current_update['wait'] = wait_interval
-        current_update['wait_start_time'] = str(
-            timeutils.utcnow().isoformat())
-        current_update['bmc_version_checking'] = True
-        node.set_driver_internal_info('redfish_fw_updates', settings)
-        node.save()
+        state['last_error'] = 'BMC update has no verified completion yet'
+        bmc['wait_start'] = timeutils.utcnow().isoformat()
+        bmc['checking'] = True
+        self._persist(node, state)
+        return None
 
-        LOG.debug('BMC firmware version check continuing for node %(node)s. '
-                  'Will check again in %(interval)s seconds.',
-                  {'node': node.uuid, 'interval': wait_interval})
+    def _start_bmc_apply_reboot(self, task, state, fw_upd, set_flags=True):
+        """Reboot the host to apply a BMC segment, and enter ``rebooting``.
 
-    def _handle_nic_update_completion(self, task, update_service, settings,
-                                      current_update):
-        """Handle NIC firmware update completion.
-
-        For NIC updates, check if a reboot is needed based on whether the
-        task went through the Running state (needs reboot after completion)
-        or if reboot already occurred during the Starting phase.
+        The BMC's own task is already terminal by the time this runs, so
+        the segment is recorded with no task monitors left to poll: the
+        ``applying`` state passes straight through to the verify states,
+        which are shared with the batched machine.
 
         :param task: a TaskManager instance
-        :param update_service: the sushy firmware update service
-        :param settings: firmware update settings
-        :param current_update: the current firmware update being processed
+        :param state: the state object
+        :param fw_upd: the BMC settings dict whose update is being
+            applied
+        :param set_flags: whether the async step flags still need to be
+            set for a reboot (they are already set when the reboot was
+            requested by an expired version check)
         """
         node = task.node
+        if not self._can_reboot_segment(task, state):
+            return
+        state['verify'] = self._build_verify(self._segment_jids(state))
+        fw_upd.pop('task_monitor', None)
+        self._prepare_reboot_observation(node, state)
+        state['bmc']['reboot_requested'] = False
+        if set_flags:
+            deploy_utils.set_async_step_flags(node, reboot=True, polling=True)
+        self._transition(task, state, STATE_REBOOTING)
+        manager_utils.node_power_action(task, states.REBOOT)
 
-        # Check if reboot was actually triggered during task start
-        reboot_triggered = current_update.get(NIC_REBOOT_TRIGGERED, False)
-        needs_post_reboot = current_update.get(
-            NIC_NEEDS_POST_COMPLETION_REBOOT, False)
-
-        if reboot_triggered:
-            LOG.info(
-                'NIC firmware update task completed for node '
-                '%(node)s. Reboot was triggered during update start.',
-                {'node': node.uuid})
-
-            # Clean up flags
-            current_update.pop(NIC_NEEDS_POST_COMPLETION_REBOOT, None)
-            current_update.pop(NIC_STARTING_TIMESTAMP, None)
-            current_update.pop(NIC_REBOOT_TRIGGERED, None)
-        elif needs_post_reboot:
-            LOG.info(
-                'NIC firmware update task completed for node '
-                '%(node)s. Reboot required to apply update.',
-                {'node': node.uuid})
-
-            # Mark that reboot is needed
-            node.set_driver_internal_info(
-                FIRMWARE_REBOOT_REQUESTED, True)
-
-            # Clean up flags
-            current_update.pop(NIC_NEEDS_POST_COMPLETION_REBOOT, None)
-            current_update.pop(NIC_STARTING_TIMESTAMP, None)
-            current_update.pop(NIC_REBOOT_TRIGGERED, None)
-        else:
-            # Neither flag was set - task completed before we could
-            # monitor it. Assume reboot is needed for safety.
-            LOG.warning(
-                'NIC firmware update task completed for node '
-                '%(node)s but no reboot flag was set (task may have '
-                'completed very quickly). Requesting reboot to ensure '
-                'firmware is applied.', {'node': node.uuid})
-            # Mark that reboot is needed
-            node.set_driver_internal_info(
-                FIRMWARE_REBOOT_REQUESTED, True)
-
-        self._continue_updates(task, update_service, settings)
-
-    def _submit_simple_update(self, node, update_service, fw_upd):
+    def _submit_simple_update(self, node, state, update_service, fw_upd):
         """Submit a SimpleUpdate request and track cleanup.
 
         Handles systems-collection targeting, firmware file staging,
         the SimpleUpdate call, and cleanup tracking.
 
         :param node: the node that will have a firmware update executed.
+        :param state: the state object; its ``cleanup`` list is extended
+            when the firmware file had to be staged.
         :param update_service: the sushy firmware update service.
         :param fw_upd: single firmware update settings dict (mutated
             in-place: task_monitor and power_timeout are added).
@@ -672,7 +1006,15 @@ class RedfishFirmware(base.FirmwareInterface):
         else:
             targets = None
 
-        component_url, cleanup = self._stage_firmware_file(node, fw_upd)
+        component_url, cleanup = self._stage_firmware_file(
+            node, fw_upd, state=state)
+
+        if cleanup:
+            fw_clean = state.setdefault('cleanup', None) or []
+            if cleanup not in fw_clean:
+                fw_clean.append(cleanup)
+            state['cleanup'] = fw_clean
+            self._persist(node, state)
 
         LOG.debug('Applying new firmware %(url)s for %(component)s on node '
                   '%(node_uuid)s',
@@ -691,144 +1033,211 @@ class RedfishFirmware(base.FirmwareInterface):
             raise exception.RedfishError(error=e)
 
         fw_upd['task_monitor'] = task_monitor.task_monitor_uri
-
-        if cleanup:
-            fw_clean = node.driver_internal_info.get('firmware_cleanup')
-            if not fw_clean:
-                fw_clean = [cleanup]
-            elif cleanup not in fw_clean:
-                fw_clean.append(cleanup)
-            node.set_driver_internal_info('firmware_cleanup', fw_clean)
+        fw_upd['submitted'] = True
+        fw_upd['synchronous'] = not bool(task_monitor.task_monitor_uri)
+        jid = self._jid_from_task_monitor(task_monitor.task_monitor_uri)
+        if jid:
+            fw_upd['jids'] = [jid]
 
         return task_monitor.task_monitor_uri
 
-    def _execute_firmware_update(self, node, update_service, settings):
-        """Executes the next firmware update to the node
+    def _jid_from_task_monitor(self, task_monitor):
+        """Extract the Dell LC job id (JID) from a task monitor URI.
 
-        Executes the first firmware update in the settings list to the node.
+        Assumes the JID is the last path segment of the URI, an iDRAC
+        convention: /redfish/v1/TaskService/TaskMonitors/JID_...
 
-        :param node: the node that will have a firmware update executed.
-        :param update_service: the sushy firmware update service.
-        :param settings: remaining settings for firmware update that needs
-            to be executed.
+        :param task_monitor: a task monitor URI string, or '' or None.
+        :returns: the JID (the URI's last path segment), or '' if a
+            JID cannot be derived.
         """
-        fw_upd = settings[0]
-        self._submit_simple_update(node, update_service, fw_upd)
-        node.set_driver_internal_info('redfish_fw_updates', settings)
+        jid = (task_monitor.rstrip('/').rsplit('/', 1)[-1]
+               if task_monitor else '')
+        return jid if jid.startswith('JID_') else ''
 
+    def _snapshot_segment_jobs(self, task, state):
+        tracking = (drac_fw.snapshot_lc_jobs(task)
+                    if redfish_utils.is_dell_node(task.node) else None)
+        state['segment']['jobs'] = tracking
+        if tracking is not None:
+            state['settings'][0]['jobs_before'] = list(tracking['baseline'])
+
+    def _segment_jids(self, state):
+        jids = []
+        for entry in state['settings'][:state['segment']['length']]:
+            jids.extend(entry.get('jids', []))
+            jid = self._jid_from_task_monitor(entry.get('task_monitor'))
+            if jid:
+                jids.append(jid)
+        return list(dict.fromkeys(jids))
+
+    def _can_reboot_segment(self, task, state):
+        if not redfish_utils.is_dell_node(task.node):
+            return True
+        status, detail = drac_fw.check_lc_jobs(
+            task, self._segment_jids(state), state['segment'].get('jobs'),
+            required=True, allow_staged=state['segment']['batched'])
+        state['last_error'] = detail
+        if status == drac_fw.LC_JOBS_ERROR:
+            raise exception.FirmwareUpdateFailed(error=detail)
+        return status in (drac_fw.LC_JOBS_DONE, drac_fw.LC_JOBS_UNAVAILABLE)
+
+    def _submit_one_batched_component(self, node, state, update_service,
+                                      idx):
+        """Submit a single SimpleUpdate for one component in a batch.
+
+        :param node: the node object
+        :param state: the state object
+        :param update_service: the sushy firmware update service
+        :param idx: index into the state's settings for the component
+            to submit
+        :raises: RedfishError if SimpleUpdate submission fails
+        """
+        settings = state['settings']
+        fw_upd = settings[idx]
         component = fw_upd.get('component', '')
-        component_type = redfish_utils.get_component_type(component)
+        LOG.debug('Batched submission %(idx)d/%(total)d: staging '
+                  '%(component)s from %(url)s for node %(node)s',
+                  {'idx': idx + 1, 'total': len(settings),
+                   'component': component, 'url': fw_upd['url'],
+                   'node': node.uuid})
+        try:
+            self._submit_simple_update(node, state, update_service, fw_upd)
+        except Exception as e:
+            LOG.error('Batched firmware submission failed at component '
+                      '%(component)s (%(idx)d/%(total)d) for node '
+                      '%(node)s. Error: %(error)s. No consolidated '
+                      'reboot will be issued.',
+                      {'component': component, 'idx': idx + 1,
+                       'total': len(settings), 'node': node.uuid,
+                       'error': e})
+            raise
 
-        if component_type == redfish_utils.BMC:
-            self._setup_bmc_update_monitoring(node, fw_upd)
-        elif component_type == redfish_utils.NIC:
-            self._setup_nic_update_monitoring(node)
-        elif component_type == redfish_utils.BIOS:
-            self._setup_bios_update_monitoring(node)
-        else:
-            self._setup_default_update_monitoring(node, fw_upd)
+    def _start_batched_segment(self, task, state, update_service):
+        """Submit the first non-BMC firmware update and start staging polling.
+
+        Submits SimpleUpdate for the leading run of non-BMC components in
+        the settings and sets up async polling. The periodic poller will
+        monitor staging progress and submit subsequent components one at
+        a time, only triggering a consolidated reboot after all are
+        staged. BMC entries and any trailing components are left in the
+        settings for later processing via _start_next_segment.
+
+        :param task: a TaskManager instance
+        :param state: the state object
+        :param update_service: the sushy firmware update service
+        :raises: RedfishError if the SimpleUpdate submission fails
+        """
+        node = task.node
+        settings = state['settings']
+
+        run_length = self._segment_run_length(state)
+        LOG.info('Batching %(batch)d of %(total)d components for node '
+                 '%(node)s; remaining components will be processed '
+                 'in subsequent segments.',
+                 {'batch': run_length, 'total': len(settings),
+                  'node': node.uuid})
+
+        state['segment'] = {'length': run_length, 'current': 0,
+                            'batched': True,
+                            'started_at': (state.get('entered_at')
+                                           or timeutils.utcnow().isoformat())}
+        self._snapshot_segment_jobs(task, state)
+        state['reboot_time'] = None
+        state['bmc'] = None
+        state['verify'] = None
+
+        deploy_utils.set_async_step_flags(
+            node,
+            reboot=False,
+            polling=True
+        )
+        self._transition(task, state, STATE_STAGING)
+        self._submit_one_batched_component(node, state, update_service, 0)
+        self._persist(node, state)
+
+        LOG.info('Submitted component 1/%(count)d for node %(node)s. '
+                 'Polling for staging completion before submitting next.',
+                 {'count': run_length, 'node': node.uuid})
 
     def _validate_resources_stability(self, node):
-        """Validate that BMC resources are consistently available.
-
-        Requires consecutive successful responses from System, Manager,
-        and NetworkAdapters resources before considering them stable.
-        The number of required successes is configured via
-        CONF.redfish.firmware_update_required_successes.
-        Timeout is configured via
-        CONF.redfish.firmware_update_resource_validation_timeout.
-
-        :param node: the Ironic node object
-        :raises: RedfishError if resources don't stabilize within timeout
-        """
+        """Take one BMC recovery sample; leave waiting to the periodic."""
         timeout = CONF.redfish.firmware_update_resource_validation_timeout
         required_successes = CONF.redfish.firmware_update_required_successes
         validation_interval = CONF.redfish.firmware_update_validation_interval
-
-        # Skip validation if validation is disabled via configuration
-        if required_successes == 0 or timeout == 0:
-            reasons = []
-            if required_successes == 0:
-                reasons.append('required_successes=0')
-            if timeout == 0:
-                reasons.append('validation_timeout=0')
-
-            LOG.info('BMC resource validation disabled (%s) for node %(node)s',
-                     ', '.join(reasons), {'node': node.uuid})
-            return
-
-        LOG.debug('Starting resource stability validation for node %(node)s '
-                  '(timeout: %(timeout)s seconds, '
-                  'required_successes: %(required)s, '
-                  'validation_interval: %(interval)s seconds)',
-                  {'node': node.uuid, 'timeout': timeout,
-                   'required': required_successes,
-                   'interval': validation_interval})
-
-        start_time = time.time()
-        end_time = start_time + timeout
-        consecutive_successes = 0
-        last_exc = None
-
-        while time.time() < end_time:
+        if not timeout or not required_successes:
+            return True
+        state = node.driver_internal_info[FIRMWARE_UPDATE_STATE]
+        bmc = state['bmc']
+        validation = bmc.setdefault('validation', {
+            'started_at': timeutils.utcnow().isoformat(), 'successes': 0})
+        if validation['successes'] >= required_successes:
+            return True
+        if self._seconds_since(validation['started_at']) >= timeout:
+            raise exception.FirmwareUpdateFailed(error=_(
+                'BMC resources failed to stabilize within %(timeout)s '
+                'seconds; last error: %(error)s') % {
+                    'timeout': timeout, 'error': validation.get('error')})
+        if (validation.get('checked_at') and self._seconds_since(
+                validation['checked_at']) < validation_interval):
+            return False
+        validation['checked_at'] = timeutils.utcnow().isoformat()
+        try:
+            system = redfish_utils.get_system(node)
+            redfish_utils.get_manager(node, system)
+            chassis = redfish_utils.get_chassis(node, system)
             try:
-                # Test System resource
-                system = redfish_utils.get_system(node)
+                adapters = chassis.network_adapters
+                if adapters is not None:
+                    adapters.get_members()
+            except sushy.exceptions.MissingAttributeError:
+                pass
+            validation['successes'] += 1
+        except (exception.RedfishError, sushy.exceptions.SushyError) as exc:
+            validation['successes'] = 0
+            validation['error'] = str(exc)
+            state['last_error'] = str(exc)
+        self._persist(node, state)
+        return validation['successes'] >= required_successes
 
-                # Test Manager resource
-                redfish_utils.get_manager(node, system)
+    def _seconds_since(self, timestamp):
+        return (timeutils.utcnow(True)
+                - timeutils.parse_isotime(timestamp)).total_seconds()
 
-                # Test Chassis and NetworkAdapters resource (if available)
-                # Some systems may not have NetworkAdapters, which is valid
-                chassis = redfish_utils.get_chassis(node, system)
-                try:
-                    network_adapters = chassis.network_adapters
-                    if network_adapters is not None:
-                        network_adapters.get_members()
-                except sushy.exceptions.MissingAttributeError:
-                    # NetworkAdapters not available is acceptable
-                    pass
+    def _boot_observation(self, node):
+        """Read standard markers, including fields missing from older sushy."""
+        data = redfish_utils.get_system(node).json
+        progress = data.get('BootProgress') or {}
+        return {'reset': data.get('LastResetTime'),
+                'state': progress.get('LastState'),
+                'state_time': progress.get('LastStateTime'),
+                'power': data.get('PowerState')}
 
-                # All resources successful
-                consecutive_successes += 1
-                LOG.debug('Resource validation success %(count)d/%(required)d '
-                          'for node %(node)s',
-                          {'count': consecutive_successes,
-                           'required': required_successes,
-                           'node': node.uuid})
+    def _prepare_reboot_observation(self, node, state):
+        before = self._boot_observation(node)
+        verify = state['verify']
+        verify['before'] = before
+        verify['progress_supported'] = before['state'] not in (
+            None, 'None', 'OEM')
+        state['reboot_time'] = timeutils.utcnow().isoformat()
 
-                if consecutive_successes >= required_successes:
-                    LOG.info('All tested Redfish resources stable and '
-                             ' available for node %(node)s',
-                             {'node': node.uuid})
-                    return
-
-            except (exception.RedfishError,
-                    exception.RedfishConnectionError,
-                    sushy.exceptions.SushyError) as e:
-                LOG.debug('BMC resource validation failed for node %(node)s: '
-                          '%(error)s. This may indicate the BMC is still '
-                          'restarting or recovering from firmware update.',
-                          {'node': node.uuid, 'error': e})
-                # Resource not available yet, reset counter
-                if consecutive_successes > 0:
-                    LOG.debug('Resource validation interrupted for node '
-                              '%(node)s, resetting success counter '
-                              '(error: %(error)s)',
-                              {'node': node.uuid, 'error': e})
-                consecutive_successes = 0
-                last_exc = e
-
-            # Wait before next validation attempt
-            time.sleep(validation_interval)
-        # Timeout reached without achieving stability
-        error_msg = _('BMC resources failed to stabilize within '
-                      '%(timeout)s seconds for node %(node)s') % {
-            'timeout': timeout, 'node': node.uuid}
-        if last_exc:
-            error_msg += _(', last error: %(error)s') % {'error': last_exc}
-        LOG.error(error_msg)
-        raise exception.RedfishError(error=error_msg)
+    def _sample_reboot(self, node, state):
+        """Accumulate reset evidence; failed reads prove nothing."""
+        observed = self._boot_observation(node)
+        verify = state['verify']
+        before = verify.get('before') or {}
+        if observed['power'] in ('Off', 'PoweringOff', 'PoweringOn'):
+            verify['new_boot_observed'] = True
+        for marker in ('reset', 'state_time'):
+            if (before.get(marker) and observed.get(marker)
+                    and before[marker] != observed[marker]):
+                verify['new_boot_observed'] = True
+        if observed['state'] not in (None, 'None', 'OEM'):
+            verify['progress_supported'] = True
+            if before.get('state') and before['state'] != observed['state']:
+                verify['new_boot_observed'] = True
+        verify['observed'] = observed
+        return observed
 
     def _report_step_error(self, task, error_msg, traceback=True):
         """Route a step error to the correct error handler.
@@ -837,6 +1246,8 @@ class RedfishFirmware(base.FirmwareInterface):
         :param error_msg: the error message string
         :param traceback: whether to include traceback (default True)
         """
+        task.node.set_driver_internal_info(
+            async_steps.FIRMWARE_UPDATE_IN_PROGRESS, True)
         if task.node.clean_step:
             manager_utils.cleaning_error_handler(
                 task, error_msg, traceback=traceback)
@@ -869,124 +1280,170 @@ class RedfishFirmware(base.FirmwareInterface):
         elif task.node.deploy_step:
             manager_utils.notify_conductor_resume_deploy(task)
 
-    def _continue_updates(self, task, update_service, settings):
-        """Continues processing the firmware updates
+    def _continue_after_bmc(self, task, state, update_service):
+        """Keep the verified BMC segment until its resources have recovered."""
+        self._transition(task, state, STATE_VALIDATING_BMC)
 
-        Continues to process the firmware updates on the node.
-        First monitors the current task completion, then validates resource
-        stability before proceeding to next update or completion.
+    def _handle_validating_bmc(self, task, state, update_service):
+        if self._run_lc_job_gate(task, state, False):
+            return None
+        if not self._validate_resources_stability(task.node):
+            return None
+        if state['bmc'].get('reboot_requested'):
+            self._start_bmc_apply_reboot(task, state, state['settings'][0])
+            return None
+        return STATE_VERIFYING_INVENTORY
 
-        Note that the caller must have an exclusive lock on the node.
+    def _handle_starting(self, task, state, update_service):
+        if not self._nic_inventory_ready(task, state):
+            return None
+        try:
+            self._start_next_segment(task, state, update_service)
+        except Exception as exc:
+            self._fail(task, state, _(
+                'Failed to start the next firmware segment on node '
+                '%(node)s: %(error)s') % {
+                    'node': task.node.uuid, 'error': exc}, traceback=True)
+        return None
 
-        :param task: a TaskManager instance containing the node to act on.
-        :param update_service: the sushy firmware update service
-        :param settings: the remaining firmware updates to apply
+    def _handle_verifying_inventory(self, task, state, update_service):
+        # Late LC jobs still block completion while inventory settles.
+        if self._run_lc_job_gate(task, state, self._state_timed_out(state)):
+            state['entered_at'] = timeutils.utcnow().isoformat()
+            return None
+        if state.get('verify'):
+            if self._run_boot_progress_gate(task, state, False):
+                return None
+        settings = state['settings'][:state['segment']['length']]
+        wait = max([CONF.redfish.firmware_update_inventory_wait]
+                   + [entry.get('wait', 0) for entry in settings])
+        if self._seconds_since(state['entered_at']) < wait:
+            return None
+        inventory_options = {}
+        if state.get('inventory_supported'):
+            inventory_options['known_supported_types'] = (
+                state['inventory_supported'])
+        try:
+            self.cache_firmware_components(
+                task, required_components=[entry['component']
+                                           for entry in settings],
+                **inventory_options)
+        except exception.UnsupportedDriverExtension:
+            LOG.warning('Firmware inventory is unsupported on node %s',
+                        task.node.uuid)
+        return self._finish_segment(task, state)
+
+    def _cleanup_staged(self, node, state=None):
+        """Remove the firmware files staged for this update.
+
+        ``firmware_utils.cleanup`` reads the staging back-ends from the
+        ``firmware_cleanup`` driver_internal_info entry, which is shared
+        with the Redfish management interface, so the list tracked in the
+        state object is placed there only for the duration of the call.
+
+        :param node: the node to clean up for
+        :param state: the state object, or None when there is none (an
+            update that failed while staging its very first file)
         """
-        node = task.node
-        fw_upd = settings[0]
-
-        wait_interval = fw_upd.get('wait')
-        if wait_interval:
-            time_now = str(timeutils.utcnow().isoformat())
-            fw_upd['wait_start_time'] = time_now
-
-            LOG.debug('Waiting at %(time)s for %(seconds)s seconds after '
-                      '%(component)s firmware update %(url)s '
-                      'on node %(node)s',
-                      {'time': time_now,
-                       'seconds': wait_interval,
-                       'component': fw_upd['component'],
-                       'url': fw_upd['url'],
-                       'node': node.uuid})
-
-            node.set_driver_internal_info('redfish_fw_updates', settings)
-            node.save()
+        cleanup = (state or {}).get('cleanup')
+        if not cleanup:
+            firmware_utils.cleanup(node)
             return
 
-        if len(settings) == 1:
-            # Last firmware update - check if reboot is needed
-            reboot_requested = node.driver_internal_info.get(
-                FIRMWARE_REBOOT_REQUESTED, False)
-
-            self._clear_updates(node)
-
-            LOG.info('Firmware updates completed for node %(node)s',
-                     {'node': node.uuid})
-
-            # If reboot was requested (e.g., for BMC timeout or NIC
-            # completion), trigger the reboot before notifying conductor
-            if reboot_requested:
-                LOG.info('Rebooting node %(node)s to apply firmware updates',
-                         {'node': node.uuid})
-                manager_utils.node_power_action(task, states.REBOOT)
-
-            LOG.debug('Validating BMC responsiveness before resuming '
-                      'conductor operations for node %(node)s',
-                      {'node': node.uuid})
-            self._validate_resources_stability(node)
-
-            try:
-                self.cache_firmware_components(task)
-            except Exception as e:
-                LOG.warning('Failed to refresh firmware components for node '
-                            '%(node)s after firmware update: %(error)s',
-                            {'node': node.uuid, 'error': e})
-
-            self._resume_step(task)
-
-        else:
-            # Validate BMC resources are stable before continuing next update
-            LOG.info('Validating BMC responsiveness before continuing '
-                     'to next firmware update for node %(node)s',
-                     {'node': node.uuid})
-            self._validate_resources_stability(node)
-
-            settings.pop(0)
-            self._execute_firmware_update(node,
-                                          update_service,
-                                          settings)
-            node.save()
-
-            # Only reboot if the component code requested it.
-            if task.node.clean_step:
-                reboot_field = async_steps.CLEANING_REBOOT
-            elif task.node.deploy_step:
-                reboot_field = async_steps.DEPLOYMENT_REBOOT
-            elif task.node.service_step:
-                reboot_field = async_steps.SERVICING_REBOOT
+        info = node.driver_internal_info
+        had_entry = STAGED_CLEANUP in info
+        previous = info.get(STAGED_CLEANUP)
+        node.set_driver_internal_info(STAGED_CLEANUP, cleanup)
+        try:
+            firmware_utils.cleanup(node)
+        finally:
+            if had_entry:
+                node.set_driver_internal_info(STAGED_CLEANUP, previous)
             else:
-                reboot_field = None
-
-            # Default to reboot=True for backwards compatibility.
-            should_reboot = (node.driver_internal_info.get(reboot_field, True)
-                             if reboot_field else True)
-
-            if should_reboot:
-                power_timeout = settings[0].get('power_timeout', 0)
-                manager_utils.node_power_action(task, states.REBOOT,
-                                                power_timeout)
-            else:
-                LOG.debug('Component requested no immediate reboot for node '
-                          '%(node)s. Continuing with async polling.',
-                          {'node': node.uuid})
+                node.del_driver_internal_info(STAGED_CLEANUP)
 
     def _clear_updates(self, node):
         """Clears firmware updates artifacts
 
-        Clears firmware updates from driver_internal_info and any files
-        that were staged.
+        Clears the firmware update state from driver_internal_info and
+        any files that were staged.
 
         Note that the caller must have an exclusive lock on the node.
 
         :param node: the node to clear the firmware updates from
         """
-        firmware_utils.cleanup(node)
-        node.del_driver_internal_info('redfish_fw_updates')
-        node.del_driver_internal_info('redfish_fw_update_start_time')
-        node.del_driver_internal_info('firmware_cleanup')
-        # Clean all temporary fields used during firmware update monitoring
-        self._clean_temp_fields(node)
+        state = node.driver_internal_info.get(FIRMWARE_UPDATE_STATE)
+        try:
+            self._cleanup_staged(node, state)
+        except exception.IronicException:
+            LOG.exception('Unable to remove staged firmware for node %s',
+                          node.uuid)
+        node.del_driver_internal_info(FIRMWARE_UPDATE_STATE)
+        node.del_driver_internal_info(async_steps.FIRMWARE_UPDATE_IN_PROGRESS)
+        # A node whose update was started before the upgrade to the state
+        # object, and which failed before the periodic could migrate it,
+        # still carries the old entries.
+        for key in LEGACY_KEYS:
+            node.del_driver_internal_info(key)
         node.save()
+
+    def _migrate_legacy_state(self, node):
+        """Fold pre-state-object driver_internal_info into the state.
+
+        A conductor upgraded in the middle of a firmware update finds the
+        node described by the old constellation of driver_internal_info
+        entries. Which components of that update had already been staged
+        on the BMC cannot be recovered from them reliably, so the update
+        is moved into ``recovery_required``. A booted host cannot prove that
+        every requested component was applied. Fail without a power action or
+        another submission, retaining the component identities in the error.
+
+        :param node: the Ironic node object
+        :returns: True if a migration was performed, False otherwise
+        """
+        info = node.driver_internal_info
+        if info.get(FIRMWARE_UPDATE_STATE):
+            return False
+        settings = info.get(LEGACY_UPDATES)
+        if not settings:
+            return False
+
+        now = str(timeutils.utcnow().isoformat())
+        state = {
+            'version': STATE_VERSION,
+            'state': STATE_RECOVERY_REQUIRED,
+            'entered_at': now,
+            'started_at': info.get(LEGACY_START_TIME) or now,
+            'settings': settings,
+            'cleanup': info.get(STAGED_CLEANUP),
+            'grouping': False,
+            'segment': {'length': len(settings), 'current': None,
+                        'batched': False},
+            'reboot_time': None,
+            'bmc': None,
+            'verify': None,
+        }
+
+        LOG.warning('A firmware update was in flight on node %(node)s '
+                    'across the upgrade to the %(key)s '
+                    'driver_internal_info entry. It is not resumed where '
+                    'it left off: operator recovery is required because '
+                    'application of all requested images cannot be proven.',
+                    {'node': node.uuid, 'key': FIRMWARE_UPDATE_STATE})
+        node.set_driver_internal_info(FIRMWARE_UPDATE_STATE, state)
+        for key in LEGACY_KEYS:
+            node.del_driver_internal_info(key)
+        node.save()
+        return True
+
+    def _handle_recovery_required(self, task, state, update_service):
+        components = ', '.join(entry.get('component', 'unknown')
+                               for entry in state.get('settings', []))
+        self._fail(task, state, _(
+            'Cannot safely resume a legacy firmware update for %(components)s '
+            'on node %(node)s. Inspect pending BMC tasks/jobs, remove staged '
+            'images if appropriate, and retry the update after recovery.') % {
+                'components': components, 'node': task.node.uuid}, note=False)
 
     @METRICS.timer('RedfishFirmware._query_update_failed')
     @periodics.node_periodic(
@@ -995,11 +1452,17 @@ class RedfishFirmware(base.FirmwareInterface):
         filters={'reserved': False, 'provision_state_in': [states.CLEANFAIL,
                  states.DEPLOYFAIL, states.SERVICEFAIL], 'maintenance': True},
         predicate_extra_fields=['driver_internal_info'],
-        predicate=lambda n: n.driver_internal_info.get('redfish_fw_updates'),
+        predicate=lambda n: (n.driver_internal_info.get(FIRMWARE_UPDATE_STATE)
+                             or n.driver_internal_info.get(LEGACY_UPDATES)),
     )
     def _query_update_failed(self, task, manager, context):
 
         """Periodic job to check for failed firmware updates."""
+        task.upgrade_lock()
+        if (task.node.provision_state not in (
+                states.CLEANFAIL, states.DEPLOYFAIL, states.SERVICEFAIL)
+                or not task.node.maintenance):
+            return
         # A firmware update failed. Discard any remaining firmware
         # updates so when the user takes the node out of
         # maintenance mode, pending firmware updates do not
@@ -1008,7 +1471,6 @@ class RedfishFirmware(base.FirmwareInterface):
                   'Discarding remaining firmware updates.',
                   {'node': task.node.uuid})
 
-        task.upgrade_lock()
         self._clear_updates(task.node)
 
     @METRICS.timer('RedfishFirmware._query_update_status')
@@ -1018,78 +1480,67 @@ class RedfishFirmware(base.FirmwareInterface):
         filters={'reserved': False, 'provision_state_in': [states.CLEANWAIT,
                  states.DEPLOYWAIT, states.SERVICEWAIT]},
         predicate_extra_fields=['driver_internal_info'],
-        predicate=lambda n: n.driver_internal_info.get('redfish_fw_updates'),
+        predicate=lambda n: (n.driver_internal_info.get(FIRMWARE_UPDATE_STATE)
+                             or n.driver_internal_info.get(LEGACY_UPDATES)),
     )
     def _query_update_status(self, task, manager, context):
         """Periodic job to check firmware update tasks."""
+        # The database selection can be stale by the time the lock is acquired.
+        task.upgrade_lock()
+        if task.node.provision_state not in (
+                states.CLEANWAIT, states.DEPLOYWAIT, states.SERVICEWAIT):
+            return
         self._check_node_redfish_firmware_update(task)
 
-    def _handle_task_completion(self, task, sushy_task, messages,
-                                update_service, settings, current_update):
+    def _task_messages(self, sushy_task):
+        """Collect the human-readable messages of a Redfish task.
+
+        :param sushy_task: the sushy task object
+        :returns: a list of message strings, possibly empty
+        """
+        messages = []
+        if sushy_task.messages and not sushy_task.messages[0].message:
+            sushy_task.parse_messages()
+
+        if sushy_task.messages is not None:
+            for m in sushy_task.messages:
+                msg = m.message
+                if not msg or msg.lower() in ['unknown', 'unknown error']:
+                    msg = m.message_id
+                if msg:
+                    messages.append(msg)
+        return messages
+
+    def _handle_task_completion(self, task, state, sushy_task, messages,
+                                update_service):
         """Handle firmware update task completion.
 
         :param task: a TaskManager instance
+        :param state: the state object
         :param sushy_task: the sushy task object
         :param messages: list of task messages
         :param update_service: the sushy firmware update service
-        :param settings: firmware update settings
-        :param current_update: the current firmware update being processed
         """
         node = task.node
+        current_update = state['settings'][0]
 
         if (sushy_task.task_state == sushy.TASK_STATE_COMPLETED
                 and sushy_task.task_status in
                 [sushy.HEALTH_OK, sushy.HEALTH_WARNING]):
+            current_update['task_success'] = True
             LOG.debug('Redfish task completed for node %(node)s, '
                       'firmware %(firmware_image)s: %(messages)s.',
                       {'node': node.uuid,
                        'firmware_image': current_update['url'],
                        'messages': ", ".join(messages)})
 
-            # Component-specific post-update handling
             component = current_update.get('component', '')
             component_type = redfish_utils.get_component_type(component)
 
             if component_type == redfish_utils.BMC:
-                # BMC: Start version checking instead of immediate reboot
-                self._handle_bmc_update_completion(
-                    task, update_service, settings, current_update)
-            elif component_type == redfish_utils.NIC:
-                # NIC: Handle completion with appropriate reboot behavior
-                self._handle_nic_update_completion(
-                    task, update_service, settings, current_update)
-            elif component_type == redfish_utils.BIOS:
-                # BIOS: Check if reboot was actually triggered
-                # Some BMCs (e.g., HPE iLO) complete the BIOS firmware task
-                # very quickly (staging the firmware) before Ironic can poll
-                # and trigger the reboot. In this case, we need to trigger
-                # the reboot now to actually apply the firmware.
-                if not current_update.get(BIOS_REBOOT_TRIGGERED):
-                    LOG.info('BIOS firmware update task completed for node '
-                             '%(node)s but reboot was not triggered yet. '
-                             'Triggering reboot now to apply staged firmware.',
-                             {'node': node.uuid})
-                    current_update[BIOS_REBOOT_TRIGGERED] = True
-                    node.set_driver_internal_info('redfish_fw_updates',
-                                                  settings)
-                    node.save()
-                    power_timeout = current_update.get('power_timeout', 0)
-                    manager_utils.node_power_action(task, states.REBOOT,
-                                                    power_timeout)
-                    return
-                else:
-                    # Reboot was already triggered when task started,
-                    # just continue with next update
-                    LOG.info('BIOS firmware update task completed for node '
-                             '%(node)s. System was already rebooted. '
-                             'Proceeding with continuation.',
-                             {'node': node.uuid})
-                    # Clean up the reboot trigger flag
-                    current_update.pop(BIOS_REBOOT_TRIGGERED, None)
-                    self._continue_updates(task, update_service, settings)
+                self._bmc_update_completion(task, state, update_service)
             else:
-                # Default: continue as before
-                self._continue_updates(task, update_service, settings)
+                self._continue_after_bmc(task, state, update_service)
         else:
             error_msg = (_('Firmware update failed for node %(node)s, '
                            'firmware %(firmware_image)s. '
@@ -1098,343 +1549,11 @@ class RedfishFirmware(base.FirmwareInterface):
                           'firmware_image': current_update['url'],
                           'errors': ",  ".join(messages)})
 
-            self._clear_updates(node)
-            self._report_step_error(task, error_msg)
+            self._fail(task, state, error_msg, note=False, traceback=True)
 
-    def _handle_nic_task_starting(self, task, task_monitor, settings,
-                                  current_update):
-        """Handle NIC firmware update task when it starts.
-
-        NIC firmware behavior varies by hardware:
-        - Some NICs need reboot to START applying (task stays at Starting)
-        - Some NICs can start immediately but need reboot to APPLY (goes to
-          Running, then needs reboot after completion)
-
-        This method waits for the configured time
-        (CONF.redfish.firmware_update_nic_starting_wait) to determine which
-        type:
-        - If still Starting after wait time → trigger reboot to start
-        - If moves to Running → let it finish, reboot will happen after
-          completion
-
-        :param task: a TaskManager instance
-        :param task_monitor: the sushy task monitor
-        :param settings: firmware update settings
-        :param current_update: the current firmware update being processed
-        :returns: True if should stop polling, False to continue
-        """
-        # Upgrade lock at the start since we may modify driver_internal_info
-        task.upgrade_lock()
-        node = task.node
-
-        try:
-            sushy_task = task_monitor.get_task()
-            task_state = sushy_task.task_state
-
-            LOG.debug('NIC update task state for node %(node)s: %(state)s',
-                      {'node': node.uuid, 'state': task_state})
-
-            # If task is Running, mark that reboot will be needed after
-            # completion and let it continue
-            if task_state == sushy.TASK_STATE_RUNNING:
-                LOG.debug('NIC update task for node %(node)s is running. '
-                          'Will wait for completion then reboot.',
-                          {'node': node.uuid})
-                # Clear flags since we're past the starting phase
-                current_update.pop(NIC_STARTING_TIMESTAMP, None)
-                current_update.pop(NIC_REBOOT_TRIGGERED, None)
-                # Mark that reboot will be needed after completion
-                current_update[NIC_NEEDS_POST_COMPLETION_REBOOT] = True
-                node.set_driver_internal_info('redfish_fw_updates', settings)
-                node.save()
-                return False  # Continue polling until completion
-
-            # If task is in STARTING, check if we need to wait or reboot
-            if task_state == sushy.TASK_STATE_STARTING:
-                # Check if we already triggered a reboot
-                if current_update.get(NIC_REBOOT_TRIGGERED):
-                    LOG.debug('NIC firmware update for node %(node)s: '
-                              'reboot already triggered, waiting for task '
-                              'to progress.', {'node': node.uuid})
-                    return False  # Continue polling
-
-                starting_time = current_update.get(NIC_STARTING_TIMESTAMP)
-
-                if not starting_time:
-                    # First time seeing STARTING - record timestamp
-                    current_update[NIC_STARTING_TIMESTAMP] = str(
-                        timeutils.utcnow().isoformat())
-                    node.set_driver_internal_info(
-                        'redfish_fw_updates', settings)
-                    node.save()
-                    LOG.debug('NIC firmware update task for node %(node)s '
-                              'is in STARTING state. Waiting to determine if '
-                              'reboot is needed to start update.',
-                              {'node': node.uuid})
-                    return False  # Keep polling
-
-                # Check if configured wait time has elapsed
-                start_time = timeutils.parse_isotime(starting_time)
-                elapsed = timeutils.utcnow(True) - start_time
-                nic_starting_wait = (
-                    CONF.redfish.firmware_update_nic_starting_wait)
-
-                if elapsed.seconds < nic_starting_wait:
-                    # Still within wait window, keep waiting
-                    LOG.debug('NIC update for node %(node)s still in '
-                              'STARTING after %(elapsed)s seconds. '
-                              'Waiting...',
-                              {'node': node.uuid,
-                               'elapsed': elapsed.seconds})
-                    return False  # Keep polling
-
-                # Wait time elapsed and still STARTING - need reboot to start
-                LOG.info('NIC firmware update task for node %(node)s '
-                         'remained in STARTING state for %(wait)s+ seconds. '
-                         'Hardware requires reboot to start update. '
-                         'Triggering reboot.',
-                         {'node': node.uuid, 'wait': nic_starting_wait})
-
-                # Mark that we triggered a reboot to prevent repeat reboots
-                current_update[NIC_REBOOT_TRIGGERED] = True
-                # Clean up timestamp
-                current_update.pop(NIC_STARTING_TIMESTAMP, None)
-                node.set_driver_internal_info('redfish_fw_updates', settings)
-                node.save()
-
-                # Trigger the reboot to start update
-                power_timeout = current_update.get('power_timeout', 0)
-                manager_utils.node_power_action(task, states.REBOOT,
-                                                power_timeout)
-
-                LOG.info('Reboot initiated for node %(node)s to start '
-                         'NIC firmware update', {'node': node.uuid})
-                return True  # Stop polling, reboot triggered
-
-        except Exception as e:
-            LOG.warning('Unable to check NIC task state for node '
-                        '%(node)s: %(error)s. Will retry.',
-                        {'node': node.uuid, 'error': e})
-
-        return False  # Continue polling on error
-
-    def _handle_bios_task_starting(self, task, task_monitor, settings,
-                                   current_update):
-        """Handle BIOS firmware update task when it starts.
-
-        BIOS updates require a reboot to apply the firmware, so we trigger
-        the reboot as soon as the update task reaches STARTING state rather
-        than waiting for task completion.
-
-        :param task: a TaskManager instance
-        :param task_monitor: the sushy task monitor
-        :param settings: firmware update settings
-        :param current_update: the current firmware update being processed
-        :returns: True if reboot was triggered, False otherwise
-        """
-        if current_update.get(BIOS_REBOOT_TRIGGERED):
-            # Already triggered, just keep polling
-            return False
-
-        # Upgrade lock at the start since we may modify driver_internal_info
-        task.upgrade_lock()
-        node = task.node
-
-        try:
-            sushy_task = task_monitor.get_task()
-            LOG.debug('BIOS update task state for node %(node)s: '
-                      '%(state)s',
-                      {'node': node.uuid,
-                       'state': sushy_task.task_state})
-
-            # Check if task has started (STARTING state or beyond)
-            # TaskState can be: New, Starting, Running, Suspended,
-            # Interrupted, Pending, Stopping, Completed, Killed,
-            # Exception, Service, Cancelling, Cancelled
-            if sushy_task.task_state in [sushy.TASK_STATE_STARTING,
-                                         sushy.TASK_STATE_RUNNING,
-                                         sushy.TASK_STATE_PENDING]:
-                LOG.info('BIOS firmware update task has started for '
-                         'node %(node)s (state: %(state)s). '
-                         'Triggering reboot to apply update.',
-                         {'node': node.uuid,
-                          'state': sushy_task.task_state})
-
-                # Mark reboot as triggered to avoid repeated reboots
-                current_update[BIOS_REBOOT_TRIGGERED] = True
-                node.set_driver_internal_info(
-                    'redfish_fw_updates', settings)
-                node.save()
-
-                # Trigger the reboot
-                power_timeout = current_update.get('power_timeout', 0)
-                manager_utils.node_power_action(task, states.REBOOT,
-                                                power_timeout)
-
-                LOG.info('Reboot initiated for node %(node)s to apply '
-                         'BIOS firmware update',
-                         {'node': node.uuid})
-                return True
-        except Exception as e:
-            LOG.warning('Unable to check BIOS task state for node '
-                        '%(node)s: %(error)s. Will retry.',
-                        {'node': node.uuid, 'error': e})
-
-        return False
-
-    def _check_bmc_scheduled_firmware_update(self, task, current_update):
-        """Check if the BMC has a scheduled job for this firmware update.
-
-        Delegates to vendor-specific helpers when available.
-        Currently only Dell iDRAC is supported via
-        ``drac.firmware.check_scheduled_idrac_job``.
-
-        :param task: a TaskManager instance
-        :param current_update: the current firmware update being processed
-        :returns: True if a matching scheduled job was found, False if
-            no matching job exists, None if this check is not supported
-        """
-        vendor = task.node.properties.get('vendor', '')
-        if vendor and 'Dell' in vendor.split():
-            return drac_fw.check_scheduled_idrac_job(task, current_update)
-        return None
-
-    def _handle_bios_task_monitor_disappeared(self, task, node,
-                                              current_update,
-                                              update_service, settings):
-        """Handle BIOS firmware update when the TaskMonitor has disappeared.
-
-        When the Redfish TaskMonitor returns 404, the BMC has purged the
-        task. This can mean either:
-
-        1. Staging succeeded and a scheduled job is waiting for reboot
-        2. The firmware download failed and the job was cleaned up
-
-        Calls _check_bmc_scheduled_firmware_update to distinguish these
-        cases. Vendor-specific subclasses can override that method to
-        query the BMC job queue. When the check is not supported
-        (returns None), falls back to triggering a reboot
-        unconditionally.
-
-        :param task: a TaskManager instance
-        :param node: an Ironic node object
-        :param current_update: the current firmware update being processed
-        :param update_service: the sushy firmware update service
-        :param settings: firmware update settings
-        """
-        has_job = self._check_bmc_scheduled_firmware_update(
-            task, current_update)
-        task.upgrade_lock()
-
-        if has_job is None:
-            LOG.info('BIOS firmware update task disappeared for node '
-                     '%(node)s. BMC scheduled job check not supported; '
-                     'assuming staging succeeded and triggering reboot.',
-                     {'node': node.uuid})
-        elif not has_job:
-            error_msg = (
-                _('Firmware update failed for node %(node)s, '
-                  'firmware %(firmware_image)s. The BMC task '
-                  'disappeared and no scheduled job was found, '
-                  'indicating the firmware download or staging '
-                  'failed.') %
-                {'node': node.uuid,
-                 'firmware_image': current_update['url']})
-            self._clear_updates(node)
-            if task.node.clean_step:
-                manager_utils.cleaning_error_handler(task, error_msg)
-            elif task.node.deploy_step:
-                manager_utils.deploying_error_handler(task, error_msg)
-            elif task.node.service_step:
-                manager_utils.servicing_error_handler(task, error_msg)
-            return
-        else:
-            LOG.info('BIOS firmware update task disappeared for node '
-                     '%(node)s. Scheduled job confirmed, triggering '
-                     'reboot to apply staged firmware.',
-                     {'node': node.uuid})
-        current_update[BIOS_REBOOT_TRIGGERED] = True
-        node.set_driver_internal_info('redfish_fw_updates', settings)
-        node.save()
-        power_timeout = current_update.get('power_timeout', 0)
-        manager_utils.node_power_action(task, states.REBOOT,
-                                        power_timeout)
-
-    def _handle_wait_completion(self, task, update_service, settings,
-                                current_update):
-        """Handle firmware update wait completion.
-
-        :param task: a TaskManager instance
-        :param update_service: the sushy firmware update service
-        :param settings: firmware update settings
-        :param current_update: the current firmware update being processed
-        """
-        # Upgrade lock at the start since we may modify driver_internal_info
-        task.upgrade_lock()
-        node = task.node
-
-        # Check if this is BMC version checking
-        if current_update.get('bmc_version_checking'):
-            current_update.pop('bmc_version_checking', None)
-            node.set_driver_internal_info(
-                'redfish_fw_updates', settings)
-            node.save()
-            # Continue BMC version checking
-            self._handle_bmc_update_completion(
-                task, update_service, settings, current_update)
-        elif current_update.get('component_type') == redfish_utils.BMC:
-            # BMC update wait expired - check if task is still running
-            # before transitioning to version checking
-            task_still_running = False
-            try:
-                task_monitor = redfish_utils.get_task_monitor(
-                    node, current_update['task_monitor'])
-                if task_monitor.is_processing:
-                    task_still_running = True
-                    LOG.debug('BMC firmware update wait expired but task '
-                              ' still processing for node %(node)s. '
-                              'Continuing to monitor task completion.',
-                              {'node': node.uuid})
-            except exception.RedfishConnectionError as e:
-                LOG.debug('Unable to communicate with task monitor for node '
-                          '%(node)s during wait completion: %(error)s. '
-                          'BMC may be resetting, will transition to version '
-                          'checking.', {'node': node.uuid, 'error': e})
-            except exception.RedfishError as e:
-                LOG.debug('Task monitor unavailable for node %(node)s: '
-                          '%(error)s. Task may have completed, transitioning '
-                          'to version checking.',
-                          {'node': node.uuid, 'error': e})
-
-            if task_still_running:
-                # Task is still running, continue to monitor task completion
-                # Don't transition to version checking yet.
-                node.set_driver_internal_info('redfish_fw_updates', settings)
-                node.save()
-                return
-
-            # Task completed, deleted or BMC unavailable
-            # Transition to version checking
-            LOG.info('BMC firmware update wait expired for node %(node)s. '
-                     'Task completed or unavailable. Transitioning to version '
-                     'checking mode.',
-                     {'node': node.uuid})
-            self._handle_bmc_update_completion(
-                task, update_service, settings, current_update)
-        else:
-            # Regular wait completion - mark reboot needed if this is the
-            # last update. Note: BIOS components reboot immediately when
-            # task starts, so they won't use this path.
-            if len(settings) == 1:
-                component = current_update.get('component', '')
-                component_type = redfish_utils.get_component_type(component)
-                # For default/unknown components, reboot may be needed
-                if component_type is None:
-                    node.set_driver_internal_info(
-                        FIRMWARE_REBOOT_REQUESTED, True)
-                    node.save()
-            # Continue with updates
-            self._continue_updates(task, update_service, settings)
+    def _bmc_wait_completed(self, task, state, update_service):
+        """Poll task outcomes before accepting version-based completion."""
+        return self._poll_bmc_update_task(task, state, update_service)
 
     def _check_overall_timeout(self, task):
         """Check if firmware update has exceeded overall timeout.
@@ -1448,8 +1567,8 @@ class RedfishFirmware(base.FirmwareInterface):
         if overall_timeout <= 0:
             return False
 
-        start_time_str = node.driver_internal_info.get(
-            'redfish_fw_update_start_time')
+        state = node.driver_internal_info.get(FIRMWARE_UPDATE_STATE) or {}
+        start_time_str = state.get('started_at')
         if not start_time_str:
             return False
 
@@ -1466,20 +1585,208 @@ class RedfishFirmware(base.FirmwareInterface):
                   'elapsed': int(elapsed.total_seconds())})
         LOG.error(msg)
         task.upgrade_lock()
-        self._clear_updates(node)
-        self._report_step_error(task, msg, traceback=False)
+        self._fail(task, state, msg)
         return True
 
-    def _handle_firmware_update_task(self, task, node, current_update,
-                                     update_service, settings):
-        """Handle the firmware update task monitoring and completion.
+    def _run_lc_job_gate(self, task, state, timed_out):
+        """Run the Dell LC job gate.
+
+        Skipped (treated as passed) on non-Dell nodes, and on Dell nodes
+        whose job collection is unavailable. Otherwise the gate holds
+        the phase until the LC job(s) applying the firmware are
+        terminal.
+
+        :param task: a TaskManager instance.
+        :param state: the state object.
+        :param timed_out: whether the verify phase timeout has elapsed.
+        :returns: True if the caller should stop and return (the step
+            failed, or another poll is needed); False if the phase
+            should proceed to the BootProgress gate.
+        """
+        node = task.node
+        verify = state.get('verify')
+        if not redfish_utils.is_dell_node(node):
+            if verify is not None:
+                verify['lc'] = _VERIFY_SKIPPED
+            return False
+
+        timeout = CONF.redfish.firmware_update_post_reboot_verify_timeout
+        jids = list(dict.fromkeys(self._segment_jids(state)
+                                  + (verify['jids'] if verify else [])))
+        status, detail = drac_fw.check_lc_jobs(
+            task, jids, state['segment'].get('jobs'), required=True)
+        state['last_error'] = detail
+        if status == drac_fw.LC_JOBS_ERROR:
+            msg = (_('Firmware update on node %(node)s failed: the '
+                     'Dell Lifecycle Controller reported an error '
+                     'applying firmware: %(detail)s')
+                   % {'node': node.uuid, 'detail': detail})
+            LOG.error(msg)
+            self._fail(task, state, msg)
+            return True
+        if status == drac_fw.LC_JOBS_RUNNING:
+            if timed_out:
+                msg = (_('Firmware update on node %(node)s was '
+                         'rebooted to apply firmware, but the Dell '
+                         'Lifecycle Controller job(s) %(jids)s did '
+                         'not finish within %(timeout)s seconds. '
+                         'The node may still be applying firmware '
+                         'during POST and must not be power-cycled '
+                         'until the Lifecycle Controller job '
+                         'finishes.')
+                       % {'node': node.uuid,
+                           'jids': ', '.join(jids),
+                          'timeout': timeout})
+                LOG.error(msg)
+                self._fail(task, state, msg)
+                return True
+            LOG.debug('Dell Lifecycle Controller job(s) %(jids)s '
+                      'still running for node %(node)s. Will check '
+                      'again on next poll.',
+                      {'jids': jids, 'node': node.uuid})
+            self._persist(node, state)
+            return True
+        if status == drac_fw.LC_JOBS_UNAVAILABLE:
+            LOG.warning('Cannot verify Dell Lifecycle Controller '
+                        'job(s) for node %(node)s: %(detail)s. '
+                        'Skipping the LC job gate.',
+                        {'node': node.uuid, 'detail': detail})
+            if verify is not None:
+                verify['lc'] = _VERIFY_SKIPPED
+        else:
+            LOG.info('Dell Lifecycle Controller job(s) %(jids)s '
+                     'finished for node %(node)s.',
+                     {'jids': jids, 'node': node.uuid})
+            if verify is not None:
+                verify['lc'] = _VERIFY_PASSED
+        return False
+
+    def _os_running_wait_elapsed(self, state):
+        """Whether the bounded wait for OSRunning is over.
+
+        Measured from the first observation of a booted-OS state, not
+        from the reboot: the node may have spent most of the phase
+        applying firmware during POST before the OS started at all.
+        Records that first observation as the deadline's anchor.
+
+        :param state: the state object, whose verify state is updated
+            in place with ``os_boot_started_at`` on the first call.
+        :returns: True if the caller should stop waiting for OSRunning
+            and proceed, False if it should keep polling.
+        """
+        elapsed, limit = self._deadline_elapsed(state,
+                                                *_OS_RUNNING_DEADLINE)
+        if limit <= 0:
+            return True
+        if elapsed is None:
+            state['verify']['os_boot_started_at'] = str(
+                timeutils.utcnow().isoformat())
+            return False
+        return elapsed.total_seconds() >= limit
+
+    def _run_boot_progress_gate(self, task, state, timed_out):
+        """Require new-boot readiness; only absent telemetry uses a timer."""
+        node = task.node
+        verify = state['verify']
+        observed = self._sample_reboot(node, state)
+        state['last_error'] = 'boot: %s, power: %s' % (
+            observed['state'], observed['power'])
+        if timed_out:
+            raise exception.FirmwareUpdateFailed(error=_(
+                'Timed out waiting for firmware reboot recovery on node '
+                '%(node)s; %(status)s') % {
+                    'node': node.uuid, 'status': state['last_error']})
+        elapsed = self._seconds_since(state['reboot_time'])
+        if (observed['power'] != 'On'
+                or elapsed < CONF.redfish.firmware_update_reboot_min_wait):
+            return True
+        limited = node.driver_info.get(
+            'firmware_update_boot_progress', 'auto') == 'limited'
+        if limited or not verify.get('progress_supported'):
+            before = verify.get('before') or {}
+            if ((before.get('reset') or before.get('state_time'))
+                    and not verify['new_boot_observed']):
+                return True
+            if elapsed < CONF.redfish.firmware_update_boot_check_delay:
+                return True
+            verify['boot'] = _VERIFY_SKIPPED
+            return False
+        targets = {target.value for target in
+                   redfish_utils.get_boot_progress_targets(node)}
+        if (verify['new_boot_observed'] and observed['state'] in targets):
+            verify['boot'] = _VERIFY_PASSED
+            return False
+        if (node.service_step and verify['new_boot_observed']
+                and observed['state'] in {
+                    item.value for item in
+                    redfish_utils.BOOT_PROGRESS_POST_COMPLETE}
+                and CONF.redfish.firmware_update_os_running_timeout > 0
+                and self._os_running_wait_elapsed(state)):
+            raise exception.FirmwareUpdateFailed(error=_(
+                'The host completed POST but did not report OSRunning within '
+                'firmware_update_os_running_timeout. Configure limited boot '
+                'progress only if this platform is known not to report it.'))
+        return True
+
+    def _finish_segment(self, task, state):
+        """Complete the current segment and hand off if more remain.
+
+        Drops the completed segment's components from the settings. If
+        more components remain, hands off to :meth:`_start_next_segment`
+        for the next segment (which might be a BMC update or another
+        batch). Inventory has already been verified by the caller. Persist
+        the next segment's start as a declared phase before submitting it.
 
         :param task: a TaskManager instance
-        :param node: an Ironic node object
-        :param current_update: the current firmware update being processed
-        :param update_service: the sushy firmware update service
-        :param settings: firmware update settings
+        :param state: the state object
         """
+        node = task.node
+        settings = state['settings']
+        segment = state['segment'] or {}
+        run_length = segment.get('length', 0)
+
+        if segment.get('batched'):
+            LOG.info('Batch segment of %(count)d components completed for '
+                     'node %(node)s.',
+                     {'count': run_length, 'node': node.uuid})
+
+        del settings[:run_length]
+        state['segment'] = None
+        state['reboot_time'] = None
+        state['verify'] = None
+        state['bmc'] = None
+
+        if settings:
+            LOG.info('%(remaining)d components remaining for node %(node)s. '
+                     'Continuing with next segment.',
+                     {'remaining': len(settings), 'node': node.uuid})
+            return STATE_STARTING
+
+        self._clear_updates(node)
+        LOG.info('Firmware updates completed for node %(node)s',
+                 {'node': node.uuid})
+        self._resume_step(task)
+        return None
+
+    def _poll_bmc_update_task(self, task, state, update_service):
+        """Poll the Redfish task of a BMC component being applied.
+
+        :param task: a TaskManager instance
+        :param state: the state object
+        :param update_service: the sushy firmware update service
+        :returns: None; this either stays in ``waiting_bmc`` or moves the
+            update on through a nested call
+        """
+        node = task.node
+        current_update = state['settings'][0]
+
+        if not current_update.get('task_monitor'):
+            if current_update.get('submitted'):
+                return self._bmc_update_completion(task, state, update_service)
+            raise exception.FirmwareUpdateFailed(error=_(
+                'BMC submission outcome is unknown; inspect the BMC jobs '
+                'before retrying the update.'))
+
         try:
             task_monitor = redfish_utils.get_task_monitor(
                 node, current_update['task_monitor'])
@@ -1490,34 +1797,29 @@ class RedfishFirmware(base.FirmwareInterface):
                         'on node %(node)s. Will try again on the next poll. '
                         'Error: %(error)s',
                         {'node': node.uuid, 'error': e})
-            return
-        except exception.RedfishError:
-            # The BMC deleted the Task before we could query it
-            LOG.warning('Firmware update completed for node %(node)s, '
-                        'firmware %(firmware_image)s, but success of the '
-                        'update is unknown.  Assuming update was successful.',
+            return None
+        except (exception.RedfishTaskMonitorNotFound,
+                sushy.exceptions.ResourceNotFoundError):
+            LOG.warning('Firmware task disappeared for node %(node)s, '
+                        'firmware %(firmware_image)s; checking completion '
+                        'evidence.',
                         {'node': node.uuid,
                          'firmware_image': current_update['url']})
-            component = current_update.get('component', '')
-            component_type = redfish_utils.get_component_type(component)
-            if (component_type == redfish_utils.BIOS
-                    and not current_update.get(BIOS_REBOOT_TRIGGERED)):
-                self._handle_bios_task_monitor_disappeared(
-                    task, node, current_update, update_service, settings)
-                return
-            self._continue_updates(task, update_service, settings)
-            return
+            self._bmc_update_completion(task, state, update_service)
+            return None
 
         try:
             # The last response does not necessarily contain a Task,
             # so get it
             sushy_task = task_monitor.get_task()
             task_state = sushy_task.task_state
+        except sushy.exceptions.ResourceNotFoundError:
+            return self._bmc_update_completion(task, state, update_service)
         except Exception as e:
             LOG.warning('Unable to get task for node %(node)s: %(error)s. '
                         'Will retry on next poll.',
                         {'node': node.uuid, 'error': e})
-            return
+            return None
 
         # Check if task is in a terminal state (completed, failed, etc.)
         # If so, proceed directly to completion handling
@@ -1533,131 +1835,555 @@ class RedfishFirmware(base.FirmwareInterface):
 
             # Only parse the messages if the BMC did not return parsed
             # messages
-            messages = []
-            if sushy_task.messages and not sushy_task.messages[0].message:
-                sushy_task.parse_messages()
+            messages = self._task_messages(sushy_task)
 
-            if sushy_task.messages is not None:
-                for m in sushy_task.messages:
-                    msg = m.message
-                    if not msg or msg.lower() in ['unknown', 'unknown error']:
-                        msg = m.message_id
-                    if msg:
-                        messages.append(msg)
+            self._handle_task_completion(task, state, sushy_task, messages,
+                                         update_service)
+            return None
 
-            self._handle_task_completion(task, sushy_task, messages,
-                                         update_service, settings,
-                                         current_update)
-            return
-
-        # Task is still in progress (NEW, RUNNING, STARTING, or PENDING)
-        # Special handling for BIOS and NIC updates
-        component = current_update.get('component', '')
-        component_type = redfish_utils.get_component_type(component)
-
-        if component_type == redfish_utils.BIOS:
-            # For BIOS, check if task has reached STARTING state
-            # and trigger reboot immediately
-            if self._handle_bios_task_starting(task, task_monitor, settings,
-                                               current_update):
-                return  # Reboot triggered, done
-            # Task is still processing, keep polling
-            return
-
-        if component_type == redfish_utils.NIC:
-            # For NIC, wait 30s to see if hardware needs reboot
-            if self._handle_nic_task_starting(task, task_monitor, settings,
-                                              current_update):
-                return  # Reboot triggered, done
-            # Task is still processing (or waiting), keep polling
-            return
-
-        # For other component types, just log and keep polling
         LOG.debug('Firmware update in progress for node %(node)s, '
                   'firmware %(firmware_image)s.',
                   {'node': node.uuid,
                    'firmware_image': current_update['url']})
+        return None
 
     @METRICS.timer('RedfishFirmware._check_node_redfish_firmware_update')
     def _check_node_redfish_firmware_update(self, task):
-        """Check the progress of running firmware update on a node."""
+        """Check the progress of running firmware update on a node.
+
+        Loads the state object, enforces the overall timeout, and then
+        runs the handler of the current state. A handler returns the
+        state to move to next, which is validated and applied by
+        :meth:`_transition` before that state's handler runs in turn, or
+        None when the update stays where it is until the next poll.
+
+        Per-state deadlines are declared in ``_STATE_TIMEOUTS`` and read
+        by the handlers through :meth:`_state_elapsed` and
+        :meth:`_state_timed_out`: unlike the overall timeout, expiry
+        does not mean the same thing in every state (a gate that must
+        now fail, a wait that is up), so each handler acts on its own
+        deadline.
+
+        :param task: a TaskManager instance
+        """
         # Upgrade the lock to ensure we are using the latest info from
         # the node.
         task.upgrade_lock()
         node = task.node
 
+        self._migrate_legacy_state(node)
+
         # Check overall timeout for firmware update operation
         if self._check_overall_timeout(task):
             return
 
-        settings = node.driver_internal_info['redfish_fw_updates']
-        current_update = settings[0]
+        state = node.driver_internal_info.get(FIRMWARE_UPDATE_STATE)
+        if not state:
+            return
+        if (state.get('version') != STATE_VERSION
+                or state.get('state') not in _STATE_HANDLERS):
+            self._fail(task, state, _(
+                'Unsupported firmware update state or schema version on node '
+                '%s. Inspect the BMC before recovering the update.')
+                % node.uuid, note=False)
+            return
+        if state['state'] == STATE_RECOVERY_REQUIRED:
+            self._handle_recovery_required(task, state, None)
+            return
+
+        segment = state.get('segment') or {}
+        anchor = segment.get('started_at') or state['entered_at']
+        segment_expired = (self._seconds_since(anchor)
+                           >= CONF.redfish.firmware_update_apply_timeout)
+        reboot_expired = (state['state'] in _REBOOTED_STATES
+                          and self._state_timed_out(state))
+        if segment_expired or reboot_expired:
+            components = ', '.join(
+                entry['component'] for entry in
+                state['settings'][:segment.get('length', 1)])
+            self._fail(task, state, _(
+                'Firmware update timed out in state %(phase)s for '
+                '%(components)s on node %(node)s. Last status: %(status)s; '
+                'LC jobs: %(jobs)s. Check firmware_update_apply_timeout and '
+                'firmware_update_post_reboot_verify_timeout before retrying.')
+                % {'phase': state['state'], 'components': components,
+                   'node': node.uuid, 'status': state.get('last_error'),
+                   'jobs': (state.get('verify') or {}).get('jids', [])})
+            return
+
+        # The driver's fixed deadlines own these waits, including outages.
+        # Agent callback timeouts must not race application monitoring.
+        node.touch_provisioning()
+        if state.get('verify') and state.get('reboot_time'):
+            try:
+                self._sample_reboot(node, state)
+            except (exception.RedfishError,
+                    sushy.exceptions.SushyError) as exc:
+                state['last_error'] = str(exc)
 
         try:
             update_service = redfish_utils.get_update_service(node)
-        except exception.RedfishConnectionError as e:
+        except (exception.RedfishError, sushy.exceptions.SushyError) as e:
             # If the BMC firmware is being updated, the BMC will be
             # unavailable for some amount of time.
             LOG.warning('Unable to communicate with firmware update service '
                         'on node %(node)s. Will try again on the next poll. '
                         'Error: %(error)s',
                         {'node': node.uuid, 'error': e})
+            state['last_error'] = str(e)
+            self._persist(node, state)
             return
 
-        # Check if BMC update just completed and node rebooted
-        # If so, continue with next component update
-        if current_update.get(BMC_UPDATE_COMPLETED):
-            LOG.info('BMC firmware update completed and node %(node)s has '
-                     'rebooted. Continuing with next component.',
-                     {'node': node.uuid})
-            current_update.pop(BMC_UPDATE_COMPLETED, None)
-            node.set_driver_internal_info('redfish_fw_updates', settings)
-            node.save()
+        # Bounded because every declared transition moves forward, so a
+        # single poll can visit each state at most once.
+        for _step in range(len(_STATE_HANDLERS)):
+            handler = getattr(self, _STATE_HANDLERS[state['state']])
+            try:
+                new_state = handler(task, state, update_service)
+            except exception.FirmwareUpdateFailed as exc:
+                self._fail(task, state, str(exc))
+                return
+            except (exception.RedfishError,
+                    sushy.exceptions.SushyError) as exc:
+                state['last_error'] = str(exc)
+                LOG.warning('Cannot monitor firmware update on node '
+                            '%(node)s in state %(state)s: %(error)s. '
+                            'Retrying on the next poll.',
+                            {'node': node.uuid, 'state': state['state'],
+                             'error': exc})
+                self._persist(node, state)
+                return
+            if new_state is None:
+                if (node.driver_internal_info.get(FIRMWARE_UPDATE_STATE)
+                        is state):
+                    self._persist(node, state)
+                return
+            self._transition(task, state, new_state)
 
-            self._continue_updates(task, update_service, settings)
+    def _handle_staging(self, task, state, update_service):
+        """Poll the component being staged and advance when it is staged.
+
+        :param task: a TaskManager instance
+        :param state: the state object
+        :param update_service: the sushy firmware update service
+        :returns: the next state, or None to stay in ``staging``
+        """
+        node = task.node
+        settings = state['settings']
+        current_idx = state['segment']['current']
+        fw_upd = settings[current_idx]
+        component = fw_upd.get('component', '')
+        monitor_uri = fw_upd.get('task_monitor')
+
+        if not monitor_uri and not fw_upd.get('submitted'):
+            self._fail(task, state, _(
+                'No task monitor was recorded for component %(component)s '
+                'on node %(node)s. Submission outcome is unknown; inspect '
+                'the BMC jobs before retrying.') % {
+                    'component': component, 'node': node.uuid})
+            return None
+        if fw_upd.get('staged'):
+            return self._advance_staging(task, state)
+        sushy_task = None
+        if monitor_uri:
+            try:
+                monitor = redfish_utils.get_task_monitor(node, monitor_uri)
+                sushy_task = monitor.get_task()
+            except (exception.RedfishTaskMonitorNotFound,
+                    sushy.exceptions.ResourceNotFoundError):
+                LOG.warning('Staging task disappeared for %(component)s on '
+                            'node %(node)s; checking available OEM evidence.',
+                            {'component': component, 'node': node.uuid})
+        if sushy_task is not None:
+            active = (sushy.TASK_STATE_NEW, sushy.TASK_STATE_PENDING,
+                      sushy.TASK_STATE_RUNNING, sushy.TASK_STATE_STARTING)
+            successful = (sushy_task.task_state == sushy.TASK_STATE_COMPLETED
+                          and sushy_task.task_status in (
+                              sushy.HEALTH_OK, sushy.HEALTH_WARNING))
+            if not successful and sushy_task.task_state not in active:
+                self._fail_component(task, state, fw_upd, sushy_task)
+                return None
+            if successful:
+                fw_upd['task_success'] = True
+        if self._staging_ready(task, state, fw_upd, sushy_task):
+            fw_upd['staged'] = True
+            return self._advance_staging(task, state)
+        return None
+
+    def _staging_ready(self, task, state, entry, sushy_task):
+        """Queue armed Dell jobs; otherwise wait for staging completion."""
+        if redfish_utils.is_dell_node(task.node):
+            tracking = state['segment'].get('jobs')
+            if tracking is None:
+                raise exception.FirmwareUpdateFailed(error=_(
+                    'Dell job baseline is missing; recover the update before '
+                    'submitting further firmware.'))
+            status, detail = drac_fw.check_staged_update(task, entry, tracking)
+            state['last_error'] = detail
+            if status == drac_fw.LC_JOBS_ERROR:
+                raise exception.FirmwareUpdateFailed(error=detail)
+            if status != drac_fw.LC_JOBS_UNAVAILABLE:
+                return status in (drac_fw.LC_JOBS_STAGED, drac_fw.LC_JOBS_DONE)
+        if self._positive_task_outcome(entry):
+            return True
+        if sushy_task is None:
+            state['last_error'] = (
+                'Unknown staging outcome for %s: task disappeared before '
+                'success was observed' % entry['component'])
+            return False
+        bios_compatibility = (
+            redfish_utils.get_component_type(entry['component'])
+            == redfish_utils.BIOS
+            and task.node.driver_info.get('firmware_update_bios_pending_reset')
+            == 'compatibility')
+        if (not state.get('grouping')
+                and (sushy_task.task_state == sushy.TASK_STATE_STARTING
+                     or (bios_compatibility and sushy_task.task_state in (
+                         sushy.TASK_STATE_PENDING,
+                         sushy.TASK_STATE_RUNNING)))):
+            # Preserve single-component updates that need a reset to start.
+            # Starting alone is insufficient evidence to queue another image.
+            started = entry.setdefault('starting_at',
+                                       timeutils.utcnow().isoformat())
+            return (self._seconds_since(started)
+                    >= CONF.redfish.firmware_update_nic_starting_wait)
+        return False
+
+    def _positive_task_outcome(self, entry):
+        """A missing monitor alone is never evidence of a successful update."""
+        return entry.get('synchronous') or entry.get('task_success')
+
+    def _recover_task_outcome(self, task, state, entry):
+        if self._positive_task_outcome(entry):
+            return True
+        if (redfish_utils.get_component_type(entry['component'])
+                == redfish_utils.BMC and entry.get('version_changed')):
+            return True
+        if redfish_utils.is_dell_node(task.node):
+            status, detail = drac_fw.check_lc_jobs(
+                task, entry.get('jids', []), state['segment'].get('jobs'),
+                required=True)
+            state['last_error'] = detail
+            if status == drac_fw.LC_JOBS_ERROR:
+                raise exception.FirmwareUpdateFailed(error=detail)
+            return status == drac_fw.LC_JOBS_DONE
+        state['last_error'] = (
+            'Unknown application outcome for %s: task disappeared before '
+            'success was observed' % entry['component'])
+        return False
+
+    def _advance_staging(self, task, state):
+        """Submit the next component, or reboot once all are staged.
+
+        :param task: a TaskManager instance
+        :param state: the state object
+        :returns: None; the consolidated reboot enters ``rebooting``
+            itself so that the poll ends with the reboot issued
+        """
+        node = task.node
+        settings = state['settings']
+        segment = state['segment']
+        next_idx = segment['current'] + 1
+        run_length = segment['length']
+
+        if next_idx >= run_length:
+            self._start_batched_reboot(task, state)
+            return None
+
+        try:
+            update_service = redfish_utils.get_update_service(node)
+        except exception.RedfishError as e:
+            error_msg = (
+                _('Failed to get update service for node %(node)s '
+                  'while advancing batch: %(error)s')
+                % {'node': node.uuid, 'error': e})
+            LOG.error(error_msg)
+            self._fail(task, state, error_msg, traceback=True)
+            return None
+
+        try:
+            # Persist intent before the POST. A lost response must not cause
+            # the same image to be submitted again on conductor restart.
+            if segment.get('jobs') is not None:
+                before = drac_fw.snapshot_lc_jobs(task)
+                if segment['jobs']['supported'] and not before['supported']:
+                    raise exception.RedfishError(error=_(
+                        'Previously supported Dell jobs are unavailable'))
+                settings[next_idx]['jobs_before'] = before['baseline']
+            segment['current'] = next_idx
+            self._persist(node, state)
+            self._submit_one_batched_component(
+                node, state, update_service, next_idx)
+        except Exception as e:
+            error_msg = (
+                _('Batched firmware submission failed at component '
+                  '%(component)s (%(idx)d/%(total)d) for node '
+                  '%(node)s. Error: %(error)s')
+                % {'component': settings[next_idx].get('component', ''),
+                   'idx': next_idx + 1, 'total': run_length,
+                   'node': node.uuid, 'error': e})
+            LOG.error(error_msg)
+            self._fail(task, state, error_msg, traceback=True)
+            return None
+
+        segment['current'] = next_idx
+        self._persist(node, state)
+        LOG.info('Submitted component %(idx)d/%(total)d for node '
+                 '%(node)s. Polling for staging completion.',
+                 {'idx': next_idx + 1, 'total': run_length,
+                  'node': node.uuid})
+        return None
+
+    def _start_batched_reboot(self, task, state):
+        """Issue the consolidated apply reboot for a staged segment.
+
+        :param task: a TaskManager instance
+        :param state: the state object
+        """
+        node = task.node
+        settings = state['settings']
+        segment = state['segment']
+        run_length = segment['length']
+        if not self._can_reboot_segment(task, state):
             return
 
-        # Touch provisioning to indicate progress is being monitored.
-        # This prevents heartbeat timeout from triggering for steps that
-        # don't require the ramdisk agent (requires_ramdisk=False).
-        # Note: Only touch after successful BMC communication to ensure
-        # the process eventually times out if the BMC is unresponsive.
-        node.touch_provisioning()
+        # Gather the JID set of the whole segment before the
+        # consolidated reboot: the applying state pops 'task_monitor'
+        # from each entry as its task completes, so this is the only
+        # opportunity to record them.
+        jids = self._segment_jids(state)
 
-        wait_start_time = current_update.get('wait_start_time')
-        if wait_start_time:
-            wait_start = timeutils.parse_isotime(wait_start_time)
+        state['verify'] = self._build_verify(jids)
+        self._prepare_reboot_observation(node, state)
+        segment['current'] = None
 
-            elapsed_time = timeutils.utcnow(True) - wait_start
-            if elapsed_time.seconds >= current_update['wait']:
-                LOG.debug('Finished waiting after firmware update '
-                          '%(firmware_image)s on node %(node)s. '
-                          'Elapsed time: %(seconds)s seconds',
-                          {'firmware_image': current_update['url'],
-                           'node': node.uuid,
-                           'seconds': elapsed_time.seconds})
-                current_update.pop('wait', None)
-                current_update.pop('wait_start_time', None)
+        LOG.info('All %(count)d batch components staged for node '
+                 '%(node)s. Triggering consolidated reboot.',
+                 {'count': run_length, 'node': node.uuid})
+        deploy_utils.set_async_step_flags(
+            node, reboot=True, polling=True)
+        self._transition(task, state, STATE_REBOOTING)
+        power_timeout = settings[0].get('power_timeout', 0)
+        manager_utils.node_power_action(task, states.REBOOT,
+                                        power_timeout)
 
-                # Handle wait completion
-                self._handle_wait_completion(
-                    task, update_service, settings, current_update)
-            else:
-                LOG.debug('Continuing to wait after firmware update '
-                          '%(firmware_image)s on node %(node)s. '
-                          'Elapsed time: %(seconds)s seconds',
-                          {'firmware_image': current_update['url'],
-                           'node': node.uuid,
-                           'seconds': elapsed_time.seconds})
+    def _handle_rebooting(self, task, state, update_service):
+        """Start polling the segment's tasks after the apply reboot.
 
-            return
+        The state is where the update sits between the reboot being
+        issued and the next poll: it anchors ``reboot_time``, which the
+        gates measure from, and records the transition.
 
-        # Handle firmware update task monitoring
-        self._handle_firmware_update_task(
-            task, node, current_update, update_service, settings)
+        :param task: a TaskManager instance
+        :param state: the state object
+        :param update_service: the sushy firmware update service
+        :returns: ``applying``
+        """
+        return STATE_APPLYING
 
-    def _stage_firmware_file(self, node, component_update):
+    def _handle_applying(self, task, state, update_service):
+        """Poll every task monitor of the segment until all are terminal.
 
+        :param task: a TaskManager instance
+        :param state: the state object
+        :param update_service: the sushy firmware update service
+        :returns: ``verifying_apply`` once every task is terminal, None
+            to stay
+        """
+        node = task.node
+        settings = state['settings']
+        run_length = state['segment']['length']
+        completed = 0
+        still_running = 0
+        polled = 0
+        offset = state['segment'].get('poll_index', 0)
+        indices = list(range(offset, run_length)) + list(range(offset))
+
+        for index in indices:
+            fw_upd = settings[index]
+            monitor_uri = fw_upd.get('task_monitor')
+            if not monitor_uri:
+                if self._recover_task_outcome(task, state, fw_upd):
+                    completed += 1
+                continue
+            if polled >= CONF.redfish.firmware_update_tasks_per_poll:
+                still_running += 1
+                continue
+            polled += 1
+            state['segment']['poll_index'] = (index + 1) % run_length
+
+            try:
+                task_monitor = redfish_utils.get_task_monitor(
+                    node, monitor_uri)
+                sushy_task = task_monitor.get_task()
+            except exception.RedfishConnectionError as e:
+                LOG.warning('Unable to reach task monitor for %(component)s '
+                            'on node %(node)s: %(error)s. Will retry.',
+                            {'component': fw_upd.get('component', ''),
+                             'node': node.uuid, 'error': e})
+                still_running += 1
+                break
+            except (exception.RedfishTaskMonitorNotFound,
+                    sushy.exceptions.ResourceNotFoundError):
+                if self._recover_task_outcome(task, state, fw_upd):
+                    fw_upd.pop('task_monitor', None)
+                    completed += 1
+                continue
+            except Exception as e:
+                LOG.warning('Unable to get task for %(component)s on node '
+                            '%(node)s: %(error)s. Will retry.',
+                            {'component': fw_upd.get('component', ''),
+                             'node': node.uuid, 'error': e})
+                state['last_error'] = str(e)
+                still_running += 1
+                break
+
+            # Active tasks must finish after the apply reset, even if a
+            # compatibility policy authorized that reset during staging.
+            if sushy_task.task_state in [sushy.TASK_STATE_NEW,
+                                         sushy.TASK_STATE_RUNNING,
+                                         sushy.TASK_STATE_STARTING,
+                                         sushy.TASK_STATE_PENDING]:
+                still_running += 1
+                continue
+
+            if (sushy_task.task_state == sushy.TASK_STATE_COMPLETED
+                    and sushy_task.task_status in
+                    [sushy.HEALTH_OK, sushy.HEALTH_WARNING]):
+                fw_upd['task_success'] = True
+                fw_upd.pop('task_monitor', None)
+                completed += 1
+                continue
+
+            self._fail_component(task, state, fw_upd, sushy_task)
+            return None
+
+        LOG.debug('Batched firmware update progress for node %(node)s: '
+                  '%(completed)d/%(total)d completed, '
+                  '%(running)d still running',
+                  {'node': node.uuid, 'completed': completed,
+                   'total': run_length, 'running': still_running})
+
+        if completed == run_length:
+            # Every task in this segment is terminal. Do not finish
+            # (cache firmware components and resume) until every
+            # available gate -- LC job, BootProgress -- passes for the
+            # whole segment.
+            return STATE_VERIFYING_APPLY
+
+        self._persist(node, state)
+        return None
+
+    def _handle_verifying_apply(self, task, state, update_service):
+        """Run the Dell LC job gate.
+
+        :param task: a TaskManager instance
+        :param state: the state object
+        :param update_service: the sushy firmware update service
+        :returns: ``verifying_boot`` once the gate passes, None to stay
+        """
+        if state['verify'] is None:
+            raise exception.FirmwareUpdateFailed(error=_(
+                'Firmware application evidence is missing. Inspect BMC '
+                'jobs before recovering this interrupted update.'))
+
+        if self._run_lc_job_gate(task, state, self._state_timed_out(state)):
+            return None
+        return STATE_VERIFYING_BOOT
+
+    def _handle_verifying_boot(self, task, state, update_service):
+        """Run the BootProgress gate, then finish the segment.
+
+        :param task: a TaskManager instance
+        :param state: the state object
+        :param update_service: the sushy firmware update service
+        :returns: None; the segment either finishes the step or starts
+            the next segment itself
+        """
+        if self._run_boot_progress_gate(task, state,
+                                        self._state_timed_out(state)):
+            return None
+        return STATE_VERIFYING_INVENTORY
+
+    def _handle_waiting_bmc(self, task, state, update_service):
+        """Advance a BMC component by one poll.
+
+        A BMC segment alternates between waiting (for the update itself,
+        then between version checks) and polling: either the Redfish task
+        of the update, or the reported BMC version.
+
+        :param task: a TaskManager instance
+        :param state: the state object
+        :param update_service: the sushy firmware update service
+        :returns: None; the segment moves itself on through nested calls
+        """
+        node = task.node
+        current_update = state['settings'][0]
+        if self._run_lc_job_gate(task, state, False):
+            return None
+        elapsed, wait_interval = self._state_elapsed(state)
+
+        if elapsed is None or wait_interval is None:
+            return self._poll_bmc_update_task(task, state, update_service)
+
+        if elapsed.total_seconds() >= wait_interval:
+            LOG.debug('Finished waiting after firmware update '
+                      '%(firmware_image)s on node %(node)s. '
+                      'Elapsed time: %(seconds)s seconds',
+                      {'firmware_image': current_update['url'],
+                       'node': node.uuid,
+                       'seconds': elapsed.seconds})
+            current_update.pop('wait', None)
+            state['bmc']['wait_start'] = None
+
+            return self._bmc_wait_completed(task, state, update_service)
+
+        LOG.debug('Continuing to wait after firmware update '
+                  '%(firmware_image)s on node %(node)s. '
+                  'Elapsed time: %(seconds)s seconds',
+                  {'firmware_image': current_update['url'],
+                   'node': node.uuid,
+                   'seconds': elapsed.seconds})
+        return None
+
+    def _fail_component(self, task, state, fw_upd, sushy_task):
+        """Fail the step because one component's Redfish task failed.
+
+        :param task: a TaskManager instance
+        :param state: the state object
+        :param fw_upd: the settings dict whose task failed
+        :param sushy_task: the failed sushy task object
+        """
+        messages = []
+        if sushy_task.messages:
+            if not sushy_task.messages[0].message:
+                sushy_task.parse_messages()
+            for m in sushy_task.messages:
+                msg = m.message
+                if not msg or msg.lower() in ['unknown', 'unknown error']:
+                    msg = m.message_id
+                if msg:
+                    messages.append(msg)
+
+        error_msg = (
+            _('Batched firmware update failed for component '
+              '%(component)s on node %(node)s. Error: %(errors)s')
+            % {'component': fw_upd.get('component', ''),
+               'node': task.node.uuid,
+               'errors': ', '.join(messages)})
+        LOG.error(error_msg)
+        self._fail(task, state, error_msg, exclude=fw_upd, traceback=True)
+
+    def _stage_firmware_file(self, node, component_update, state=None):
+        """Make the firmware image reachable by the BMC.
+
+        :param node: the Ironic node object
+        :param component_update: a single firmware update settings dict
+        :param state: the state object, used only to clean up already
+            staged files if this staging fails
+        :returns: a tuple (url the BMC should fetch, the staging
+            back-end to clean up afterwards or None)
+        """
         try:
             url = component_update['url']
             name = component_update['component']
@@ -1694,5 +2420,5 @@ class RedfishFirmware(base.FirmwareInterface):
             return firmware_utils.stage(node, source, temp_file)
 
         except exception.IronicException:
-            firmware_utils.cleanup(node)
+            self._cleanup_staged(node, state)
             raise
