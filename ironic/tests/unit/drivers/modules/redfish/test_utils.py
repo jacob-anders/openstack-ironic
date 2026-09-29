@@ -877,3 +877,46 @@ class IsDellNodeTestCase(db_base.DbTestCase):
         get_system.side_effect = exception.RedfishError(error='unavailable')
         self.assertRaises(exception.RedfishError,
                           redfish_utils.is_dell_node, mock.Mock(properties={}))
+
+
+class GetBootProgressTargetsTestCase(db_base.DbTestCase):
+
+    def test_service_step(self):
+        node = mock.Mock(service_step={'step': 'x'}, clean_step=None,
+                         deploy_step=None)
+        self.assertEqual(
+            redfish_utils.BOOT_PROGRESS_SERVICE_TARGETS,
+            redfish_utils.get_boot_progress_targets(node))
+
+    def test_clean_step(self):
+        node = mock.Mock(service_step=None, clean_step={'step': 'x'},
+                         deploy_step=None)
+        self.assertEqual(
+            redfish_utils.BOOT_PROGRESS_CLEAN_TARGETS,
+            redfish_utils.get_boot_progress_targets(node))
+
+    def test_deploy_step(self):
+        node = mock.Mock(service_step=None, clean_step=None,
+                         deploy_step={'step': 'x'})
+        self.assertEqual(
+            redfish_utils.BOOT_PROGRESS_CLEAN_TARGETS,
+            redfish_utils.get_boot_progress_targets(node))
+
+    def test_no_step(self):
+        node = mock.Mock(service_step=None, clean_step=None,
+                         deploy_step=None)
+        self.assertEqual(
+            redfish_utils.BOOT_PROGRESS_SERVICE_TARGETS,
+            redfish_utils.get_boot_progress_targets(node))
+
+    def test_service_targets_require_os_running(self):
+        self.assertEqual(
+            frozenset({sushy.BootProgressStates.OS_RUNNING}),
+            redfish_utils.BOOT_PROGRESS_SERVICE_TARGETS)
+
+    def test_post_complete_states(self):
+        self.assertEqual(
+            frozenset({sushy.BootProgressStates.HARDWARE_COMPLETE,
+                       sushy.BootProgressStates.OS_BOOT_STARTED,
+                       sushy.BootProgressStates.OS_RUNNING}),
+            redfish_utils.BOOT_PROGRESS_POST_COMPLETE)

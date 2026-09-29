@@ -712,3 +712,54 @@ def get_chassis(node, system):
                   'Error %(error)s',
                   {'system': system.identity, 'error': e})
         raise exception.RedfishError(error=e)
+
+
+# Servicing requires the OS to be fully running: the firmware inventory
+# is only read once the node reaches this state, so anything earlier can
+# still report the versions in place before the update was applied.
+# Whether and when a BMC reports OS_RUNNING is platform-specific and
+# not guaranteed by the Redfish schema, so callers bound the wait for
+# it once BOOT_PROGRESS_POST_COMPLETE is seen.
+BOOT_PROGRESS_SERVICE_TARGETS = frozenset({
+    sushy.BootProgressStates.OS_RUNNING,
+})
+
+# States proving POST finished, and with it any firmware the platform
+# flashes during POST. The node has handed control to the boot loader or
+# beyond, so the flash window this gate protects is over.
+#
+# Reporting past this point is platform-specific and not guaranteed by
+# the Redfish schema: some BMCs report the full ladder up to OS_RUNNING,
+# while others stop at HARDWARE_COMPLETE for the life of the boot. Where
+# OS_RUNNING is the only target, callers use this set to start a bounded
+# wait for it ([redfish]firmware_update_os_running_timeout) rather than
+# holding the node for a whole gate's timeout on a reporting difference.
+BOOT_PROGRESS_POST_COMPLETE = frozenset({
+    sushy.BootProgressStates.HARDWARE_COMPLETE,
+    sushy.BootProgressStates.OS_BOOT_STARTED,
+    sushy.BootProgressStates.OS_RUNNING,
+})
+
+# Cleaning also accepts HARDWARE_COMPLETE because no-ramdisk cleaning
+# never boots an OS, so the boot progress can legitimately stop there.
+BOOT_PROGRESS_CLEAN_TARGETS = frozenset({
+    sushy.BootProgressStates.HARDWARE_COMPLETE,
+    sushy.BootProgressStates.SETUP,
+    sushy.BootProgressStates.OS_BOOT_STARTED,
+    sushy.BootProgressStates.OS_RUNNING,
+})
+
+
+def get_boot_progress_targets(node):
+    """Get the BootProgress target states for the node's current step.
+
+    :param node: an ironic node object.
+    :returns: a frozenset of ``sushy.BootProgressStates`` members that
+        satisfy the BootProgress gate for the step currently running on
+        the node.
+    """
+    if node.service_step:
+        return BOOT_PROGRESS_SERVICE_TARGETS
+    if node.clean_step or node.deploy_step:
+        return BOOT_PROGRESS_CLEAN_TARGETS
+    return BOOT_PROGRESS_SERVICE_TARGETS
