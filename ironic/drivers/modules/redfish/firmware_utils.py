@@ -11,6 +11,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import inspect
 import os
 import shutil
 import tempfile
@@ -19,6 +20,8 @@ from urllib import parse as urlparse
 import jsonschema
 from oslo_log import log
 from oslo_utils import fileutils
+import sushy
+from sushy import taskmonitor
 
 from ironic.common import exception
 from ironic.common.i18n import _
@@ -127,6 +130,49 @@ def validate_firmware_interface_update_args(settings):
         raise exception.InvalidParameterValue(
             _('Invalid firmware update %(settings)s. Errors: %(err)s')
             % {'settings': settings, 'err': err})
+
+
+def simple_update_on_reset(update_service, image_uri, targets=None):
+    """Request deferred application without retrying an ambiguous POST.
+
+    Older supported sushy lacks an apply_time argument. Keep the compatibility
+    request here; SettingsApplyTime is for settings resources, whereas the
+    Redfish action annotation is OperationApplyTime.
+    """
+    if 'apply_time' in inspect.signature(
+            update_service.simple_update).parameters:
+        return update_service.simple_update(
+            image_uri, targets=targets, apply_time=sushy.ApplyTime.ON_RESET)
+
+    action = update_service._get_simple_update_element()
+    action_data = update_service.json.get('Actions', {}).get(
+        '#UpdateService.SimpleUpdate', {})
+    support = (action_data.get('@Redfish.OperationApplyTimeSupport')
+               or update_service.json.get('@Redfish.OperationApplyTimeSupport')
+               or {})
+    allowed_times = support.get('SupportedValues')
+    if allowed_times is not None and 'OnReset' not in allowed_times:
+        raise exception.UnsupportedDriverExtension(_(
+            'SimpleUpdate does not support OnReset application. Disable '
+            'allow_grouping_reboots or use a BMC that supports deferred '
+            'firmware application.'))
+    scheme = urlparse.urlparse(image_uri).scheme.lower()
+    protocol = (sushy.UpdateTransferProtocolType.HTTPS if scheme == 'https'
+                else sushy.UpdateTransferProtocolType.HTTP)
+    allowed = update_service.get_allowed_transfer_protocols()
+    if protocol not in allowed and protocol.value not in allowed:
+        raise exception.InvalidParameterValue(_(
+            'SimpleUpdate does not support the %s transfer protocol')
+            % protocol.value)
+    data = {'ImageURI': image_uri, 'TransferProtocol': protocol.value,
+            '@Redfish.OperationApplyTime': 'OnReset'}
+    if targets:
+        data['Targets'] = targets
+    response = update_service._conn.post(action.target_uri, data=data)
+    return taskmonitor.TaskMonitor.from_response(
+        update_service._conn, response, action.target_uri,
+        redfish_version=update_service.redfish_version,
+        registries=update_service.registries)
 
 
 def get_swift_temp_url(parsed_url):

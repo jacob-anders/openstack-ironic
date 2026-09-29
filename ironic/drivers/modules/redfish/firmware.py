@@ -278,16 +278,29 @@ class RedfishFirmware(base.FirmwareInterface):
                 'interval. BMC wait controls version verification.'
             ),
             'required': True
+        },
+        'allow_grouping_reboots': {
+            'description': (
+                'Boolean. When True, adjacent non-BMC firmware updates '
+                'share a single consolidated host reboot instead of '
+                'rebooting after each component. BMC entries segment the '
+                'list into independent phases. Ironic does not reorder '
+                'the settings list. Duplicate components within a non-BMC '
+                'segment are rejected. Defaults to False.'
+            ),
+            'required': False
         }
     }
 
     def _segment_run_length(self, state):
-        """Select one non-BMC component for the next segment.
+        """Leading batchable run length, respecting the grouping mode.
 
         :param state: the state object
-        :returns: 1 for a leading non-BMC component, otherwise 0
+        :returns: int — capped to 1 when grouping is disabled
         """
         settings = state.get('settings') or []
+        if state.get('grouping'):
+            return _leading_batchable_run(settings)
         return _leading_batchable_run(settings, max_size=1)
 
     def _staged_pending(self, state, exclude=None):
@@ -722,13 +735,15 @@ class RedfishFirmware(base.FirmwareInterface):
     @base.service_step(priority=0, abortable=False,
                        argsinfo=_FW_SETTINGS_ARGSINFO,
                        requires_ramdisk=False)
-    def update(self, task, settings):
+    def update(self, task, settings, allow_grouping_reboots=False):
         """Update the Firmware on the node using the settings for components.
 
         :param task: a TaskManager instance.
         :param settings: a list of dictionaries, each dictionary contains the
             component name and the url that will be used to update the
             firmware.
+        :param allow_grouping_reboots: Boolean. When True, non-BMC firmware
+            updates are batched into a single host reboot. Defaults to False.
         :raises: UnsupportedDriverExtension, if the node's driver doesn't
             support update via the interface.
         :raises: InvalidParameterValue, if validation of the settings fails.
@@ -739,13 +754,33 @@ class RedfishFirmware(base.FirmwareInterface):
         """
         firmware_utils.validate_firmware_interface_update_args(settings)
         self._validate_boot_policy(task.node)
+        if not isinstance(allow_grouping_reboots, bool):
+            raise exception.InvalidParameterValue(
+                _('allow_grouping_reboots must be a boolean, '
+                  'got %s') % type(allow_grouping_reboots).__name__)
+        if allow_grouping_reboots:
+            seen = set()
+            for s in settings:
+                comp = s.get('component', '')
+                if redfish_utils.get_component_type(comp) == redfish_utils.BMC:
+                    seen.clear()
+                    continue
+                if comp in seen:
+                    raise exception.InvalidParameterValue(
+                        _("component '%(comp)s' appears more than once; "
+                          "batched updates require distinct components. "
+                          "Use separate firmware.update steps, or omit "
+                          "allow_grouping_reboots, for staged or sequential "
+                          "updates of the same component.") % {'comp': comp})
+                seen.add(comp)
 
         node = task.node
         update_service = redfish_utils.get_update_service(node)
 
         LOG.debug('Updating Firmware on node %(node_uuid)s with settings '
-                  '%(settings)s',
-                  {'node_uuid': node.uuid, 'settings': settings})
+                  '%(settings)s, allow_grouping_reboots=%(group)s',
+                  {'node_uuid': node.uuid, 'settings': settings,
+                   'group': allow_grouping_reboots})
 
         state = {
             'version': STATE_VERSION,
@@ -754,7 +789,7 @@ class RedfishFirmware(base.FirmwareInterface):
             'started_at': str(timeutils.utcnow().isoformat()),
             'settings': settings,
             'cleanup': None,
-            'grouping': False,
+            'grouping': allow_grouping_reboots,
             'segment': None,
             'reboot_time': None,
             'bmc': None,
@@ -1011,7 +1046,12 @@ class RedfishFirmware(base.FirmwareInterface):
                   {'url': fw_upd['url'], 'component': fw_upd['component'],
                    'node_uuid': node.uuid})
         try:
-            if targets is not None:
+            if (state.get('grouping')
+                    and redfish_utils.get_component_type(fw_upd['component'])
+                    != redfish_utils.BMC):
+                task_monitor = firmware_utils.simple_update_on_reset(
+                    update_service, component_url, targets=targets)
+            elif targets is not None:
                 task_monitor = update_service.simple_update(component_url,
                                                             targets=targets)
             else:

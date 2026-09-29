@@ -23,6 +23,7 @@ from ironic.conductor import task_manager
 from ironic.conductor import utils as manager_utils
 from ironic.drivers.modules.drac import firmware as drac_fw
 from ironic.drivers.modules.redfish import firmware
+from ironic.drivers.modules.redfish import firmware_utils
 from ironic.drivers.modules.redfish import utils
 from ironic.tests.unit.db import base
 from ironic.tests.unit.db import utils as db_utils
@@ -52,6 +53,10 @@ class FirmwareStateMachineTestCase(base.DbTestCase):
         self.chassis = self._patch(utils, 'get_chassis').return_value
         self.service = self._patch(utils, 'get_update_service').return_value
         self.service.simple_update.side_effect = self._submit
+        self._patch(firmware_utils, 'simple_update_on_reset',
+                    side_effect=lambda service, url, targets=None:
+                    service.simple_update(url, **(
+                        {'targets': targets} if targets is not None else {})))
         collection = self._patch(utils, 'get_system_collection').return_value
         collection.members_identities = ['/Systems/1']
         self.get_monitor = self._patch(utils, 'get_task_monitor')
@@ -84,7 +89,8 @@ class FirmwareStateMachineTestCase(base.DbTestCase):
                             'BootProgress': {'LastState': state},
                             'LastResetTime': reset}
 
-    def _start(self, step='clean', components=('bios', 'nic:1'), wait=None):
+    def _start(self, step='clean', components=('bios', 'nic:1'),
+               grouping=True, wait=None):
         setattr(self.node, step + '_step',
                 {'interface': 'firmware', 'step': 'update'})
         self.node.provision_state = {
@@ -96,7 +102,8 @@ class FirmwareStateMachineTestCase(base.DbTestCase):
         if wait is not None:
             settings[0]['wait'] = wait
         with task_manager.acquire(self.context, self.node.uuid) as task:
-            self.firmware.update(task, settings)
+            self.firmware.update(task, settings,
+                                 allow_grouping_reboots=grouping)
         self.node.refresh()
 
     def _poll(self, seconds=60):
@@ -109,8 +116,33 @@ class FirmwareStateMachineTestCase(base.DbTestCase):
         return self.node.driver_internal_info.get(
             firmware.FIRMWARE_UPDATE_STATE)
 
-    def test_default_keeps_per_component_reboots(self):
+    def test_batch_has_one_reboot_and_waits_for_new_boot(self):
         self._start()
+        self.assertEqual(firmware.STATE_STAGING, self._state()['state'])
+        self._poll()  # Stage the NIC after BIOS staging completed.
+        self.power.assert_not_called()
+        self._poll()  # All images staged: issue one reset.
+        self.power.assert_called_once()
+        self.assertEqual(firmware.STATE_REBOOTING, self._state()['state'])
+        self._poll()  # Old boot's OSRunning is still latched.
+        self.resume.assert_not_called()
+        self.cache.assert_not_called()
+        self._boot('MemoryInitializationStarted', 'new')
+        self._poll()
+        self.resume.assert_not_called()
+        self._boot('SystemHardwareInitializationComplete', 'new')
+        self._poll()
+        self.assertEqual(firmware.STATE_VERIFYING_INVENTORY,
+                         self._state()['state'])
+        self.cache.assert_not_called()
+        self._poll()
+        self.cache.assert_called_once()
+        self.resume.assert_called_once()
+        self.power.assert_called_once()
+        self.assertIsNone(self._state())
+
+    def test_default_keeps_per_component_reboots(self):
+        self._start(grouping=False)
         self._poll()
         self.assertEqual(1, self.service.simple_update.call_count)
         self._boot('SystemHardwareInitializationComplete', 'boot1')
@@ -207,6 +239,19 @@ class FirmwareStateMachineTestCase(base.DbTestCase):
         self.power.assert_called_once()
         self.resume.assert_not_called()
 
+    def test_partial_submission_failure_never_reboots(self):
+        self.config(poweroff_in_servicefail=True, group='conductor')
+        self._start(step='service')
+        self.service.simple_update.side_effect = exception.RedfishError(
+            error='NIC image rejected')
+        self._poll()
+        self.assertEqual(states.SERVICEFAIL, self.node.provision_state)
+        self.assertIn('bios', self.node.last_error)
+        self.assertIn('NIC image rejected', self.node.last_error)
+        self.assertTrue(self.node.maintenance)
+        self.power.assert_not_called()
+        self.resume.assert_not_called()
+
     def test_no_telemetry_uses_fallback_wait(self):
         self._boot(None)
         self._start(components=('bios',))
@@ -244,19 +289,39 @@ class FirmwareStateMachineTestCase(base.DbTestCase):
         self.service.simple_update.assert_called_once()
         self.power.assert_called_once()
 
-    def test_per_component_wait_remains_supported(self):
-        self._start(components=('bios',), wait=120)
-        self._poll()
-        self._boot('SystemHardwareInitializationComplete', 'new')
-        self._poll()
-        self._poll()
-        self.resume.assert_not_called()
-        self._poll()
-        self.resume.assert_called_once()
-
     def _job(self, identity, state):
         return {'id': identity, 'state': state, 'type': 'FirmwareUpdate',
                 'message': 'LC diagnostic'}
+
+    def test_dell_staging_pacing_and_late_apply_jobs(self):
+        self.node.properties = {'vendor': 'Dell Inc.'}
+        self.jobs.return_value = []
+        self._start()
+        self.task_state.task_state = sushy.TASK_STATE_STARTING
+        self.jobs.return_value = [self._job('JID_1', 'Downloading')]
+        self._poll()
+        self.service.simple_update.assert_called_once()
+        self.power.assert_not_called()
+        self.jobs.return_value[0]['state'] = 'Scheduled'
+        self._poll()
+        self.assertEqual(2, self.service.simple_update.call_count)
+        self.jobs.return_value.append(self._job('JID_2', 'Scheduled'))
+        self._poll()
+        self.power.assert_called_once()
+        self.task_state.task_state = sushy.TASK_STATE_COMPLETED
+        self.jobs.return_value = [self._job('JID_1', 'Completed'),
+                                  self._job('JID_2', 'Completed'),
+                                  self._job('JID_child', 'Running')]
+        self._boot('SystemHardwareInitializationComplete', 'new')
+        self._poll()
+        self.cache.assert_not_called()
+        self.resume.assert_not_called()
+        self.jobs.return_value[-1]['state'] = 'Completed'
+        self._poll()
+        self.jobs.return_value = []  # Positive outcomes survive purging.
+        self._poll()
+        self.resume.assert_called_once()
+        self.power.assert_called_once()
 
     def test_dell_failed_late_job_blocks_next_segment(self):
         self.node.properties = {'vendor': 'Dell Inc.'}
@@ -274,6 +339,87 @@ class FirmwareStateMachineTestCase(base.DbTestCase):
         self.power.assert_called_once()
         self.resume.assert_not_called()
 
+    def test_hpe_starting_does_not_mean_staging_finished(self):
+        self._start()
+        self.task_state.task_state = sushy.TASK_STATE_STARTING
+        self._poll()
+        self._poll()
+        self.service.simple_update.assert_called_once()
+        self.power.assert_not_called()
+        self.task_state.task_state = sushy.TASK_STATE_COMPLETED
+        self._poll()
+        self.assertEqual(2, self.service.simple_update.call_count)
+
+    def test_hpe_nic_precondition_holds_entire_segment(self):
+        self.chassis.network_adapters = None
+        self._start()
+        self._poll()
+        self.assertEqual(firmware.STATE_STARTING, self._state()['state'])
+        self.assertIn('boot IPA', self._state()['last_error'])
+        self.service.simple_update.assert_not_called()
+        self.power.assert_not_called()
+        adapters = mock.Mock(spec=['get_members'])
+        adapters.get_members.return_value = [object()]
+        self.chassis.network_adapters = adapters
+        self._poll()
+        self.service.simple_update.assert_called_once()
+        self.assertEqual(firmware.STATE_STAGING, self._state()['state'])
+
+    def test_per_component_wait_remains_supported(self):
+        self._start(components=('bios',), grouping=False, wait=120)
+        self._poll()
+        self._boot('SystemHardwareInitializationComplete', 'new')
+        self._poll()
+        self._poll()
+        self.resume.assert_not_called()
+        self._poll()
+        self.resume.assert_called_once()
+
+    def test_task_polling_budget_rotates_through_batch(self):
+        self.config(firmware_update_tasks_per_poll=1, group='redfish')
+        self._start(components=('bios', 'nic:1', 'nic:2'))
+        self._poll()
+        self._poll()
+        self._poll()
+        self.power.assert_called_once()
+        self.get_monitor.reset_mock()
+        self._boot('SystemHardwareInitializationComplete', 'new')
+        for expected in (1, 2, 3):
+            self._poll()
+            self.assertEqual(expected, self.get_monitor.call_count)
+        self._poll()
+        self.resume.assert_called_once()
+
+    def test_bmc_separates_batches_without_reordering(self):
+        self.config(firmware_update_reboot_delay=0,
+                    firmware_update_required_successes=1, group='redfish')
+        self._start(components=('bios', 'bmc', 'bios', 'nic:1'))
+        self._poll()  # First BIOS segment's reset.
+        self._boot('SystemHardwareInitializationComplete', 'boot1')
+        self._poll()
+        self._poll()  # Submit the BMC, in the requested position.
+        self.assertEqual('bmc', self._state()['settings'][0]['component'])
+        self.manager.firmware_version = '2.0'
+        self._poll()  # Version verification -> BMC validation.
+        self._poll()  # BMC handoff reset, required by the existing BMC path.
+        self.assertEqual(2, self.power.call_count)
+        self._boot('SystemHardwareInitializationComplete', 'boot2')
+        self._poll()
+        self._poll()  # Start the last non-BMC segment.
+        self._poll()  # Stage its NIC.
+        self._poll()  # Consolidated BIOS+NIC reset.
+        self.assertEqual(3, self.power.call_count)
+        self._boot('SystemHardwareInitializationComplete', 'boot3')
+        self._poll()
+        self._poll()
+        self.resume.assert_called_once()
+        submitted = [call.args[0] for call in
+                     self.service.simple_update.call_args_list]
+        self.assertEqual([
+            'https://firmware/bios', 'https://firmware/bmc',
+            'https://firmware/bios', 'https://firmware/nic:1'],
+            submitted)
+
     def test_synchronous_success_without_monitor_is_not_ambiguous(self):
         self.service.simple_update.side_effect = None
         self.service.simple_update.return_value = SimpleNamespace(
@@ -287,7 +433,7 @@ class FirmwareStateMachineTestCase(base.DbTestCase):
         self.resume.assert_called_once()
 
     def test_non_dell_starting_compatibility_is_single_component_only(self):
-        self._start(components=('nic:1',))
+        self._start(components=('nic:1',), grouping=False)
         self.task_state.task_state = sushy.TASK_STATE_STARTING
         self._poll()
         self.power.assert_not_called()
