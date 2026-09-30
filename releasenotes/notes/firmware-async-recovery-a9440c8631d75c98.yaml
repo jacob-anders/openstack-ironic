@@ -1,0 +1,30 @@
+fixes:
+  - |
+    Firmware reboot observation and BMC resource validation now use periodic
+    samples rather than blocking conductor workers. Explicit validating-BMC,
+    verifying-inventory and next-segment states retain the current update
+    until recovery completes. Requests are persisted before image submission
+    or reboot so a lost response does not cause duplicate hardware actions.
+  - |
+    Adds a finite ``[redfish]firmware_update_apply_timeout`` per segment,
+    including when the overall timeout is disabled. Supported boot checks
+    cannot expire into success. A node known to report only intermediate
+    boot stages may explicitly use ``firmware_update_boot_progress=limited``;
+    supported job and reset evidence remain mandatory. Inventory refreshes
+    follow recovery and a configurable ``firmware_update_inventory_wait``.
+  - |
+    Firmware periodics revalidate the node's lifecycle state under the
+    exclusive lock. A queued callback cannot resume an update that another
+    worker has failed, or clear a newly started update after selecting an
+    older failed operation.
+  - |
+    Late Dell Lifecycle Controller jobs restart the inventory settling wait
+    from the poll that confirms they have completed. The BMC resource
+    validation timeout starts when recovery begins and remains enforced while
+    UpdateService or Lifecycle Controller reads are unavailable.
+deprecations:
+  - |
+    ``[redfish]firmware_update_reboot_watch_timeout`` is no longer used by
+    firmware updates. Reset evidence is sampled asynchronously at the firmware
+    status interval. ``firmware_update_reboot_min_wait`` sets the minimum
+    observation delay; it does not replace evidence of the new boot.

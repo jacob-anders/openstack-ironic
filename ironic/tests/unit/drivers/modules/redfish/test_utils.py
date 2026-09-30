@@ -861,7 +861,38 @@ class IsDellNodeTestCase(db_base.DbTestCase):
 
     def test_is_dell_node_no_vendor(self):
         node = mock.Mock(properties={})
-        self.assertFalse(redfish_utils.is_dell_node(node))
+        with mock.patch.object(redfish_utils, 'get_system', autospec=True) \
+                as get_system:
+            self.assertFalse(redfish_utils.is_dell_node(node))
+            get_system.assert_not_called()
+
+
+class GetSystemVendorTestCase(db_base.DbTestCase):
+
+    def test_cached_vendor_avoids_redfish_read(self):
+        node = mock.Mock(properties={'vendor': 'Dell Inc.'})
+        with mock.patch.object(redfish_utils, 'get_system', autospec=True) \
+                as get_system:
+            self.assertEqual(
+                'Dell Inc.', redfish_utils.get_system_vendor(node))
+            get_system.assert_not_called()
+
+    def test_discovers_manufacturer_when_property_is_missing(self):
+        node = mock.Mock(properties={})
+        with mock.patch.object(redfish_utils, 'get_system', autospec=True) \
+                as get_system:
+            get_system.return_value.manufacturer = 'Dell Inc.'
+            self.assertEqual(
+                'Dell Inc.', redfish_utils.get_system_vendor(node))
+            get_system.assert_called_once_with(node)
+
+    def test_vendor_discovery_error_propagates(self):
+        node = mock.Mock(properties={})
+        with mock.patch.object(
+                redfish_utils, 'get_system', autospec=True,
+                side_effect=exception.RedfishError(error='unavailable')):
+            self.assertRaises(exception.RedfishError,
+                              redfish_utils.get_system_vendor, node)
 
 
 class GetBootProgressTargetsTestCase(db_base.DbTestCase):
@@ -879,6 +910,8 @@ class GetBootProgressTargetsTestCase(db_base.DbTestCase):
         self.assertEqual(
             redfish_utils.BOOT_PROGRESS_CLEAN_TARGETS,
             redfish_utils.get_boot_progress_targets(node))
+        self.assertIn(sushy.BootProgressStates.SETUP,
+                      redfish_utils.get_boot_progress_targets(node))
 
     def test_deploy_step(self):
         node = mock.Mock(service_step=None, clean_step=None,
@@ -1167,12 +1200,39 @@ class BootChangedSinceTestCase(db_base.DbTestCase):
                 self.assertTrue(redfish_utils.boot_changed_since(
                     self.BEFORE, self._current(power=power)))
 
-    def test_boot_progress_appears(self):
-        # A BMC that reported nothing before the reboot and something
-        # after it has equally proven the node reset.
+    def test_off_to_on_is_reset_evidence_without_other_markers(self):
+        before = {'state': None, 'state_time': None, 'reset_time': None,
+                  'power': 'Off'}
+        current = {'state': 'SystemHardwareInitializationComplete',
+                   'state_time': None, 'reset_time': None, 'power': 'On'}
+
+        self.assertTrue(redfish_utils.boot_changed_since(before, current))
+
+    def test_on_to_on_with_latched_target_is_not_reset_evidence(self):
+        before = {'state': None, 'state_time': None, 'reset_time': None,
+                  'power': 'On'}
+        current = {'state': 'SystemHardwareInitializationComplete',
+                   'state_time': None, 'reset_time': None, 'power': 'On'}
+
+        self.assertFalse(redfish_utils.boot_changed_since(before, current))
+
+    def test_boot_progress_without_baseline_is_not_reset_evidence(self):
+        # A latched post-boot state can appear without a new host reset.
         before = dict(self.BEFORE, state=None, state_time=None)
+        self.assertFalse(redfish_utils.boot_changed_since(
+            before, self._current(state='OSRunning', state_time=None)))
+
+    def test_legacy_reset_key_is_accepted(self):
+        before = dict(self.BEFORE)
+        before['reset'] = before.pop('reset_time')
         self.assertTrue(redfish_utils.boot_changed_since(
-            before, self._current(state='SetupEntered', state_time=None)))
+            before, self._current(reset_time='2026-10-01T12:05:00+00:00')))
+
+    def test_legacy_reset_key_with_missing_markers_is_safe(self):
+        before = dict(self.BEFORE)
+        before['reset'] = before.pop('reset_time')
+        self.assertFalse(redfish_utils.boot_changed_since(
+            before, self._current()))
 
     def test_marker_missing_from_one_reading_proves_nothing(self):
         self.assertFalse(redfish_utils.boot_changed_since(

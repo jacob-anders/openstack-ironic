@@ -1,0 +1,12 @@
+---
+fixes:
+  - |
+    Redfish firmware updates recheck staging tasks before retrying an apply
+    reboot after a temporary preparation failure. Historical staging evidence
+    no longer overrides a currently running or failed task.
+  - |
+    Firmware reboot intent, its phase and async flags are saved together so
+    conductor restarts cannot leave a partially published reboot record.
+    Previously saved preparation records recover without replaying a committed
+    hardware action. Post-application inventory settling waits also retain
+    their restarted timestamp when late firmware jobs delay recovery.

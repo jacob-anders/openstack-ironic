@@ -1,0 +1,8 @@
+upgrade:
+  - |
+    Firmware updates using legacy pre-state-machine bookkeeping now fail in
+    maintenance after a conductor upgrade rather than reporting success for
+    potentially unapplied components. No additional image is submitted and
+    no reboot is issued. Inspect BMC tasks and staged jobs before recovering
+    and retrying the step. Unknown state-machine schema versions also fail
+    safely instead of being interpreted as the current schema.

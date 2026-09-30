@@ -1,0 +1,52 @@
+---
+features:
+  - |
+    The Redfish ``firmware.update`` step (cleaning, servicing and deploy)
+    accepts a new boolean argument ``allow_grouping_reboots``. When set,
+    adjacent non-BMC components in the ``settings`` list are staged one
+    after another and applied with a single consolidated host reboot
+    instead of one reboot per component. BMC entries segment the list,
+    since a BMC update resets the management controller rather than the
+    host; each segment of adjacent non-BMC components shares one reboot.
+    Duplicate components within a non-BMC segment are rejected, but may
+    recur in separate segments. The per-component ``wait`` remains supported;
+    grouped non-BMC segments use the largest requested settling interval.
+    The default (``False``) keeps one reboot per component.
+  - |
+    Supported non-BMC Redfish firmware updates (BIOS and NIC) follow the same
+    stage-then-reboot flow. Grouping explicitly requests ``OnReset`` application
+    with the standard ``@Redfish.OperationApplyTime`` action annotation,
+    including on older supported sushy versions. Dell staging waits for an
+    armed LC job; other platforms wait for staging task completion. The node
+    is rebooted once all images are staged, then waits in the verification phase
+    until every check the platform makes available confirms the firmware
+    was applied (Dell Lifecycle Controller jobs and BootProgress), for
+    the whole segment, before resuming or continuing.
+  - |
+    HPE NIC updates wait for ``NetworkAdapters`` visibility before staging
+    any image in their segment. Keep the deployed OS running during servicing,
+    or boot IPA before day-0 updates. A failed staging request fails the step
+    without issuing a consolidated reboot; inspect pending BMC jobs before
+    recovery and retry.
+fixes:
+  - |
+    Grouped updates check all submitted Dell firmware jobs before staging each
+    additional image, rather than waiting until the final reboot to discover
+    an earlier failure. A deferred request without a task monitor requires
+    positive OEM staging evidence and is no longer treated as synchronous
+    success, including when recovering older in-flight records.
+  - |
+    A failed Dell Lifecycle Controller job now fails a grouped firmware update
+    immediately, even while another Redfish task monitor is still running. The
+    node is left powered on in maintenance and may still be flashing; inspect
+    all firmware jobs and do not power-cycle it before recovery.
+  - |
+    The deferred-update compatibility adapter reports incompatible sushy APIs
+    before submitting firmware. Missing transfer-protocol advertisements do
+    not prevent a request, while explicit protocol restrictions remain enforced.
+  - |
+    ``[redfish]firmware_update_nic_starting_wait`` continues to support
+    single-component updates that need a reset to leave ``Starting``.
+    This heuristic is not used to queue additional images in a grouped update.
+    ``firmware_update_tasks_per_poll`` bounds task-monitor reads for large
+    batches, and job baselines track additional LC jobs created during POST.

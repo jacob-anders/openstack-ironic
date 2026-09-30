@@ -12,6 +12,16 @@ multiple firmware updates, the update in progress will complete, and processing
 of the remaining updates will pause.  When the node is taken out of maintenance
 mode, processing of the remaining updates will continue.
 
+Progress is stored in one versioned ``redfish_fw_update`` record in the node's
+``driver_internal_info``. Its named phases cover staging, application, BMC
+recovery, boot and inventory verification. Phase transitions and complete action
+intent are persisted before submissions or resets; ambiguous responses do not
+cause those hardware actions to be replayed after a conductor restart.
+
+Legacy in-flight queues and unknown record versions enter maintenance for
+operator recovery rather than being resumed without reliable application
+evidence. Inspect BMC tasks and staged jobs before retrying such an update.
+
 .. note:: Only :doc:`/admin/drivers/redfish` supports firmware updates
    currently.
 

@@ -114,8 +114,10 @@ opts = [
     cfg.IntOpt('firmware_update_wait_unresponsive_bmc',
                min=0,
                default=0,
-               help=_('Number of seconds to wait before proceeding with the '
-                      'reboot to finish the BMC firmware update step')),
+               deprecated_for_removal=True,
+               deprecated_reason=_('Firmware recovery uses the segment '
+                                   'apply and resource-validation deadlines.'),
+               help=_('Deprecated and ignored by the firmware interface.')),
     cfg.IntOpt('firmware_update_required_successes',
                min=0,
                default=3,
@@ -126,9 +128,9 @@ opts = [
     cfg.IntOpt('firmware_update_validation_interval',
                min=0,
                default=30,
-               help=_('Timeout (in seconds) to wait between validation '
-                      'attempts. Set to 0 for rapid succession retries '
-                      'with no delay.')),
+               help=_('Minimum seconds between periodic BMC recovery samples. '
+                      'Also bounded by firmware_update_status_interval. '
+                      'Set to 0 to sample on every firmware poll.')),
     cfg.IntOpt('firmware_update_resource_validation_timeout',
                min=0,
                default=480,
@@ -140,17 +142,16 @@ opts = [
     cfg.IntOpt('firmware_update_bmc_timeout',
                min=0,
                default=300,
-               help=_('Timeout (in seconds) for BMC firmware updates. '
-                      'BMC firmware updates may need extended time to handle '
-                      'BMC transitional states during the firmware update '
-                      'process.')),
+               deprecated_for_removal=True,
+               deprecated_reason=_('Firmware recovery uses the segment '
+                                   'apply and resource-validation deadlines.'),
+               help=_('Deprecated and ignored by the firmware interface.')),
     cfg.IntOpt('firmware_update_reboot_delay',
                min=0,
                default=300,
-               help=_('Default wait time (in seconds) for component-specific '
-                      'firmware update operations. Used for: BIOS firmware '
-                      'update wait before reboot, BMC firmware version check '
-                      'timeout, and NIC firmware task completion timeout.')),
+               help=_('Default time (in seconds) used as the host apply-reset '
+                      'power_timeout and the initial BMC version-check '
+                      'wait.')),
     cfg.IntOpt('firmware_update_bmc_version_check_interval',
                min=0,
                default=30,
@@ -160,75 +161,62 @@ opts = [
     cfg.IntOpt('firmware_update_nic_starting_wait',
                min=0,
                default=30,
-               help=_('Time (in seconds) to wait for a NIC firmware update '
-                      'task to progress beyond the STARTING state before '
-                      'triggering a reboot. Some NICs need a reboot to '
-                      'start applying firmware, while others can begin '
-                      'immediately. This timeout helps determine which '
-                      'behavior the hardware exhibits.')),
+               help=_('Seconds to observe a STARTING task before rebooting a '
+                      'single non-BMC component without OEM staging evidence. '
+                      'This preserves updates which need a reset to begin.')),
     cfg.IntOpt('firmware_update_post_reboot_verify_timeout',
-               min=0,
-               default=1800,
-               help=_('Maximum time (in seconds) to wait, after a reboot '
-                      'to apply staged firmware, for the post-reboot '
-                      'verify phase to complete: a Dell Lifecycle '
-                      'Controller job finishing (Dell only) and the '
-                      'node reaching a target BootProgress state. '
-                      'During servicing the node must reach OSRunning, '
-                      'so that the firmware versions cached before the '
-                      'step resumes are current; during cleaning and '
-                      'deployment an earlier state is accepted, since '
-                      'no OS need boot. Each check is skipped when '
-                      'unavailable. The node may be flashing firmware '
-                      'during POST for part of this period, so it must '
-                      'accommodate a full POST cycle. Set to 0 to wait '
-                      'indefinitely, bounded only by '
-                      '``firmware_update_overall_timeout``. Default is '
-                      '1800 seconds (30 minutes).')),
+               min=0, default=1800,
+               help=_('Maximum seconds after an apply reboot for firmware '
+                      'jobs, host readiness and inventory recovery to finish. '
+                      'Late jobs share this deadline. Set to 0 to disable '
+                      'this narrower deadline; the segment apply timeout '
+                      'remains enforced.')),
     cfg.IntOpt('firmware_update_os_running_timeout',
-               min=0,
-               default=300,
-               help=_('Maximum time (in seconds) to keep waiting for '
-                      'BootProgress to report OSRunning after the node '
-                      'has finished POST, reporting '
-                      'SystemHardwareInitializationComplete or '
-                      'OSBootStarted, during a servicing firmware '
-                      'update. The firmware versions cached '
-                      'before the step resumes are most accurate once '
-                      'the OS is fully running, but whether and when a '
-                      'BMC reports OSRunning is platform-specific and '
-                      'not guaranteed by the Redfish schema: some BMCs '
-                      'never advance past the end of POST. '
-                      'When this time elapses, Ironic logs a warning '
-                      'and proceeds. Set to 0 to not wait beyond the '
-                      'end of POST at all. Only applies to servicing: '
-                      'cleaning and deployment accept earlier boot '
-                      'states. Default is 300 seconds (5 minutes).')),
+               min=0, default=300,
+               help=_('Maximum seconds to wait for OSRunning after completed '
+                      'POST during servicing. Expiry fails the update. Set '
+                      'to 0 to use only the broader segment and reboot '
+                      'deadlines. Limited reporting must be configured '
+                      'explicitly via firmware_update_boot_progress.')),
     cfg.IntOpt('firmware_update_boot_check_delay',
-               min=0,
-               default=600,
-               help=_('Minimum time (in seconds) after a reboot issued '
-                      'to apply firmware before Ironic trusts a target '
-                      'BootProgress state it has not seen the node '
-                      'reach. A reboot request does not reset '
-                      'BootProgress: until the host actually resets, '
-                      'the BMC keeps reporting the state the previous '
-                      'boot ended in, so an immediate reading can be a '
-                      'stale one. It is also how long a node whose BMC '
-                      'does not report BootProgress at all is held '
-                      'before it is allowed to proceed. On hardware '
-                      'that gives no boot signal this delay stands in '
-                      'for the whole POST-and-flash window, during '
-                      'which the node must not be powered off, so it '
-                      'should comfortably exceed the slowest POST '
-                      'expected in the deployment. Where the reboot is '
-                      'observed instead -- the boot state, its '
-                      'timestamp, the last reset time or the power '
-                      'state differs from before the reboot, or a '
-                      'non-target state is polled -- the delay does not '
-                      'apply and the node proceeds as soon as its boot '
-                      'state says it may. Default is 600 seconds '
-                      '(10 minutes).')),
+               min=0, default=600,
+               help=_('Seconds allowed for POST and recovery when boot '
+                      'progress is absent or explicitly configured as '
+                      'limited. This delay never replaces supported job '
+                      'checks.')),
+    cfg.IntOpt('firmware_update_apply_timeout',
+               min=1, default=1800,
+               help=_('Maximum seconds for one firmware segment, including '
+                      'preparation, staging, application and inventory '
+                      'recovery. A segment contains one component unless '
+                      'reboot grouping is enabled. Increase for large '
+                      'batches. Enforced even when the overall timeout '
+                      'is disabled. '
+                      'Expiry preserves power; flashing may remain active.')),
+    cfg.IntOpt('firmware_update_tasks_per_poll',
+               min=1, default=16,
+               help=_('Maximum firmware task monitors sampled per periodic '
+                      'invocation while applying a segment. Larger values '
+                      'reduce detection latency for large batches, but hold '
+                      'a conductor worker and node lock longer.')),
+    cfg.IntOpt('firmware_update_reboot_watch_timeout',
+               min=0, default=60,
+               deprecated_for_removal=True,
+               deprecated_reason=_('Reboot evidence is sampled by the '
+                                   'firmware periodic without a blocking '
+                                   'watch after each reboot.'),
+               help=_('Deprecated blocking reboot watch duration. Ignored '
+                      'by the firmware state machine.')),
+    cfg.IntOpt('firmware_update_reboot_min_wait',
+               min=0, default=60,
+               help=_('Minimum seconds after a firmware reboot request before '
+                      'accepting host readiness. Reset and application '
+                      'evidence are still required where supported.')),
+    cfg.IntOpt('firmware_update_inventory_wait',
+               min=0, default=60,
+               help=_('Seconds after firmware application and host recovery '
+                      'before refreshing inventory. Allows publication to '
+                      'catch up; job checks continue during this interval.')),
     cfg.IntOpt('firmware_update_overall_timeout',
                min=0,
                default=7200,

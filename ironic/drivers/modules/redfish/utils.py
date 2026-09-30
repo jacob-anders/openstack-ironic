@@ -149,9 +149,11 @@ BOOT_PROGRESS_POST_COMPLETE = frozenset({
     sushy.BootProgressStates.OS_RUNNING,
 })
 
-# Cleaning also accepts HARDWARE_COMPLETE because no-ramdisk cleaning
-# never boots an OS, so the boot progress can legitimately stop there.
+# Cleaning and deployment also accept SETUP because these firmware steps can
+# complete without booting an OS. They accept HARDWARE_COMPLETE because
+# no-ramdisk cleaning can legitimately stop there.
 BOOT_PROGRESS_CLEAN_TARGETS = frozenset({
+    sushy.BootProgressStates.SETUP,
     sushy.BootProgressStates.HARDWARE_COMPLETE,
     sushy.BootProgressStates.OS_BOOT_STARTED,
     sushy.BootProgressStates.OS_RUNNING,
@@ -180,6 +182,19 @@ def get_component_type(component):
     return None
 
 
+def get_system_vendor(node):
+    """Use the cached vendor, or discover it before choosing OEM checks.
+
+    :param node: an Ironic node object
+    :returns: the vendor string, or an empty string if it is unavailable
+    :raises: RedfishError when discovery is required but fails
+    """
+    vendor = (node.properties or {}).get('vendor')
+    if vendor:
+        return vendor
+    return get_system(node).manufacturer or ''
+
+
 def is_dell_node(node):
     """Check whether a node is Dell hardware.
 
@@ -187,8 +202,8 @@ def is_dell_node(node):
     :returns: True if the ``vendor`` property identifies the node as Dell
         hardware, False otherwise
     """
-    vendor = node.properties.get('vendor') or ''
-    return 'Dell' in vendor.split()
+    vendor = (node.properties or {}).get('vendor') or ''
+    return 'dell' in vendor.lower().split()
 
 
 def _parse_tls_settings(node, driver_info):
@@ -570,7 +585,7 @@ def get_task_monitor(node, uri):
         LOG.error('The Redfish TaskMonitor "%(uri)s" was not found for '
                   'node %(node)s. Error %(error)s',
                   {'uri': uri, 'node': node.uuid, 'error': e})
-        raise exception.RedfishError(error=e)
+        raise exception.RedfishTaskMonitorNotFound(error=e)
 
 
 def _get_connection(node, lambda_fun, *args):
@@ -892,13 +907,21 @@ def boot_changed_since(before, current):
     :returns: True if the host has reset since ``before``, False if
         nothing shows that it has.
     """
-    if current['power'] in _RESETTING_POWER_STATES:
+    if current.get('power') in _RESETTING_POWER_STATES:
         return True
     if not before:
         return False
-    for marker in ('reset_time', 'state_time'):
-        if (before[marker] is not None and current[marker] is not None
-                and before[marker] != current[marker]):
+    if before.get('power') == 'Off' and current.get('power') == 'On':
+        return True
+    before_reset = before.get('reset_time', before.get('reset'))
+    current_reset = current.get('reset_time', current.get('reset'))
+    for before_marker, current_marker in (
+            (before_reset, current_reset),
+            (before.get('state_time'), current.get('state_time'))):
+        if (before_marker is not None and current_marker is not None
+                and before_marker != current_marker):
             return True
-    return (current['state'] is not None
-            and current['state'] != before['state'])
+    before_state = before.get('state')
+    current_state = current.get('state')
+    return (before_state is not None and current_state is not None
+            and current_state != before_state)
