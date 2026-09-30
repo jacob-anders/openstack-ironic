@@ -77,23 +77,28 @@ class RedfishFirmware(base.FirmwareInterface):
         redfish_utils.parse_driver_info(task.node)
 
     @METRICS.timer('RedfishFirmware.cache_firmware_components')
-    def cache_firmware_components(self, task):
+    def cache_firmware_components(self, task, required_components=(),
+                                  known_supported_types=(), nic_bindings=None):
         """Store or update Firmware Components on the given node.
 
-        This method stores Firmware Components to the firmware_information
-        table during 'cleaning' operation. It will also update the timestamp
-        of each Firmware Component.
-
         :param task: a TaskManager instance.
+        :param required_components: component names whose supported inventory
+            must be readable before updating the cache. Ordinary discovery
+            remains best effort; update verification retries transient errors.
+        :param known_supported_types: previously observed capabilities that
+            must not be reclassified as unsupported during recovery.
+        :param nic_bindings: requested NIC aliases mapped to adapter identities
+            captured before submission. Serial uniqueness is invalidated in
+            place if recovery exposes duplicates, for the caller to persist.
+            Identity metadata is not cached in the firmware component table.
         :raises: UnsupportedDriverExtension, if the node's driver doesn't
             support getting Firmware Components from bare metal.
         """
-
         node_id = task.node.id
         settings = []
-        # NOTE(iurygregory): currently we will only retrieve BIOS and BMC
-        # firmware information through the redfish system and manager.
-
+        required_types = {redfish_utils.get_component_type(component)
+                          for component in required_components}
+        unsupported_types = set()
         system = redfish_utils.get_system(task.node)
 
         if system.bios_version:
@@ -106,9 +111,6 @@ class RedfishFirmware(base.FirmwareInterface):
                       'system %(system)s', {'node_uuid': task.node.uuid,
                                             'system': system.identity})
 
-        # NOTE(iurygregory): normally we only relay on the System to
-        # perform actions, but to retrieve the BMC Firmware we need to
-        # access the Manager.
         try:
             manager = redfish_utils.get_manager(task.node, system)
             if manager.firmware_version:
@@ -123,31 +125,48 @@ class RedfishFirmware(base.FirmwareInterface):
                           '%(node_uuid)s manager %(manager)s',
                           {'node_uuid': task.node.uuid,
                            'manager': manager.identity})
-        except exception.RedfishError:
+        except (exception.RedfishError, sushy.exceptions.SushyError):
+            if redfish_utils.BMC in required_types:
+                raise
             LOG.warning('No manager available to retrieve Firmware '
                         'from the bmc of node %s', task.node.uuid)
 
         nic_components = None
+        nic_identities = []
         try:
-            nic_components = self.retrieve_nic_components(task, system)
+            if redfish_utils.NIC in required_types:
+                nic_identities, nic_components = self._read_nic_inventory(
+                    task, system, strict=True)
+            else:
+                nic_components = self.retrieve_nic_components(task, system)
+        except exception.UnsupportedDriverExtension:
+            if redfish_utils.NIC in known_supported_types or nic_bindings:
+                raise exception.RedfishError(error=_(
+                    'Previously supported NetworkAdapters inventory is '
+                    'temporarily unavailable'))
+            unsupported_types.add(redfish_utils.NIC)
+            LOG.warning('NIC firmware inventory is unsupported on node %s',
+                        task.node.uuid)
         except (exception.RedfishError,
                 sushy.exceptions.BadRequestError,
                 sushy.exceptions.MissingAttributeError) as e:
-            # NOTE(janders) if an exception is raised, log a warning
-            # with exception details. This is important for HP hardware
-            # which at the time of writing this are known to return 400
-            # responses to GET NetworkAdapters while OS isn't fully booted
+            if redfish_utils.NIC in required_types:
+                raise
             LOG.warning('Unable to access NetworkAdapters on node '
                         '%(node_uuid)s, Error: %(error)s',
                         {'node_uuid': task.node.uuid, 'error': e})
-        # NOTE(janders) if no exception is raised but no NICs are returned,
-        # state that clearly but in a lower severity message
         if nic_components == []:
             LOG.debug('Could not retrieve Firmware Package Version from '
                       'NetworkAdapters on node %(node_uuid)s',
                       {'node_uuid': task.node.uuid})
         elif nic_components:
-            settings.extend(nic_components)
+            settings.extend({key: value for key, value in entry.items()
+                             if key != '_identity'}
+                            for entry in nic_components)
+
+        self._verify_inventory(settings, nic_components or [],
+                               required_components, nic_bindings or {},
+                               unsupported_types, nic_identities)
 
         if not settings:
             error_msg = (_('Cannot retrieve firmware for node %s: no '
@@ -158,7 +177,6 @@ class RedfishFirmware(base.FirmwareInterface):
         create_list, update_list, nochange_list = (
             objects.FirmwareComponentList.sync_firmware_components(
                 task.context, node_id, settings))
-
         if create_list:
             for new_fw in create_list:
                 new_fw_cmp = objects.FirmwareComponent(
@@ -187,43 +205,124 @@ class RedfishFirmware(base.FirmwareInterface):
                 up_fw_cmp.serial_number = up_fw.get('serial_number')
                 up_fw_cmp.save()
 
-    def retrieve_nic_components(self, task, system):
-        """Helper function to retrieve all NICs components on a given node.
+    def _verify_inventory(self, settings, nics, required, bindings,
+                          unsupported, identities):
+        """Check requested availability before publishing a partial cache."""
+        available = {entry['component'] for entry in settings}
+        if any(redfish_utils.get_component_type(component) == redfish_utils.NIC
+               for component in required):
+            available -= {entry['component'] for entry in nics}
+            available.update(self._available_nic_components(
+                nics, identities, required, bindings))
+        missing = [component for component in required
+                   if component not in available
+                   and redfish_utils.get_component_type(component)
+                   not in unsupported]
+        if missing:
+            raise exception.RedfishError(error=_(
+                'Firmware inventory is not yet available for: %s')
+                % ', '.join(missing))
 
-        :param task: a TaskManager instance.
-        :param system: a Redfish System object
-        :returns: a list of NIC components
+    def _nic_identity(self, adapter):
+        return {'id': adapter.identity,
+                'serial': adapter.serial_number or None,
+                'uri': getattr(adapter, 'path', None)}
+
+    def _nic_aliases(self, identity):
+        return {redfish_utils.NIC_COMPONENT_PREFIX + value
+                for value in (identity['id'], identity['serial']) if value}
+
+    def _same_nic(self, expected, actual):
+        if expected.get('serial'):
+            if expected['serial'] != actual['serial']:
+                return False
+            if (expected.get('serial_unique', True)
+                    and actual.get('serial_unique', False)):
+                return True
+        if expected.get('uri'):
+            return expected['uri'] == actual['uri']
+        return expected['id'] == actual['id']
+
+    def _available_nic_components(self, inventory, identities, required,
+                                  bindings):
+        """Resolve identity against all adapters, then check its version."""
+        available = set()
+        readable = [entry['_identity'] for entry in inventory]
+        for requested in required:
+            binding = bindings.get(requested)
+            if binding and binding.get('serial') and any(
+                    identity['serial'] == binding['serial']
+                    and not identity['serial_unique']
+                    for identity in identities):
+                # Once duplicates are observed, a later partial enumeration
+                # cannot restore serial-only trust for this in-flight update.
+                binding['serial_unique'] = False
+            matches = [identity for identity in identities
+                       if (self._same_nic(binding, identity) if binding
+                           else requested in self._nic_aliases(identity))]
+            if len(matches) == 1 and matches[0] in readable:
+                available.add(requested)
+        return available
+
+    def retrieve_nic_components(self, task, system, strict=False,
+                                include_identifiers=False):
+        """Read NIC inventory, propagating failures when strict."""
+        _identities, components = self._read_nic_inventory(
+            task, system, strict)
+        if include_identifiers:
+            return components
+        return [{key: value for key, value in entry.items()
+                 if key != '_identity'} for entry in components]
+
+    def _read_nic_inventory(self, task, system, strict=False):
+        """Return all adapter identities and their version-bearing entries.
+
+        Identity and serial uniqueness use the complete enumeration, including
+        adapters with no controllers or readable versions. Those adapters must
+        not disappear from alias resolution during firmware recovery.
         """
         nic_list = []
         try:
             chassis = redfish_utils.get_chassis(task.node, system)
         except exception.RedfishError:
+            if strict:
+                raise
             LOG.debug('No chassis available to retrieve NetworkAdapters '
                       'firmware information on node %(node_uuid)s',
                       {'node_uuid': task.node.uuid})
-            return nic_list
-
+            return [], nic_list
         try:
             network_adapters = chassis.network_adapters
             if network_adapters is None:
+                if strict:
+                    raise exception.UnsupportedDriverExtension(
+                        'NetworkAdapters is not supported')
                 LOG.debug('NetworkAdapters not available on chassis for '
                           'node %(node_uuid)s',
                           {'node_uuid': task.node.uuid})
-                return nic_list
-            adapters = network_adapters.get_members()
+                return [], nic_list
         except sushy.exceptions.MissingAttributeError:
+            if strict:
+                raise exception.UnsupportedDriverExtension(
+                    'NetworkAdapters is not supported')
             LOG.debug('NetworkAdapters not available on chassis for '
                       'node %(node_uuid)s',
                       {'node_uuid': task.node.uuid})
-            return nic_list
+            return [], nic_list
 
+        adapters = network_adapters.get_members()
+        serials = [adapter.serial_number for adapter in adapters]
+        identities = []
         for net_adp in adapters:
+            identity = self._nic_identity(net_adp)
+            identity['serial_unique'] = bool(identity['serial']) and (
+                serials.count(identity['serial']) == 1)
+            identities.append(identity)
             for net_adp_ctrl in net_adp.controllers:
                 fw_pkg_v = net_adp_ctrl.firmware_package_version
                 if not fw_pkg_v:
                     continue
-
-                if net_adp.serial_number:
+                if identity['serial_unique']:
                     net_adp_id = net_adp.serial_number
                     LOG.debug('Using SerialNumber %(serial_number)s for '
                               'NetworkAdapter %(net_adp_id)s',
@@ -235,19 +334,17 @@ class RedfishFirmware(base.FirmwareInterface):
                               'NetworkAdapter %(net_adp_id)s',
                               {'identity': net_adp.identity,
                                'net_adp_id': net_adp.identity})
-
-                net_adp_fw = {
-                    'component': (
-                        redfish_utils.NIC_COMPONENT_PREFIX
-                        + net_adp_id),
+                component = {
+                    'component': (redfish_utils.NIC_COMPONENT_PREFIX
+                                  + net_adp_id),
                     'current_version': fw_pkg_v,
                     'vendor': net_adp.manufacturer,
                     'model': net_adp.model,
                     'serial_number': net_adp.serial_number,
                 }
-                nic_list.append(net_adp_fw)
-
-        return nic_list
+                component['_identity'] = identity
+                nic_list.append(component)
+        return identities, nic_list
 
     @METRICS.timer('RedfishFirmware.update')
     @base.deploy_step(priority=0, abortable=False,

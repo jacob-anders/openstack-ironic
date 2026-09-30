@@ -12,10 +12,13 @@
 #    under the License.
 
 import datetime
+import inspect
 import json
 import time
+from types import SimpleNamespace
 from unittest import mock
 
+import ddt
 from oslo_config import cfg
 from oslo_utils import timeutils
 import sushy
@@ -26,10 +29,13 @@ from ironic.conductor import task_manager
 from ironic.conductor import utils as manager_utils
 from ironic.conf import CONF
 from ironic.drivers.modules import deploy_utils
+from ironic.drivers.modules.redfish import firmware
 from ironic.drivers.modules.redfish import firmware as redfish_fw
 from ironic.drivers.modules.redfish import firmware_utils
+from ironic.drivers.modules.redfish import utils
 from ironic.drivers.modules.redfish import utils as redfish_utils
 from ironic import objects
+from ironic.tests.unit.db import base
 from ironic.tests.unit.db import base as db_base
 from ironic.tests.unit.db import utils as db_utils
 from ironic.tests.unit.objects import utils as obj_utils
@@ -37,10 +43,10 @@ from ironic.tests.unit.objects import utils as obj_utils
 INFO_DICT = db_utils.get_test_redfish_info()
 
 
-class RedfishFirmwareTestCase(db_base.DbTestCase):
+class RedfishFirmwareLegacyTestCase(db_base.DbTestCase):
 
     def setUp(self):
-        super(RedfishFirmwareTestCase, self).setUp()
+        super(RedfishFirmwareLegacyTestCase, self).setUp()
         self.config(enabled_bios_interfaces=['redfish'],
                     enabled_hardware_types=['redfish'],
                     enabled_power_interfaces=['redfish'],
@@ -3188,3 +3194,162 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
             self.assertTrue(
                 refreshed_settings[0].get('bios_reboot_triggered'),
                 'Flag must be persisted to database')
+
+
+@ddt.ddt
+class RedfishFirmwareTestCase(base.DbTestCase):
+
+    def setUp(self):
+        super().setUp()
+        self.config(enabled_bios_interfaces=['redfish'],
+                    enabled_hardware_types=['redfish'],
+                    enabled_power_interfaces=['redfish'],
+                    enabled_boot_interfaces=['redfish-virtual-media'],
+                    enabled_management_interfaces=['redfish'],
+                    enabled_firmware_interfaces=['redfish'])
+        self.node = obj_utils.create_test_node(
+            self.context, driver='redfish',
+            driver_info=db_utils.get_test_redfish_info(),
+            properties={'vendor': 'Generic'})
+        self.firmware = firmware.RedfishFirmware()
+        self.system = self._patch(utils, 'get_system').return_value
+        self.system.bios_version = '1.0'
+        self.manager = self._patch(utils, 'get_manager').return_value
+        self.manager.firmware_version = '2.0'
+        self.manager.model = 'BMC'
+        self.chassis = self._patch(utils, 'get_chassis').return_value
+        self.adapter = SimpleNamespace(
+            identity='1', serial_number=None,
+            manufacturer='NIC vendor', model='NIC',
+            controllers=[SimpleNamespace(firmware_package_version='3.0')])
+        self.chassis.network_adapters.get_members.return_value = [self.adapter]
+
+    def _patch(self, target, attribute, **kwargs):
+        patcher = mock.patch.object(target, attribute, autospec=True, **kwargs)
+        self.addCleanup(patcher.stop)
+        return patcher.start()
+
+    def _cache(self, **kwargs):
+        with task_manager.acquire(self.context, self.node.uuid) as task:
+            self.firmware.cache_firmware_components(task, **kwargs)
+        return {component.component: component.current_version
+                for component in objects.FirmwareComponentList.get_by_node_id(
+                    self.context, self.node.id)}
+
+    def test_settings_only_api_and_no_declared_state_machine(self):
+        self.assertEqual(['self', 'task', 'settings'], list(
+            inspect.signature(firmware.RedfishFirmware.update).parameters))
+        self.assertFalse(hasattr(firmware, 'FIRMWARE_UPDATE_STATE'))
+        self.assertFalse(hasattr(firmware, '_TRANSITIONS'))
+
+    def test_create_all_components(self):
+        self.assertEqual({'bios': '1.0', 'bmc': '2.0', 'nic:1': '3.0'},
+                         self._cache())
+
+    def test_update_existing_components(self):
+        self._cache()
+        self.system.bios_version = '1.1'
+        self.assertEqual({'bios': '1.1', 'bmc': '2.0', 'nic:1': '3.0'},
+                         self._cache())
+        self.assertEqual(3, len(
+            objects.FirmwareComponentList.get_by_node_id(
+                self.context, self.node.id)))
+
+    @ddt.data('bios', 'bmc', 'nic:1')
+    def test_discovery_can_omit_unavailable_component(self, component):
+        if component == 'bios':
+            self.system.bios_version = None
+        elif component == 'bmc':
+            self.manager.firmware_version = None
+        else:
+            self.adapter.controllers[0].firmware_package_version = None
+        versions = self._cache()
+        self.assertNotIn(component, versions)
+        self.assertEqual(2, len(versions))
+
+    def test_missing_all_components(self):
+        self.system.bios_version = None
+        self.manager.firmware_version = None
+        self.chassis.network_adapters = None
+        self.assertRaises(exception.UnsupportedDriverExtension, self._cache)
+
+    def test_nic_serial_preferred_for_discovery(self):
+        self.adapter.serial_number = 'SERIAL'
+        versions = self._cache()
+        self.assertIn('nic:SERIAL', versions)
+        self.assertNotIn('nic:1', versions)
+
+    @ddt.data('manager', 'chassis', 'members')
+    def test_discovery_read_failures_are_best_effort(self, resource):
+        reader = {'manager': utils.get_manager,
+                  'chassis': utils.get_chassis,
+                  'members': self.chassis.network_adapters.get_members}[
+                      resource]
+        reader.side_effect = exception.RedfishConnectionError(
+            node=self.node.uuid, error='temporarily down')
+        versions = self._cache()
+        self.assertIn('bios', versions)
+        self.assertNotIn('bmc' if resource == 'manager' else 'nic:1', versions)
+
+    @ddt.data('manager', 'chassis', 'members')
+    def test_requested_inventory_read_failure_propagates(self, resource):
+        reader = {'manager': utils.get_manager,
+                  'chassis': utils.get_chassis,
+                  'members': self.chassis.network_adapters.get_members}[
+                      resource]
+        reader.side_effect = exception.RedfishConnectionError(
+            node=self.node.uuid, error='temporarily down')
+        requested = 'bmc' if resource == 'manager' else 'nic:1'
+        self.assertRaises(exception.RedfishConnectionError, self._cache,
+                          required_components=[requested])
+        self.assertEqual([], list(
+            objects.FirmwareComponentList.get_by_node_id(
+                self.context, self.node.id)))
+
+    @ddt.data(sushy.exceptions.BadRequestError,
+              sushy.exceptions.MissingAttributeError)
+    def test_member_read_errors_do_not_become_unsupported(self, error_type):
+        if error_type is sushy.exceptions.BadRequestError:
+            error = error_type('GET', '/NetworkAdapters',
+                               mock.Mock(status_code=400))
+        else:
+            error = error_type(attribute='Members', resource='NIC')
+        self.chassis.network_adapters.get_members.side_effect = error
+        self.assertRaises(error_type, self._cache,
+                          required_components=['nic:1'])
+
+    @ddt.data(False, True)
+    def test_explicitly_absent_nic_capability(self, previously_supported):
+        self.chassis.network_adapters = None
+        if previously_supported:
+            self.assertRaises(exception.RedfishError, self._cache,
+                              required_components=['nic:1'],
+                              known_supported_types=['nic'])
+        else:
+            self.assertEqual({'bios': '1.0', 'bmc': '2.0'},
+                             self._cache(required_components=['nic:1']))
+
+    def test_missing_requested_component_does_not_publish_partial_cache(self):
+        self.assertRaises(exception.RedfishError, self._cache,
+                          required_components=['nic:2'])
+        self.assertEqual([], list(
+            objects.FirmwareComponentList.get_by_node_id(
+                self.context, self.node.id)))
+
+    @ddt.data('duplicate_serial', 'id_serial_collision')
+    def test_unbound_alias_uses_identities_without_versions(self, ambiguity):
+        self.adapter.serial_number = 'SHARED'
+        self.adapter.controllers = []
+        peer = SimpleNamespace(
+            identity='2' if ambiguity == 'duplicate_serial' else 'SHARED',
+            serial_number=('SHARED'
+                           if ambiguity == 'duplicate_serial' else None),
+            manufacturer='NIC vendor', model='NIC',
+            controllers=[SimpleNamespace(firmware_package_version='4.0')])
+        self.chassis.network_adapters.get_members.return_value = [
+            self.adapter, peer]
+        self.assertRaises(exception.RedfishError, self._cache,
+                          required_components=['nic:SHARED'])
+        self.assertEqual([], list(
+            objects.FirmwareComponentList.get_by_node_id(
+                self.context, self.node.id)))
