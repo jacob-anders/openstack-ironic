@@ -1,0 +1,7 @@
+fixes:
+  - |
+    Firmware update failures and conductor callback timeouts preserve host
+    power and boot configuration and place the node in maintenance. This
+    suppresses configured cleaning and servicing failure power-offs because
+    firmware may still be flashing or staged for the next boot. Inspect the
+    BMC jobs before recovery; do not power-cycle a node that may be flashing.

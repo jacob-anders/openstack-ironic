@@ -541,6 +541,20 @@ def cleanup_cleanwait_timeout(task):
                            set_fail_state=False)
 
 
+def _preserve_firmware_power(node, errmsg):
+    """Keep failure handling from interrupting a possible firmware flash."""
+    preserve = bool(node.driver_internal_info.get(
+        async_steps.FIRMWARE_UPDATE_IN_PROGRESS)
+        or node.driver_internal_info.get('redfish_fw_updates'))
+    if preserve:
+        errmsg += _(' Firmware may still be flashing or staged for the next '
+                    'boot. Do not power-cycle the node. Inspect the BMC '
+                    'firmware jobs before recovery.')
+        node.maintenance = True
+        node.maintenance_reason = errmsg
+    return preserve, errmsg
+
+
 def cleaning_error_handler(task, logmsg, errmsg=None, traceback=False,
                            tear_down_cleaning=True, set_fail_state=True,
                            set_maintenance=None):
@@ -562,14 +576,16 @@ def cleaning_error_handler(task, logmsg, errmsg=None, traceback=False,
     if set_maintenance is None:
         set_maintenance = bool(task.node.clean_step)
 
-    errmsg = errmsg or logmsg
+    preserve_power, errmsg = _preserve_firmware_power(
+        task.node, errmsg or logmsg)
     LOG.error(logmsg, exc_info=traceback)
     node = task.node
-    if set_maintenance:
-        node.fault = faults.CLEAN_FAILURE
+    if set_maintenance or preserve_power:
+        if not preserve_power or not node.fault:
+            node.fault = faults.CLEAN_FAILURE
         node.maintenance = True
 
-    if tear_down_cleaning:
+    if tear_down_cleaning and not preserve_power:
         try:
             task.driver.deploy.tear_down_cleaning(task)
         except Exception as e:
@@ -602,7 +618,7 @@ def cleaning_error_handler(task, logmsg, errmsg=None, traceback=False,
     if not node.maintenance_reason and set_maintenance:
         node.maintenance_reason = errmsg
 
-    if CONF.conductor.poweroff_in_cleanfail:
+    if CONF.conductor.poweroff_in_cleanfail and not preserve_power:
         # NOTE(NobodyCam): Power off node in clean fail
         node_power_action(task, states.POWER_OFF)
 
@@ -722,7 +738,9 @@ def deploying_error_handler(task, logmsg, errmsg=None, traceback=False,
     :param traceback: Boolean; True to log a traceback
     :param clean_up: Boolean; True to clean up
     """
-    errmsg = errmsg or logmsg
+    preserve_power, errmsg = _preserve_firmware_power(
+        task.node, errmsg or logmsg)
+    clean_up = clean_up and not preserve_power
     node = task.node
     LOG.error(logmsg, exc_info=traceback)
     node_history_record(node, event=errmsg, event_type=states.DEPLOYING,
@@ -2097,14 +2115,16 @@ def servicing_error_handler(task, logmsg, errmsg=None, traceback=False,
     if set_maintenance is None:
         set_maintenance = bool(task.node.service_step)
 
-    errmsg = errmsg or logmsg
+    preserve_power, errmsg = _preserve_firmware_power(
+        task.node, errmsg or logmsg)
     LOG.error(logmsg, exc_info=traceback)
     node = task.node
-    if set_maintenance:
-        node.fault = faults.SERVICE_FAILURE
+    if set_maintenance or preserve_power:
+        if not preserve_power or not node.fault:
+            node.fault = faults.SERVICE_FAILURE
         node.maintenance = True
 
-    if tear_down_service:
+    if tear_down_service and not preserve_power:
         try:
             task.driver.deploy.tear_down_service(task)
         except Exception as e:
@@ -2133,7 +2153,7 @@ def servicing_error_handler(task, logmsg, errmsg=None, traceback=False,
     if not node.maintenance_reason and set_maintenance:
         node.maintenance_reason = errmsg
 
-    if CONF.conductor.poweroff_in_servicefail:
+    if CONF.conductor.poweroff_in_servicefail and not preserve_power:
         # NOTE(NobodyCam): Power off node in service fail
         node_power_action(task, states.POWER_OFF)
 

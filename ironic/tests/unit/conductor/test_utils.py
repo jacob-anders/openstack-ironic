@@ -1436,6 +1436,7 @@ class ErrorHandlersTestCase(db_base.DbTestCase):
                                  target_provision_state=states.NOSTATE,
                                  maintenance=False, maintenance_reason=None,
                                  id=fake_node.id)
+        self.node.driver_internal_info.get.return_value = None
         self.task.context = self.context
 
     @mock.patch.object(conductor_utils, 'LOG', autospec=True)

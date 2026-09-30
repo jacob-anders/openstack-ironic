@@ -837,6 +837,8 @@ class RedfishFirmware(base.FirmwareInterface):
         :param error_msg: the error message string
         :param traceback: whether to include traceback (default True)
         """
+        task.node.set_driver_internal_info(
+            async_steps.FIRMWARE_UPDATE_IN_PROGRESS, True)
         if task.node.clean_step:
             manager_utils.cleaning_error_handler(
                 task, error_msg, traceback=traceback)
@@ -1341,12 +1343,7 @@ class RedfishFirmware(base.FirmwareInterface):
                 {'node': node.uuid,
                  'firmware_image': current_update['url']})
             self._clear_updates(node)
-            if task.node.clean_step:
-                manager_utils.cleaning_error_handler(task, error_msg)
-            elif task.node.deploy_step:
-                manager_utils.deploying_error_handler(task, error_msg)
-            elif task.node.service_step:
-                manager_utils.servicing_error_handler(task, error_msg)
+            self._report_step_error(task, error_msg, traceback=False)
             return
         else:
             LOG.info('BIOS firmware update task disappeared for node '
