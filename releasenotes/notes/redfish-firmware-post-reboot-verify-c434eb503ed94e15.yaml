@@ -1,0 +1,23 @@
+---
+fixes:
+  - |
+    Redfish firmware updates verify each component before submitting the next
+    one or resuming cleaning, servicing or deployment. A completed staging task
+    does not establish that the firmware was applied. After the apply reboot,
+    supported Dell Lifecycle Controller jobs must finish successfully and
+    BootProgress must reach the target for the current operation. Inventory is
+    refreshed only after application and host recovery.
+  - |
+    Servicing requires OSRunning where reported; cleaning and deployment also
+    accept hardware initialization completion or setup. An explicitly configured
+    limited BootProgress policy, or absent telemetry, uses the bounded
+    firmware_update_boot_check_delay. Supported job checks remain mandatory.
+upgrade:
+  - |
+    The per-component firmware_update_apply_timeout bounds staging, application
+    and recovery even when the overall firmware timeout is disabled. The
+    firmware_update_post_reboot_verify_timeout additionally bounds the apply
+    reboot checks. The narrower firmware_update_os_running_timeout starts after
+    POST; expiry fails the step rather than weakening a supported check.
+    firmware_update_reboot_min_wait and firmware_update_inventory_wait are
+    minimum observation and publication delays.

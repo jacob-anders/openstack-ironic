@@ -1,0 +1,7 @@
+---
+fixes:
+  - |
+    BMC resource stability validation now runs only after a BMC firmware update.
+    It samples System, Manager and NetworkAdapters across firmware polls until
+    the required consecutive successful reads are observed. Host firmware
+    updates use their application and boot verification gates instead.

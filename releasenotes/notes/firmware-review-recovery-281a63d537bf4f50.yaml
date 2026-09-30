@@ -1,0 +1,38 @@
+fixes:
+  - |
+    Redfish firmware updates recover from a transient pre-reboot observation
+    failure without publishing incomplete reset intent or skipping the apply
+    reboot. Lost reset responses still cannot replay the hardware action.
+  - |
+    Unreadable staging Tasks remain in bounded recovery instead of aborting
+    monitoring of subsequent nodes. Unexpected monitoring errors fail the
+    affected node with diagnostics and preserved power.
+  - |
+    NIC update verification resolves Redfish-ID and serial-number aliases to
+    the same adapter. Identity bindings survive conductor restart and prevent
+    a missing or replacement adapter from satisfying verification. Recovery
+    checks serial uniqueness against all enumerated adapters, including those
+    without readable firmware versions, before accepting a renumbered target.
+  - |
+    The post-reboot firmware deadline continues through inventory recovery and
+    late Lifecycle Controller jobs. Power-preserving failures retain tracked job
+    outcomes in diagnostics after retiring the executable queue.
+deprecations:
+  - |
+    The ignored ``[redfish]firmware_update_bmc_timeout`` and
+    ``[redfish]firmware_update_wait_unresponsive_bmc`` options, and per-node
+    ``firmware_update_unresponsive_bmc_wait`` property, are deprecated. Use the
+    component apply and BMC resource-validation deadlines instead.
+upgrade:
+  - |
+    Check firmware recovery budgets when upgrading to the revised workflow.
+    The legacy ``[redfish]firmware_update_bmc_timeout`` and
+    ``[redfish]firmware_update_wait_unresponsive_bmc`` settings, and per-node
+    ``firmware_update_unresponsive_bmc_wait``, do not control this workflow.
+    Setting them will not extend its recovery waits. Use
+    ``[redfish]firmware_update_apply_timeout`` for the total per-component budget,
+    ``[redfish]firmware_update_resource_validation_timeout`` for BMC resource
+    recovery, and ``[redfish]firmware_update_post_reboot_verify_timeout`` for
+    verification following a host apply reboot. Include the configured minimum
+    waits within those budgets. The deprecation marks already-unused settings;
+    it does not itself change their runtime effect.

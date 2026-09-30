@@ -1,31 +1,26 @@
 Firmware Updates
 ================
 
-The firmware update step allows one or more firmware updates to be applied
-to a node via cleaning or servicing. If multiple updates are specified, then
-they are applied
-sequentially in the order given. The server is rebooted once per update.
-If a failure occurs, the step immediately fails which may result
-in some updates not being applied. If the node is placed into maintenance
-mode while a firmware update step is running that is performing
-multiple firmware updates, the update in progress will complete, and processing
-of the remaining updates will pause.  When the node is taken out of maintenance
-mode, processing of the remaining updates will continue.
+The firmware update step applies components sequentially in the requested order
+during cleaning, deployment or servicing. Each non-BMC component receives its
+own apply reboot. BMC firmware uses version and resource-recovery checks and may
+require a host handoff reboot before another component can be submitted.
+
+The current component is retained until its available task/job, host-recovery
+and inventory checks pass. A failure stops the queue, preserves power and places
+the node in maintenance. The executable queue is discarded so it cannot resume
+automatically; diagnostics and tracked job outcomes remain in the node's error
+and history. Inspect the BMC jobs before recovering and retrying an update.
 
 .. note:: Only :doc:`/admin/drivers/redfish` supports firmware updates
    currently.
 
-When updating the BMC firmware, the BMC may become unavailable for a period of
-time as it resets. In this case, it may be desirable to have the step
-wait after the update has been applied before indicating that the
-update was successful. This allows the BMC time to fully reset before further
-operations are carried out against it. To cause the step to wait after
-applying an update, an optional ``wait`` argument may be specified in the
-firmware image dictionary. The value of this argument indicates the number of
-seconds to wait following the update. If the ``wait`` argument is not
-specified, then this is equivalent to ``wait 0``, meaning that it will not
-wait and immediately proceed with the next firmware update if there is one,
-or complete the step if not.
+The optional per-component ``wait`` has different uses. For a BMC update it
+controls the initial/version-check wait, defaulting to
+``[redfish]firmware_update_reboot_delay`` (300 seconds). For a non-BMC component
+it sets a minimum post-application settling interval, with
+``firmware_update_inventory_wait`` providing the lower bound. Elapsed time alone
+does not replace a required firmware-job outcome.
 
 How it works
 ------------
@@ -76,7 +71,7 @@ Each firmware image dictionary is of the form::
     {
       "component": "The desired component to have the firmware updated, supported components are listed below",
       "url": "<URL of firmware image file>",
-      "wait": <Optional time in seconds to wait after applying update>
+      "wait": <Optional settling interval or BMC version-check wait in seconds>
     }
 
 .. csv-table::
@@ -87,11 +82,89 @@ Each firmware image dictionary is of the form::
     "bios", "The BIOS firmware"
     "nic:<NIC_REDFISH_ID>", "Since machines can have multiple NICs, we use **nic:** as prefix plus the **NIC_REDFISH_ID** to identify the NIC to update"
 
+When NetworkAdapters inventory is readable, ``nic:<SerialNumber>`` is also
+accepted if it identifies exactly one adapter. Ironic binds either form before
+submission and verifies that same adapter after recovery. A unique serial can
+identify the adapter if its Redfish ID changes. Duplicate serials require an
+unambiguous Redfish ID; unknown or ambiguous names are rejected before the image
+is submitted. Missing requested inventory remains a recovery failure, rather
+than being satisfied by another adapter's firmware version.
+
 The ``component`` and ``url`` arguments in the firmware image dictionary are
 mandatory, while the ``wait`` argument is optional.
 
 For ``url`` currently ``http``, ``https``, ``swift`` and ``file`` schemes are
 supported.
+
+Verification policies
+---------------------
+
+Dell Lifecycle Controller jobs must report successful application, including
+late jobs discovered while inventory settles. A missing or unreadable job does
+not establish success. If a job fails while another is still running, Ironic
+fails the step in maintenance without powering off, rebooting or continuing to
+another image. Retiring the Ironic queue does not cancel BMC-side jobs.
+
+``driver_info/firmware_update_boot_progress`` defaults to ``auto``. Reported
+readiness is required: ``OSRunning`` for servicing, with hardware initialization
+completion, OS boot start or setup also accepted for cleaning/deployment.
+For a platform documented to report only intermediate stages, explicitly set
+``limited`` to use the configured boot-check delay. A stalled supported check is
+not automatically classified as unavailable. Available job checks still apply.
+
+``driver_info/firmware_update_bios_pending_reset`` defaults to ``auto``, which
+waits for Pending or Running BIOS tasks. For hardware documented to retain these
+states until reset, ``compatibility`` permits the apply reset after the staging
+wait. This policy must not be used for tasks that are actively flashing.
+Application and boot verification are still required after that reset.
+
+For example, select a documented platform policy with:
+
+.. code-block:: console
+
+   $ baremetal node set <node> --driver-info firmware_update_boot_progress=limited
+   $ baremetal node set <node> --driver-info firmware_update_bios_pending_reset=compatibility
+
+Some platforms, notably HPE, expose NIC inventory only while an OS is running.
+Keep the instance OS running during servicing, or boot IPA before day-0 NIC
+updates. Ironic waits for supported inventory to become readable before staging.
+
+Timeout hierarchy
+-----------------
+
+The first applicable deadline to expire fails the update. All values below are
+``[redfish]`` configuration options, in seconds:
+
+* ``firmware_update_overall_timeout`` (7200) bounds the complete settings list.
+  Zero disables only this overall limit.
+* ``firmware_update_apply_timeout`` (1800) bounds one component from preparation
+  through staging, application and inventory recovery. It always remains finite.
+* ``firmware_update_post_reboot_verify_timeout`` (1800) bounds all remaining
+  verification from the apply-reset request, including inventory recovery and
+  late LC jobs. Entering inventory does not restart or bypass it. Zero disables
+  this narrower deadline while the component limit remains enforced.
+* ``firmware_update_os_running_timeout`` (300) bounds the servicing wait from
+  observed POST completion to OSRunning. Zero uses the broader budgets.
+* ``firmware_update_resource_validation_timeout`` (480) bounds BMC resource
+  recovery, also within the component and overall budgets.
+
+``firmware_update_reboot_min_wait`` (60), ``firmware_update_boot_check_delay``
+(600 for absent/limited telemetry) and ``firmware_update_inventory_wait`` (60)
+are minimum waits, not permission to bypass supported checks. Include these and
+any explicit per-component ``wait`` in the applicable deadline budgets. For
+slow POST, increase the post-reboot and component budgets together; for a slow
+BMC update, size the component and resource-recovery budgets for that hardware.
+
+Reads occur on ``firmware_update_status_interval`` (60) polls. The BMC
+``firmware_update_validation_interval`` (30) is a minimum between samples, not
+a blocking sleep. At default settings, three consecutive successful samples
+span at least 120 seconds from the first sample to the third. Failed samples
+restart the success count, without extending the validation deadline.
+
+The legacy ``firmware_update_bmc_timeout`` and
+``firmware_update_wait_unresponsive_bmc`` options, and the per-node
+``firmware_update_unresponsive_bmc_wait`` property, are deprecated and ignored by
+this interface. They do not extend these budgets.
 
 Applying updates
 ----------------

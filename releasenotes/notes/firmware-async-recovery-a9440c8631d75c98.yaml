@@ -1,0 +1,16 @@
+fixes:
+  - |
+    Firmware reboot observation and BMC resource validation use periodic samples
+    rather than blocking conductor workers. The sequential update queue retains
+    each component's task/job evidence and recovery timestamps until verification
+    completes. Submission and reset intent are persisted before hardware actions
+    so ambiguous responses cannot cause those actions to be replayed.
+  - |
+    Firmware periodics revalidate the node's lifecycle state under the exclusive
+    lock before acting. Failures preserve power and maintenance diagnostics
+    before cleanup; a cleanup error does not bypass the failure transition.
+upgrade:
+  - |
+    An in-flight firmware queue without the new per-component evidence cannot be
+    safely resumed. It fails into maintenance without another submission or
+    reset, so the operator can inspect BMC tasks and jobs before retrying.

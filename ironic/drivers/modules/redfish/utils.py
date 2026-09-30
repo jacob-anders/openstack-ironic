@@ -74,10 +74,8 @@ OPTIONAL_PROPERTIES = {
                            'default value is taken from Ironic '
                            'configuration as ``[redfish]auth_type`` option.'),
     'firmware_update_unresponsive_bmc_wait': _(
-        'Number of seconds to wait to avoid the BMC becoming unresponsive '
-        'during firmware updates. If not set, the default value is taken from '
-        'the Ironic configuration ``firmware_update_wait_unresponsive_bmc`` '
-        'in the ``[redfish]`` section.'),
+        'Deprecated and ignored by the firmware interface. Firmware recovery '
+        'uses the component apply and BMC resource-validation deadlines.'),
     'redfish_tls_minimum_version': _(
         'Minimum TLS protocol version for connections to the '
         'Redfish BMC. Can be "1.1", "1.2", or "1.3". If not '
@@ -110,6 +108,26 @@ NIC = "nic"
 
 FIRMWARE_COMPONENTS = [BIOS, BMC]
 """Firmware Components available to update"""
+
+# Readiness targets are separate from firmware outcomes and reset evidence.
+BOOT_PROGRESS_SERVICE_TARGETS = frozenset({
+    sushy.BootProgressStates.OS_RUNNING,
+})
+
+# The firmware boot gate starts the narrower OS-running deadline after POST.
+BOOT_PROGRESS_POST_COMPLETE = frozenset({
+    sushy.BootProgressStates.HARDWARE_COMPLETE,
+    sushy.BootProgressStates.OS_BOOT_STARTED,
+    sushy.BootProgressStates.OS_RUNNING,
+})
+
+# Cleaning and deployment need not boot a tenant OS to be ready.
+BOOT_PROGRESS_CLEAN_TARGETS = frozenset({
+    sushy.BootProgressStates.HARDWARE_COMPLETE,
+    sushy.BootProgressStates.SETUP,
+    sushy.BootProgressStates.OS_BOOT_STARTED,
+    sushy.BootProgressStates.OS_RUNNING,
+})
 
 
 def get_component_type(component):
@@ -712,3 +730,19 @@ def get_chassis(node, system):
                   'Error %(error)s',
                   {'system': system.identity, 'error': e})
         raise exception.RedfishError(error=e)
+
+
+def get_boot_progress_targets(node):
+    """Get the BootProgress target states for the node's current step.
+
+    :param node: an ironic node object.
+    :returns: a frozenset of ``sushy.BootProgressStates`` members that
+        satisfy the BootProgress gate for the step currently running on
+        the node.
+    """
+    if node.service_step:
+        return BOOT_PROGRESS_SERVICE_TARGETS
+    if node.clean_step or node.deploy_step:
+        return BOOT_PROGRESS_CLEAN_TARGETS
+    # Without an active step, use the more conservative servicing target.
+    return BOOT_PROGRESS_SERVICE_TARGETS

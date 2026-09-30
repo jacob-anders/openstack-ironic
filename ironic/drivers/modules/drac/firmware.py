@@ -229,38 +229,3 @@ def describe_tracked_jobs(tracking):
     jobs = (tracking or {}).get('jobs', {})
     return ', '.join('%s=%s' % (identity, state or 'unknown')
                      for identity, state in sorted(jobs.items()))
-
-
-def check_staged_job(task, jid):
-    """Distinguish armed firmware from downloads and active flashing."""
-    jobs = get_jobs(task)
-    if jobs is None:
-        return LC_JOBS_UNAVAILABLE, 'Dell job capability is not available'
-    for job in jobs:
-        if job['id'] != jid:
-            continue
-        detail = '%s: %s - %s' % (jid, job['state'], job['message'])
-        if job['state'] in FAILED_JOB_STATES:
-            return LC_JOBS_ERROR, detail
-        if job['state'] == 'Completed':
-            return LC_JOBS_DONE, detail
-        if job['state'] in STAGED_JOB_STATES:
-            return LC_JOBS_STAGED, detail
-        return LC_JOBS_RUNNING, detail
-    return LC_JOBS_RUNNING, '%s: missing' % jid
-
-
-def check_scheduled_idrac_job(task, current_update):
-    """Check the job associated with a disappeared BMC task monitor."""
-    uri = current_update.get('task_monitor', '')
-    if not uri:
-        return None
-    status, detail = check_staged_job(
-        task, uri.rstrip('/').rsplit('/', 1)[-1])
-    if status == LC_JOBS_UNAVAILABLE:
-        return None
-    if status == LC_JOBS_RUNNING:
-        # The sequential caller retries read errors. An active or not-yet
-        # published job is neither failed staging nor permission to reboot.
-        raise exception.RedfishError(error=detail)
-    return status in (LC_JOBS_STAGED, LC_JOBS_DONE)

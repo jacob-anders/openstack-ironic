@@ -713,6 +713,10 @@ class RedfishTaskMonitorNotFound(RedfishError):
     """The BMC has removed a task monitor (an actual HTTP 404)."""
 
 
+class FirmwareUpdateFailed(RedfishError):
+    """A terminal firmware failure, rather than a retryable Redfish error."""
+
+
 class RedfishConnectionError(RedfishError):
     _msg_fmt = _("Redfish connection failed for node %(node)s: %(error)s")
 
