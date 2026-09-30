@@ -84,9 +84,13 @@ class RedfishFirmwareTestCase(base.DbTestCase):
         self.assertIn('firmware_update_boot_progress', properties)
         self.assertIn('firmware_update_bios_pending_reset', properties)
 
-    def test_settings_only_api_with_declared_state_machine(self):
-        self.assertEqual(['self', 'task', 'settings'], list(
-            inspect.signature(firmware.RedfishFirmware.update).parameters))
+    def test_grouping_is_opt_in_with_declared_state_machine(self):
+        parameters = inspect.signature(
+            firmware.RedfishFirmware.update).parameters
+        self.assertEqual(
+            ['self', 'task', 'settings', 'allow_grouping_reboots'],
+            list(parameters))
+        self.assertIs(False, parameters['allow_grouping_reboots'].default)
         self.assertTrue(hasattr(firmware, 'FIRMWARE_UPDATE_STATE'))
         self.assertTrue(hasattr(firmware, '_TRANSITIONS'))
 

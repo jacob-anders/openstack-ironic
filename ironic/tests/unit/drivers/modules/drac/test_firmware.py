@@ -438,3 +438,165 @@ class CheckScheduledIdracJobTestCase(_LcJobsTestBase):
             self.assertRaises(sushy.exceptions.ConnectionError,
                               drac_fw.check_scheduled_idrac_job,
                               task, self.UPDATE)
+
+
+class TrackedLcJobsTestCase(_LcJobsTestBase):
+
+    @mock.patch.object(redfish_utils, 'get_system', autospec=True)
+    def test_get_jobs_uses_native_sushy_reader(self, get_system_mock):
+        job = mock.Mock(spec=['identity', 'job_state', 'job_type', 'message',
+                              'message_id'])
+        job.identity = 'JID_1'
+        job.job_state = 'Completed'
+        job.job_type = 'FirmwareUpdate'
+        job.message = None
+        job.message_id = 'RED001'
+        collection = self._mock_job_collection(get_system_mock, jobs=[job])
+
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            result = drac_fw.get_jobs(task)
+
+        self.assertEqual([{'id': 'JID_1', 'state': 'Completed',
+                           'type': 'FirmwareUpdate', 'message': 'RED001'}],
+                         result)
+        collection.get_jobs.assert_called_once_with()
+
+    @mock.patch.object(drac_fw, '_get_dell_job_collection', autospec=True)
+    def test_get_jobs_uses_expanded_collection_when_native_reader_is_missing(
+            self, get_collection):
+        collection = mock.Mock()
+        collection.get_jobs = None
+        collection.path = '/redfish/v1/Managers/1/Oem/Dell/Jobs'
+        collection._conn.get.return_value.json.return_value = {
+            'Members': [{'Id': 'JID_1', 'JobState': 'Failed',
+                         'JobType': 'FirmwareUpdate',
+                         'MessageId': 'RED002'}]}
+        get_collection.return_value = collection
+
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            result = drac_fw.get_jobs(task)
+
+        self.assertEqual([{'id': 'JID_1', 'state': 'Failed',
+                           'type': 'FirmwareUpdate', 'message': 'RED002'}],
+                         result)
+        collection._conn.get.assert_called_once_with(
+            collection.path + '?$expand=.($levels=1)')
+
+    @mock.patch.object(drac_fw, 'get_jobs', autospec=True)
+    def test_snapshot_and_staging_outcomes_survive_job_purging(self, get_jobs):
+        get_jobs.return_value = [{'id': 'old', 'state': 'Failed',
+                                  'type': 'FirmwareUpdate',
+                                  'message': 'historical failure'}]
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            tracking = drac_fw.snapshot_lc_jobs(task)
+            update = {'component': 'bios',
+                      'task_monitor': '/TaskMonitors/JID_1'}
+            get_jobs.return_value = [
+                {'id': 'old', 'state': 'Failed', 'type': 'FirmwareUpdate',
+                 'message': 'historical failure'},
+                {'id': 'JID_1', 'state': 'Scheduled',
+                 'type': 'FirmwareUpdate', 'message': 'armed'}]
+            status, _detail = drac_fw.check_staged_update(
+                task, update, tracking)
+            self.assertEqual(drac_fw.LC_JOBS_STAGED, status)
+
+            status, _detail = drac_fw.check_lc_jobs(
+                task, ['JID_1'], tracking, required=True)
+            self.assertEqual(drac_fw.LC_JOBS_RUNNING, status)
+
+            get_jobs.return_value = [
+                {'id': 'old', 'state': 'Failed', 'type': 'FirmwareUpdate',
+                 'message': 'historical failure'},
+                {'id': 'JID_1', 'state': 'Completed',
+                 'type': 'FirmwareUpdate', 'message': 'complete'}]
+            status, _detail = drac_fw.check_lc_jobs(
+                task, ['JID_1'], tracking, required=True)
+            self.assertEqual(drac_fw.LC_JOBS_DONE, status)
+
+            get_jobs.return_value = []
+            status, _detail = drac_fw.check_lc_jobs(
+                task, ['JID_1'], tracking, required=True)
+
+        self.assertEqual(drac_fw.LC_JOBS_DONE, status)
+
+    @mock.patch.object(drac_fw, 'get_jobs', autospec=True)
+    def test_failed_job_is_terminal_while_sibling_runs(self, get_jobs):
+        tracking = {'supported': True, 'baseline': [], 'jobs': {}}
+        get_jobs.return_value = [
+            {'id': 'JID_failed', 'state': 'Failed',
+             'type': 'FirmwareUpdate', 'message': 'flash failed'},
+            {'id': 'JID_running', 'state': 'Running',
+             'type': 'FirmwareUpdate', 'message': None}]
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            status, detail = drac_fw.check_lc_jobs(
+                task, ['JID_failed', 'JID_running'], tracking, required=True)
+
+        self.assertEqual(drac_fw.LC_JOBS_ERROR, status)
+        self.assertIn('JID_failed: Failed - flash failed', detail)
+        self.assertIn('JID_running', detail)
+        self.assertIn('JID_running: Running', detail)
+
+        get_jobs.return_value = [{
+            'id': 'JID_failed', 'state': 'Failed',
+            'type': 'FirmwareUpdate', 'message': 'flash failed'}]
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            status, detail = drac_fw.check_lc_jobs(
+                task, ['JID_failed', 'JID_running'], tracking, required=True)
+        self.assertEqual(drac_fw.LC_JOBS_ERROR, status)
+        self.assertIn('JID_running: Running (missing)', detail)
+
+    @mock.patch.object(drac_fw, 'get_jobs', autospec=True)
+    def test_missing_staged_job_blocks_reboot_but_completed_can_be_purged(
+            self, get_jobs):
+        tracking = {'supported': True, 'baseline': [], 'jobs': {
+            'JID_first': 'Scheduled', 'JID_completed': 'Completed',
+            'JID_staged': 'Scheduled'}}
+        get_jobs.return_value = [
+            {'id': 'JID_staged', 'state': 'Scheduled',
+             'type': 'FirmwareUpdate', 'message': None}]
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            status, detail = drac_fw.check_lc_jobs(
+                task, ['JID_first', 'JID_completed', 'JID_staged'], tracking,
+                required=True, allow_staged=True)
+        self.assertEqual(drac_fw.LC_JOBS_RUNNING, status)
+        self.assertIn('JID_first', detail)
+        self.assertIn('missing', detail)
+
+        tracking['jobs']['JID_first'] = 'Completed'
+        tracking['jobs']['JID_completed'] = 'Completed'
+        get_jobs.return_value = [
+            {'id': 'JID_staged', 'state': 'Scheduled',
+             'type': 'FirmwareUpdate', 'message': None}]
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            status, _detail = drac_fw.check_lc_jobs(
+                task, ['JID_first', 'JID_completed', 'JID_staged'], tracking,
+                required=True, allow_staged=True)
+        self.assertEqual(drac_fw.LC_JOBS_DONE, status)
+
+    @mock.patch.object(drac_fw, 'get_jobs', autospec=True)
+    def test_missing_job_and_unreadable_jobs_do_not_count_as_success(
+            self, get_jobs):
+        tracking = {'supported': True, 'baseline': [],
+                    'jobs': {'JID_1': 'Running'}}
+        get_jobs.return_value = []
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            status, detail = drac_fw.check_lc_jobs(
+                task, ['JID_1'], tracking, required=True)
+        self.assertEqual(drac_fw.LC_JOBS_RUNNING, status)
+        self.assertIn('missing', detail)
+
+        get_jobs.side_effect = exception.RedfishError(error='unavailable')
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            status, detail = drac_fw.check_lc_jobs(
+                task, ['JID_1'], tracking, required=True)
+        self.assertEqual(drac_fw.LC_JOBS_RUNNING, status)
+        self.assertIn('unavailable', detail)

@@ -1,0 +1,15 @@
+fixes:
+  - |
+    Redfish firmware updates now retain positive task outcomes separately from
+    task monitors. Disappeared tasks cannot authorize grouped submissions or
+    completion without successful evidence. Dell BMC job identities are retained
+    through recovery, including same-version reinstalls and host handoff resets.
+  - |
+    Firmware inventory verification retries failures reading requested NIC and
+    BMC components instead of accepting a partial best-effort inventory cache.
+  - |
+    Adds the per-node ``firmware_update_bios_pending_reset=compatibility`` driver
+    option for platforms whose ungrouped BIOS tasks remain Pending or Running
+    until reset. The default policy continues to wait, protecting tasks that
+    represent active flashing. Grouped updates still require positive staging
+    evidence.

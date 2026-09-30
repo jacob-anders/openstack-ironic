@@ -18,6 +18,8 @@ from unittest import mock
 from urllib.parse import urlparse
 
 from oslo_utils import fileutils
+import sushy
+from sushy.resources.updateservice import updateservice
 
 from ironic.common import exception
 from ironic.common import image_service
@@ -28,6 +30,182 @@ from ironic.tests import base
 
 
 class FirmwareUtilsTestCase(base.TestCase):
+
+    def _update_service(self):
+        service = mock.Mock(spec=[
+            'simple_update', '_get_simple_update_element', '_conn', 'json',
+            'redfish_version', 'registries', 'get_allowed_transfer_protocols'])
+        service.json = {'Actions': {'#UpdateService.SimpleUpdate': {
+            '@Redfish.OperationApplyTimeSupport': {
+                'SupportedValues': ['OnReset']}}}}
+        service.redfish_version = '1.0'
+        service.registries = {}
+        service.get_allowed_transfer_protocols.return_value = {
+            sushy.UpdateTransferProtocolType.HTTP,
+            sushy.UpdateTransferProtocolType.HTTPS}
+        service._get_simple_update_element.return_value.target_uri = '/Update'
+        return service
+
+    @mock.patch.object(firmware_utils.taskmonitor.TaskMonitor, 'from_response',
+                       autospec=True)
+    def test_grouped_update_requests_on_reset_with_old_sushy(
+            self, from_response):
+        service = self._update_service()
+        result = firmware_utils.simple_update_on_reset(
+            service, 'https://firmware/image', targets=['/Systems/1'])
+        service._conn.post.assert_called_once_with('/Update', data={
+            'ImageURI': 'https://firmware/image', 'TransferProtocol': 'HTTPS',
+            'Targets': ['/Systems/1'],
+            '@Redfish.OperationApplyTime': 'OnReset'})
+        service.simple_update.assert_not_called()
+        self.assertIs(from_response.return_value, result)
+
+    def test_on_reset_rejection_is_not_retried_as_immediate(self):
+        service = self._update_service()
+        service._conn.post.side_effect = sushy.exceptions.SushyError(
+            'rejected')
+        self.assertRaises(sushy.exceptions.SushyError,
+                          firmware_utils.simple_update_on_reset,
+                          service, 'http://firmware/image')
+        service._conn.post.assert_called_once()
+        service.simple_update.assert_not_called()
+
+    def test_missing_compatibility_attributes_fail_before_post(self):
+        for name in ('simple_update', '_get_simple_update_element', '_conn',
+                     'json', 'redfish_version', 'registries',
+                     'get_allowed_transfer_protocols'):
+            with self.subTest(attribute=name):
+                service = self._update_service()
+                conn = service._conn
+                delattr(service, name)
+                self.assertRaisesRegex(
+                    exception.UnsupportedDriverExtension,
+                    'compatible sushy release',
+                    firmware_utils.simple_update_on_reset,
+                    service, 'http://firmware/image')
+                conn.post.assert_not_called()
+
+    def test_non_callable_compatibility_hook_fails_before_post(self):
+        service = self._update_service()
+        service._get_simple_update_element = None
+        self.assertRaisesRegex(
+            exception.UnsupportedDriverExtension, 'OnReset',
+            firmware_utils.simple_update_on_reset,
+            service, 'http://firmware/image')
+        service._conn.post.assert_not_called()
+
+    def test_attribute_error_after_post_is_not_a_capability_fallback(self):
+        service = self._update_service()
+        service._conn.post.side_effect = AttributeError('response lost')
+        self.assertRaises(
+            AttributeError, firmware_utils.simple_update_on_reset,
+            service, 'http://firmware/image')
+        service._conn.post.assert_called_once()
+        service.simple_update.assert_not_called()
+
+    @mock.patch.object(firmware_utils.taskmonitor.TaskMonitor, 'from_response',
+                       autospec=True, side_effect=AttributeError('decode bug'))
+    def test_monitor_creation_failure_does_not_replay_post(
+            self, from_response):
+        service = self._update_service()
+        self.assertRaises(
+            AttributeError, firmware_utils.simple_update_on_reset,
+            service, 'http://firmware/image')
+        service._conn.post.assert_called_once()
+        service.simple_update.assert_not_called()
+
+    @mock.patch.object(firmware_utils.taskmonitor.TaskMonitor, 'from_response',
+                       autospec=True)
+    def test_unknown_transfer_protocols_do_not_block_on_reset(
+            self, from_response):
+        for allowed in (None, [], set()):
+            with self.subTest(allowed=allowed):
+                service = self._update_service()
+                service.get_allowed_transfer_protocols.return_value = allowed
+                result = firmware_utils.simple_update_on_reset(
+                    service, 'https://firmware/image')
+                service._conn.post.assert_called_once_with('/Update', data={
+                    'ImageURI': 'https://firmware/image',
+                    'TransferProtocol': 'HTTPS',
+                    '@Redfish.OperationApplyTime': 'OnReset'})
+                self.assertIs(from_response.return_value, result)
+
+    def test_explicit_transfer_protocol_restriction_is_respected(self):
+        service = self._update_service()
+        service.get_allowed_transfer_protocols.return_value = {'FTP'}
+        self.assertRaises(exception.InvalidParameterValue,
+                          firmware_utils.simple_update_on_reset,
+                          service, 'https://firmware/image')
+        service._conn.post.assert_not_called()
+
+    def test_explicitly_unsupported_on_reset_is_rejected_before_post(self):
+        service = self._update_service()
+        service.json['Actions']['#UpdateService.SimpleUpdate'][
+            '@Redfish.OperationApplyTimeSupport'] = {
+                'SupportedValues': ['Immediate']}
+        self.assertRaises(exception.UnsupportedDriverExtension,
+                          firmware_utils.simple_update_on_reset,
+                          service, 'http://firmware/image')
+        service._conn.post.assert_not_called()
+
+    def test_missing_on_reset_support_is_rejected_before_post(self):
+        service = self._update_service()
+        service.json = {'Actions': {'#UpdateService.SimpleUpdate': {}}}
+        self.assertRaisesRegex(
+            exception.UnsupportedDriverExtension, 'does not advertise',
+            firmware_utils.simple_update_on_reset,
+            service, 'http://firmware/image')
+        service._conn.post.assert_not_called()
+
+    def test_native_on_reset_api_is_used_when_available(self):
+        service = self._update_service()
+
+        def simple_update(uri, targets=None, apply_time=None):
+            self.assertEqual(sushy.ApplyTime.ON_RESET, apply_time)
+            self.assertEqual(['/Systems/2'], targets)
+            return 'monitor'
+
+        service.simple_update = simple_update
+        self.assertEqual('monitor', firmware_utils.simple_update_on_reset(
+            service, 'http://firmware/image', targets=['/Systems/2']))
+        service._conn.post.assert_not_called()
+
+    def test_native_api_requires_advertised_on_reset_support(self):
+        service = self._update_service()
+        service.json = {'Actions': {'#UpdateService.SimpleUpdate': {}}}
+        simple_update = mock.Mock()
+
+        def update(uri, targets=None, apply_time=None):
+            return simple_update(uri, targets=targets, apply_time=apply_time)
+
+        service.simple_update = update
+        self.assertRaisesRegex(
+            exception.UnsupportedDriverExtension, 'does not advertise',
+            firmware_utils.simple_update_on_reset,
+            service, 'http://firmware/image')
+        simple_update.assert_not_called()
+        service._conn.post.assert_not_called()
+
+    @mock.patch.object(firmware_utils.taskmonitor.TaskMonitor, 'from_response',
+                       autospec=True)
+    def test_on_reset_with_real_sushy_update_service(self, from_response):
+        conn = mock.Mock()
+        conn.get.return_value.json.return_value = {
+            'Id': 'UpdateService', 'Name': 'Update Service',
+            'Actions': {'#UpdateService.SimpleUpdate': {
+                'target': '/redfish/v1/UpdateService/Actions/SimpleUpdate',
+                '@Redfish.OperationApplyTimeSupport': {
+                    'SupportedValues': ['OnReset']}}}}
+        service = updateservice.UpdateService(
+            conn, '/redfish/v1/UpdateService', redfish_version='1.0.0')
+        result = firmware_utils.simple_update_on_reset(
+            service, 'https://firmware/image', targets=['/Systems/1'])
+        conn.post.assert_called_once_with(
+            '/redfish/v1/UpdateService/Actions/SimpleUpdate', data={
+                'ImageURI': 'https://firmware/image',
+                'TransferProtocol': 'HTTPS', 'Targets': ['/Systems/1'],
+                '@Redfish.OperationApplyTime': 'OnReset'})
+        self.assertIs(from_response.return_value, result)
 
     def test_validate_update_firmware_args(self):
         firmware_images = [

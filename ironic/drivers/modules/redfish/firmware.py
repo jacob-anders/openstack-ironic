@@ -252,16 +252,29 @@ class RedfishFirmware(base.FirmwareInterface):
                 'interval. BMC wait controls version verification.'
             ),
             'required': True
+        },
+        'allow_grouping_reboots': {
+            'description': (
+                'Boolean. When True, adjacent non-BMC firmware updates '
+                'share a single consolidated host reboot instead of '
+                'rebooting after each component. BMC entries segment the '
+                'list into independent phases. Ironic does not reorder '
+                'the settings list. Duplicate components within a non-BMC '
+                'segment are rejected. Defaults to False.'
+            ),
+            'required': False
         }
     }
 
     def _segment_run_length(self, state):
-        """Select one non-BMC component for the next segment.
+        """Leading batchable run length, respecting the grouping mode.
 
         :param state: the state object
-        :returns: 1 for a leading non-BMC component, otherwise 0
+        :returns: int — capped to 1 when grouping is disabled
         """
         settings = state.get('settings') or []
+        if state.get('grouping'):
+            return _leading_batchable_run(settings)
         return _leading_batchable_run(settings, max_size=1)
 
     def _staged_pending(self, state, exclude=None):
@@ -790,13 +803,15 @@ class RedfishFirmware(base.FirmwareInterface):
     @base.service_step(priority=0, abortable=False,
                        argsinfo=_FW_SETTINGS_ARGSINFO,
                        requires_ramdisk=False)
-    def update(self, task, settings):
+    def update(self, task, settings, allow_grouping_reboots=False):
         """Update the Firmware on the node using the settings for components.
 
         :param task: a TaskManager instance.
         :param settings: a list of dictionaries, each dictionary contains the
             component name and the url that will be used to update the
             firmware.
+        :param allow_grouping_reboots: Boolean. When True, non-BMC firmware
+            updates are batched into a single host reboot. Defaults to False.
         :raises: UnsupportedDriverExtension, if the node's driver doesn't
             support update via the interface.
         :raises: InvalidParameterValue, if validation of the settings fails.
@@ -807,13 +822,33 @@ class RedfishFirmware(base.FirmwareInterface):
         """
         firmware_utils.validate_firmware_interface_update_args(settings)
         self._validate_boot_policy(task.node)
+        if not isinstance(allow_grouping_reboots, bool):
+            raise exception.InvalidParameterValue(
+                _('allow_grouping_reboots must be a boolean, '
+                  'got %s') % type(allow_grouping_reboots).__name__)
+        if allow_grouping_reboots:
+            seen = set()
+            for s in settings:
+                comp = s.get('component', '')
+                if redfish_utils.get_component_type(comp) == redfish_utils.BMC:
+                    seen.clear()
+                    continue
+                if comp in seen:
+                    raise exception.InvalidParameterValue(
+                        _("component '%(comp)s' appears more than once; "
+                          "batched updates require distinct components. "
+                          "Use separate firmware.update steps, or omit "
+                          "allow_grouping_reboots, for staged or sequential "
+                          "updates of the same component.") % {'comp': comp})
+                seen.add(comp)
 
         node = task.node
         update_service = redfish_utils.get_update_service(node)
 
         LOG.debug('Updating Firmware on node %(node_uuid)s with settings '
-                  '%(settings)s',
-                  {'node_uuid': node.uuid, 'settings': settings})
+                  '%(settings)s, allow_grouping_reboots=%(group)s',
+                  {'node_uuid': node.uuid, 'settings': settings,
+                   'group': allow_grouping_reboots})
 
         state = {
             'version': STATE_VERSION,
@@ -822,7 +857,7 @@ class RedfishFirmware(base.FirmwareInterface):
             'started_at': str(timeutils.utcnow().isoformat()),
             'settings': settings,
             'cleanup': None,
-            'grouping': False,
+            'grouping': allow_grouping_reboots,
             'segment': None,
             'reboot_time': None,
             'bmc': None,
@@ -1031,7 +1066,7 @@ class RedfishFirmware(base.FirmwareInterface):
                    if check_start_time else None)
         timeout = bmc.get('check_timeout',
                           CONF.redfish.firmware_update_reboot_delay)
-        positive = self._positive_task_outcome(current_update)
+        positive = self._positive_task_outcome(current_update, state)
         tracking = state['segment'].get('jobs') or {}
         jobs = tracking.get('jobs', {})
         positive = positive or (bool(jobs) and all(
@@ -1132,8 +1167,14 @@ class RedfishFirmware(base.FirmwareInterface):
                   '%(node_uuid)s',
                   {'url': fw_upd['url'], 'component': fw_upd['component'],
                    'node_uuid': node.uuid})
+        deferred = (state.get('grouping')
+                    and redfish_utils.get_component_type(fw_upd['component'])
+                    != redfish_utils.BMC)
         try:
-            if targets is not None:
+            if deferred:
+                task_monitor = firmware_utils.simple_update_on_reset(
+                    update_service, component_url, targets=targets)
+            elif targets is not None:
                 task_monitor = update_service.simple_update(component_url,
                                                             targets=targets)
             else:
@@ -1146,7 +1187,9 @@ class RedfishFirmware(base.FirmwareInterface):
 
         fw_upd['task_monitor'] = task_monitor.task_monitor_uri
         fw_upd['submitted'] = True
-        fw_upd['synchronous'] = not bool(task_monitor.task_monitor_uri)
+        # A deferred action without a monitor has no positive staging evidence.
+        fw_upd['synchronous'] = (not task_monitor.task_monitor_uri
+                                 and not deferred)
         jid = self._jid_from_task_monitor(task_monitor.task_monitor_uri)
         if jid:
             fw_upd['jids'] = [jid]
@@ -2257,7 +2300,7 @@ class RedfishFirmware(base.FirmwareInterface):
                 raise exception.FirmwareUpdateFailed(error=detail)
             if status != drac_fw.LC_JOBS_UNAVAILABLE:
                 return status in (drac_fw.LC_JOBS_STAGED, drac_fw.LC_JOBS_DONE)
-        if (self._positive_task_outcome(entry)
+        if (self._positive_task_outcome(entry, state)
                 and (sushy_task is None
                      or sushy_task.task_state == sushy.TASK_STATE_COMPLETED)):
             return True
@@ -2284,12 +2327,16 @@ class RedfishFirmware(base.FirmwareInterface):
                     >= CONF.redfish.firmware_update_nic_starting_wait)
         return False
 
-    def _positive_task_outcome(self, entry):
-        """A missing monitor alone is never evidence of a successful update."""
-        return entry.get('synchronous') or entry.get('task_success')
+    def _positive_task_outcome(self, entry, state):
+        """Require observed success for deferred requests and old records."""
+        deferred = (state.get('grouping')
+                    and redfish_utils.get_component_type(entry['component'])
+                    != redfish_utils.BMC)
+        return (entry.get('task_success')
+                or (entry.get('synchronous') and not deferred))
 
     def _recover_task_outcome(self, task, state, entry):
-        if self._positive_task_outcome(entry):
+        if self._positive_task_outcome(entry, state):
             return True
         if (redfish_utils.get_component_type(entry['component'])
                 == redfish_utils.BMC and entry.get('version_changed')):
@@ -2325,26 +2372,25 @@ class RedfishFirmware(base.FirmwareInterface):
             self._start_batched_reboot(task, state)
             return None
 
-        try:
-            update_service = redfish_utils.get_update_service(node)
-        except exception.RedfishError as e:
-            error_msg = (
-                _('Failed to get update service for node %(node)s '
-                  'while advancing batch: %(error)s')
-                % {'node': node.uuid, 'error': e})
-            LOG.error(error_msg)
-            self._fail(task, state, error_msg, traceback=True)
+        # Read-only preparation can retry while the current index still names
+        # the staged image. Publish the next index only once it is complete.
+        update_service = redfish_utils.get_update_service(node)
+        before = None
+        if segment.get('jobs') is not None:
+            before = drac_fw.snapshot_lc_jobs(task)
+            if segment['jobs']['supported'] and not before['supported']:
+                raise exception.RedfishError(error=_(
+                    'Previously supported Dell jobs are unavailable'))
+        # Check every submitted member, not just the current image. An earlier
+        # failure or active job must block the next POST as well as reset.
+        if not self._can_reboot_segment(task, state):
             return None
-
+        if before is not None:
+            settings[next_idx]['jobs_before'] = list(dict.fromkeys(
+                before['baseline'] + list(segment['jobs']['jobs'])))
         try:
             # Persist intent before the POST. A lost response must not cause
             # the same image to be submitted again on conductor restart.
-            if segment.get('jobs') is not None:
-                before = drac_fw.snapshot_lc_jobs(task)
-                if segment['jobs']['supported'] and not before['supported']:
-                    raise exception.RedfishError(error=_(
-                        'Previously supported Dell jobs are unavailable'))
-                settings[next_idx]['jobs_before'] = before['baseline']
             segment['current'] = next_idx
             self._persist(node, state)
             self._submit_one_batched_component(

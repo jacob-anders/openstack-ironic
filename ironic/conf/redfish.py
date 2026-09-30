@@ -163,7 +163,9 @@ opts = [
                default=30,
                help=_('Seconds to observe a STARTING task before rebooting a '
                       'single non-BMC component without OEM staging evidence. '
-                      'This preserves updates which need a reset to begin.')),
+                      'This preserves updates which need a reset to begin. '
+                      'Grouped updates require positive staging evidence '
+                      'instead of this timer.')),
     cfg.IntOpt('firmware_update_post_reboot_verify_timeout',
                min=0, default=1800,
                help=_('Maximum seconds after an apply reboot for firmware '
