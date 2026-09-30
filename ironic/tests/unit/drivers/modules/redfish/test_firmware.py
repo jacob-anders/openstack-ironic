@@ -1255,8 +1255,10 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
         from ironic.drivers.modules.drac import firmware as drac_fw
         manager_mock = mock.Mock()
         oem_mock = manager_mock.get_oem_extension.return_value
-        oem_mock.job_collection.get_unfinished_jobs.return_value = [
-            'JID_839968767020']
+        oem_mock.job_collection.get_jobs.return_value = [
+            mock.Mock(identity='JID_839968767020', job_state='Scheduled',
+                      job_type='FirmwareUpdate', message='LC message',
+                      message_id='LC message')]
         get_system_mock.return_value.managers = [manager_mock]
 
         current_update = {
@@ -1270,6 +1272,12 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
 
         self.assertIs(result, True)
         manager_mock.get_oem_extension.assert_called_once_with('Dell')
+        oem_mock.job_collection.get_jobs.return_value[0].job_state = 'Running'
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            self.assertRaises(exception.RedfishError,
+                              drac_fw.check_scheduled_idrac_job,
+                              task, current_update)
 
     @mock.patch.object(redfish_utils, 'get_system', autospec=True)
     def test_check_scheduled_idrac_job_not_found(self, get_system_mock):
@@ -1277,7 +1285,7 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
         from ironic.drivers.modules.drac import firmware as drac_fw
         manager_mock = mock.Mock()
         oem_mock = manager_mock.get_oem_extension.return_value
-        oem_mock.job_collection.get_unfinished_jobs.return_value = []
+        oem_mock.job_collection.get_jobs.return_value = []
         get_system_mock.return_value.managers = [manager_mock]
 
         current_update = {
@@ -1286,10 +1294,9 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
 
         with task_manager.acquire(self.context, self.node.uuid,
                                   shared=False) as task:
-            result = drac_fw.check_scheduled_idrac_job(
-                task, current_update)
-
-        self.assertIs(result, False)
+            self.assertRaises(exception.RedfishError,
+                              drac_fw.check_scheduled_idrac_job,
+                              task, current_update)
 
     @mock.patch.object(redfish_utils, 'get_system', autospec=True)
     def test_check_scheduled_idrac_job_oem_not_available(
@@ -1297,8 +1304,8 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
         """Non-Dell hardware: OEM extension not found returns None."""
         from ironic.drivers.modules.drac import firmware as drac_fw
         manager_mock = mock.Mock()
-        manager_mock.get_oem_extension.side_effect = Exception(
-            'OEM extension not found')
+        manager_mock.get_oem_extension.side_effect = (
+            sushy.exceptions.OEMExtensionNotFoundError())
         get_system_mock.return_value.managers = [manager_mock]
 
         current_update = {

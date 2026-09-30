@@ -1324,8 +1324,14 @@ class RedfishFirmware(base.FirmwareInterface):
         :param update_service: the sushy firmware update service
         :param settings: firmware update settings
         """
-        has_job = self._check_bmc_scheduled_firmware_update(
-            task, current_update)
+        try:
+            has_job = self._check_bmc_scheduled_firmware_update(
+                task, current_update)
+        except (exception.RedfishError, sushy.exceptions.SushyError) as exc:
+            LOG.warning('Cannot check scheduled firmware for node %(node)s: '
+                        '%(error)s. Will retry on the next poll.',
+                        {'node': node.uuid, 'error': exc})
+            return
         task.upgrade_lock()
 
         if has_job is None:

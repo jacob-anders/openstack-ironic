@@ -843,3 +843,37 @@ class RedfishUtilsSystemTestCase(db_base.DbTestCase):
         fake_conn.get_system.assert_has_calls(expected_get_system_calls)
         fake_system.assert_called_once_with('bar')
         self.assertEqual(fake_conn.get_system.call_count, 2)
+
+
+class IsDellNodeTestCase(db_base.DbTestCase):
+
+    @mock.patch.object(redfish_utils, 'get_system', autospec=True)
+    def test_is_dell_node(self, get_system):
+        get_system.return_value.manufacturer = ''
+        for vendor, expected in [('Dell Inc.', True),
+                                 ('Dell', True),
+                                 ('DELL Inc.', True),
+                                 ('HPE', False),
+                                 ('Dellsomething', False),
+                                 ('', False),
+                                 (None, False)]:
+            node = mock.Mock(properties={'vendor': vendor})
+            self.assertIs(expected, redfish_utils.is_dell_node(node))
+
+    @mock.patch.object(redfish_utils, 'get_system', autospec=True)
+    def test_is_dell_node_no_vendor(self, get_system):
+        get_system.return_value.manufacturer = None
+        node = mock.Mock(properties={})
+        self.assertFalse(redfish_utils.is_dell_node(node))
+
+    @mock.patch.object(redfish_utils, 'get_system', autospec=True)
+    def test_is_dell_node_discovers_manufacturer(self, get_system):
+        get_system.return_value.manufacturer = 'Dell Inc.'
+        node = mock.Mock(properties={})
+        self.assertTrue(redfish_utils.is_dell_node(node))
+
+    @mock.patch.object(redfish_utils, 'get_system', autospec=True)
+    def test_vendor_discovery_errors_are_not_non_dell(self, get_system):
+        get_system.side_effect = exception.RedfishError(error='unavailable')
+        self.assertRaises(exception.RedfishError,
+                          redfish_utils.is_dell_node, mock.Mock(properties={}))

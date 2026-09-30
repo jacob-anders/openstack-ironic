@@ -709,6 +709,10 @@ class RedfishError(DriverOperationError):
     _msg_fmt = _("Redfish exception occurred. Error: %(error)s")
 
 
+class RedfishTaskMonitorNotFound(RedfishError):
+    """The BMC has removed a task monitor (an actual HTTP 404)."""
+
+
 class RedfishConnectionError(RedfishError):
     _msg_fmt = _("Redfish connection failed for node %(node)s: %(error)s")
 
