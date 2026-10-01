@@ -19,6 +19,7 @@ from unittest import mock
 from oslo_config import cfg
 from testtools import matchers
 
+from ironic.common import async_steps
 from ironic.common import exception
 from ironic.common import state_machine
 from ironic.common import states
@@ -287,6 +288,45 @@ class HeartbeatMixinTest(AgentDeployMixinBaseTest):
                 {'err': 'Failed to process the next deploy step: '
                  'LlamaException',
                  'node': task.node.uuid})
+
+    @mock.patch.object(manager_utils, 'node_power_action', autospec=True)
+    @mock.patch.object(agent_base.HeartbeatMixin, 'refresh_steps',
+                       autospec=True)
+    def test_heartbeat_deploy_wait_preserves_firmware_power(
+            self, refresh_mock, power_action_mock):
+        """Agent heartbeat failure must not power off a firmware update."""
+        CONF.set_override('power_off_after_deploy_failure', True, 'deploy')
+        CONF.set_override('deploy_logs_collect', 'never', 'agent')
+        self.node.provision_state = states.DEPLOYWAIT
+        self.node.target_provision_state = states.ACTIVE
+        self.node.deploy_step = {
+            'priority': 0,
+            'interface': 'firmware',
+            'step': 'update',
+            'argsinfo': {'settings': []},
+        }
+        info = self.node.driver_internal_info.copy()
+        info[async_steps.FIRMWARE_UPDATE_IN_PROGRESS] = True
+        self.node.driver_internal_info = info
+        self.node.save()
+        refresh_mock.side_effect = RuntimeError('agent steps unavailable')
+
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            self.deploy.heartbeat(task, 'http://agent', '3.2.0')
+
+            power_action_mock.assert_not_called()
+            self.assertEqual(states.DEPLOYFAIL, task.node.provision_state)
+            self.assertTrue(task.node.maintenance)
+            self.assertIn('Firmware may still be flashing or staged',
+                          task.node.last_error)
+            self.assertIn('Firmware may still be flashing or staged',
+                          task.node.maintenance_reason)
+
+        self.node.refresh()
+        self.assertIn('Firmware may still be flashing or staged',
+                      self.node.last_error)
+        self.assertTrue(self.node.maintenance)
 
     @mock.patch.object(deploy_utils, 'set_failed_state', autospec=True)
     @mock.patch.object(agent_base.LOG, 'exception', autospec=True)

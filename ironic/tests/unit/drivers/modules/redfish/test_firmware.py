@@ -19,7 +19,10 @@ from unittest import mock
 from oslo_config import cfg
 from oslo_utils import timeutils
 import sushy
+from sushy.resources.updateservice import constants as update_service_constants
+from sushy.resources.updateservice import updateservice
 
+from ironic.common import async_steps
 from ironic.common import exception
 from ironic.common import states
 from ironic.conductor import task_manager
@@ -693,7 +696,7 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
                                           update_service_mock, log_mock):
         settings = [{'component': 'bmc', 'url': 'http://upfwbmc/v2.0.0'}]
         update_service = update_service_mock.return_value
-        update_service.simple_update.side_effect = \
+        update_service._get_simple_update_element.side_effect = \
             sushy.exceptions.MissingAttributeError(
                 attribute='#UpdateService.SimpleUpdate',
                 resource='redfish/v1/UpdateService')
@@ -711,25 +714,87 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
                 'The attribute #UpdateService.SimpleUpdate is missing '
                 'on node %(node)s. Error: %(error)s',
                 {'node': self.node.uuid, 'error': expected_err_msg})
+            update_service.simple_update.assert_not_called()
+            self.assertNotIn(async_steps.FIRMWARE_UPDATE_IN_PROGRESS,
+                             task.node.driver_internal_info)
 
-            component = settings[0].get('component')
-            url = settings[0].get('url')
+    @mock.patch.object(redfish_utils, 'get_system_collection', autospec=True)
+    def test_simple_update_task_monitor_parse_error_keeps_power_hold(
+            self, get_system_collection_mock):
+        """A parse error after POST may follow an accepted update request."""
+        get_system_collection_mock.return_value.members_identities = ['1']
+        update_service = mock.Mock()
+        update_service._get_simple_update_element.return_value = mock.Mock()
+        update_service.simple_update.side_effect = (
+            sushy.exceptions.MissingAttributeError(
+                attribute='Name', resource='TaskMonitor'))
+        fw_update = {'component': 'bmc', 'url': 'http://bmc/v1.0.0'}
+        firmware = redfish_fw.RedfishFirmware()
 
-            log_call = [
-                mock.call('Updating Firmware on node %(node_uuid)s '
-                          'with settings %(settings)s',
-                          {'node_uuid': self.node.uuid,
-                           'settings': settings}),
-                mock.call('For node %(node)s serving firmware for '
-                          '%(component)s from original location %(url)s',
-                          {'node': self.node.uuid,
-                           'component': component, 'url': url}),
-                mock.call('Applying new firmware %(url)s for '
-                          '%(component)s on node %(node_uuid)s',
-                          {'url': url, 'component': component,
-                           'node_uuid': self.node.uuid})
-            ]
-            log_mock.debug.assert_has_calls(log_call)
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            self.assertRaises(
+                exception.RedfishError,
+                firmware._submit_simple_update, task.node, update_service,
+                fw_update)
+
+            update_service.simple_update.assert_called_once_with(
+                fw_update['url'])
+            self.assertTrue(task.node.driver_internal_info.get(
+                async_steps.FIRMWARE_UPDATE_IN_PROGRESS))
+
+        self.node.refresh()
+        self.assertTrue(self.node.driver_internal_info.get(
+            async_steps.FIRMWARE_UPDATE_IN_PROGRESS))
+
+    @mock.patch.object(redfish_utils, 'get_system_collection', autospec=True)
+    def test_simple_update_partial_task_response_keeps_power_hold(
+            self, get_system_collection_mock):
+        """Real Sushy parsing of an accepted partial Task keeps the hold."""
+        get_system_collection_mock.return_value.members_identities = ['1']
+        response = mock.Mock(
+            status_code=202, content=b'{"Id":"task-1",'
+            b'"TaskState":"Running"}',
+            headers={'Location': '/redfish/v1/TaskService/Tasks/1'})
+        response.json.return_value = {'Id': 'task-1',
+                                      'TaskState': 'Running'}
+        connector = mock.Mock()
+        connector.post.return_value = response
+
+        # Run Sushy's actual UpdateService.simple_update() and
+        # TaskMonitor.from_response() against a response accepted by the BMC
+        # but missing Task.Name. Whether Sushy accepts or rejects that partial
+        # Task, the accepted POST must leave the power hold in place.
+        update_service = mock.Mock()
+        update_service._conn = connector
+        update_service.redfish_version = None
+        update_service.registries = None
+        update_service.get_allowed_transfer_protocols.return_value = [
+            update_service_constants.UPDATE_PROTOCOL_HTTP]
+        update_service._get_simple_update_element.return_value.target_uri = (
+            '/redfish/v1/UpdateService/Actions/SimpleUpdate')
+        update_service.simple_update.side_effect = (
+            lambda *args, **kwargs: updateservice.UpdateService.simple_update(
+                update_service, *args, **kwargs))
+        fw_update = {'component': 'bmc', 'url': 'http://bmc/v1.0.0'}
+        firmware = redfish_fw.RedfishFirmware()
+
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            try:
+                result = firmware._submit_simple_update(
+                    task.node, update_service, fw_update)
+            except exception.RedfishError:
+                # Some Sushy versions reject a partial Task while constructing
+                # the response; the BMC has still accepted the firmware POST.
+                pass
+            else:
+                self.assertEqual('/redfish/v1/TaskService/Tasks/1', result)
+
+            connector.post.assert_called_once()
+            self.assertEqual(202, response.status_code)
+            self.assertTrue(task.node.driver_internal_info.get(
+                async_steps.FIRMWARE_UPDATE_IN_PROGRESS))
 
     @mock.patch.object(redfish_fw, 'LOG', autospec=True)
     def _test_invalid_settings(self, log_mock):
@@ -1386,6 +1451,17 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
         mock_task_monitor.get_task.return_value = mock_sushy_task
         tm_mock.return_value = mock_task_monitor
         self._generate_new_driver_internal_info(['bmc'])
+        self.node.set_driver_internal_info(
+            async_steps.FIRMWARE_UPDATE_IN_PROGRESS, True)
+        self.node.save()
+
+        def check_flag(task, *args, **kwargs):
+            # Clearing the update queue must not drop the protection the
+            # error handler relies on.
+            self.assertTrue(task.node.driver_internal_info.get(
+                async_steps.FIRMWARE_UPDATE_IN_PROGRESS))
+
+        cleaning_error_handler_mock.side_effect = check_flag
 
         task, interface = self._test__check_node_redfish_firmware_update()
 
@@ -1572,9 +1648,16 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
                                    validate_mock,
                                    cache_firmware_components_mock):
         self._generate_new_driver_internal_info(['bmc'])
+        self.node.set_driver_internal_info(
+            async_steps.FIRMWARE_UPDATE_IN_PROGRESS, True)
+        self.node.save()
         task = self._test_continue_updates()
 
         cond_resume_clean_mock.assert_called_once_with(task)
+        # The update finished, so later failures may power the node off.
+        self.node.refresh()
+        self.assertNotIn(async_steps.FIRMWARE_UPDATE_IN_PROGRESS,
+                         self.node.driver_internal_info)
         # Verify BMC validation was called before resuming conductor
         validate_mock.assert_called_once()
         # Verify firmware components were refreshed before resuming conductor
@@ -1655,10 +1738,11 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
                 task.node.driver_internal_info['redfish_fw_updates'])
             update_service_mock.simple_update.assert_called_once_with(
                 'https://bios/v1.0.1')
-            # NOTE(iurygregory): node.save() is called twice:
-            # 1. Inside _execute_firmware_update via setup methods
-            # 2. In _continue_updates after _execute_firmware_update returns
-            self.assertEqual(task.node.save.call_count, 2)
+            # node.save() is called three times:
+            # 1. Before submitting firmware, to persist the power hold
+            # 2. Inside _execute_firmware_update via setup methods
+            # 3. In _continue_updates after _execute_firmware_update returns
+            self.assertEqual(task.node.save.call_count, 3)
             # Verify BMC validation was called before continuing to next update
             validate_mock.assert_called_once_with(firmware, task.node)
             node_power_action_mock.assert_called_once_with(task, states.REBOOT,
@@ -1682,7 +1766,14 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
         task_monitor_mock = mock.Mock()
         task_monitor_mock.task_monitor_uri = '/task/2'
         update_service_mock = mock.Mock()
-        update_service_mock.simple_update.return_value = task_monitor_mock
+
+        def submit_after_guard(url):
+            self.node.refresh()
+            self.assertTrue(self.node.driver_internal_info.get(
+                async_steps.FIRMWARE_UPDATE_IN_PROGRESS))
+            return task_monitor_mock
+
+        update_service_mock.simple_update.side_effect = submit_after_guard
         firmware = redfish_fw.RedfishFirmware()
 
         settings = [{'component': 'bios', 'url': 'https://bios/v1.0.1'}]
@@ -1690,6 +1781,89 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
                                           settings)
         update_service_mock.simple_update.assert_called_once_with(
             'https://bios/v1.0.1')
+        # Submitted firmware keeps a failure from powering the node off.
+        self.assertTrue(self.node.driver_internal_info[
+            async_steps.FIRMWARE_UPDATE_IN_PROGRESS])
+
+    @mock.patch.object(redfish_utils, 'get_system_collection', autospec=True)
+    def _test_execute_firmware_update_no_simple_update(
+            self, get_system_collection_mock, submitted_before=False):
+        get_system_collection_mock.return_value.members_identities = [
+            '/redfish/v1/Systems/1']
+        if submitted_before:
+            self.node.set_driver_internal_info(
+                async_steps.FIRMWARE_UPDATE_IN_PROGRESS, True)
+        update_service_mock = mock.Mock()
+        update_service_mock._get_simple_update_element.side_effect = (
+            sushy.exceptions.MissingAttributeError(
+                attribute='Actions/#UpdateService.SimpleUpdate',
+                resource='/redfish/v1/UpdateService'))
+        firmware = redfish_fw.RedfishFirmware()
+
+        settings = [{'component': 'bios', 'url': 'https://bios/v1.0.1'}]
+        self.assertRaises(exception.RedfishError,
+                          firmware._execute_firmware_update, self.node,
+                          update_service_mock, settings)
+        return self.node.driver_internal_info.get(
+            async_steps.FIRMWARE_UPDATE_IN_PROGRESS)
+
+    def test__execute_firmware_update_no_simple_update(self):
+        # Nothing reached the BMC, so a failure may power the node off.
+        self.assertIsNone(
+            self._test_execute_firmware_update_no_simple_update())
+
+    def test__execute_firmware_update_no_simple_update_after_other(self):
+        # An earlier component may still be staged on the BMC.
+        self.assertTrue(self._test_execute_firmware_update_no_simple_update(
+            submitted_before=True))
+
+    @mock.patch.object(redfish_utils, 'get_system_collection', autospec=True)
+    def test__execute_firmware_update_http_errors_only_clear_for_4xx(
+            self, get_system_collection_mock):
+        get_system_collection_mock.return_value.members_identities = [
+            '/redfish/v1/Systems/1']
+        firmware = redfish_fw.RedfishFirmware()
+
+        for status_code in (400, 500):
+            response = mock.Mock(status_code=status_code)
+            response.json.return_value = {}
+            update_service_mock = mock.Mock()
+            update_service_mock.simple_update.side_effect = (
+                sushy.exceptions.HTTPError(
+                    method='POST', url='http://bmc', response=response))
+
+            self.assertRaises(
+                exception.RedfishError,
+                firmware._execute_firmware_update,
+                self.node, update_service_mock,
+                [{'component': 'bios', 'url': 'https://bios/v1.0.1'}])
+
+            self.node.refresh()
+            if status_code < 500:
+                self.assertNotIn(
+                    async_steps.FIRMWARE_UPDATE_IN_PROGRESS,
+                    self.node.driver_internal_info)
+            else:
+                self.assertTrue(self.node.driver_internal_info.get(
+                    async_steps.FIRMWARE_UPDATE_IN_PROGRESS))
+
+        self.node.set_driver_internal_info(
+            async_steps.FIRMWARE_UPDATE_IN_PROGRESS, True)
+        self.node.save()
+        response = mock.Mock(status_code=400)
+        response.json.return_value = {}
+        update_service_mock = mock.Mock()
+        update_service_mock.simple_update.side_effect = (
+            sushy.exceptions.HTTPError(
+                method='POST', url='http://bmc', response=response))
+        self.assertRaises(
+            exception.RedfishError,
+            firmware._execute_firmware_update,
+            self.node, update_service_mock,
+            [{'component': 'bios', 'url': 'https://bios/v1.0.1'}])
+        self.node.refresh()
+        self.assertTrue(self.node.driver_internal_info.get(
+            async_steps.FIRMWARE_UPDATE_IN_PROGRESS))
 
     @mock.patch.object(redfish_utils, 'get_system', autospec=True)
     @mock.patch.object(redfish_utils, 'get_system_collection', autospec=True)

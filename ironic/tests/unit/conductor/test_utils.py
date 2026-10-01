@@ -21,9 +21,11 @@ from oslo_context import context as oslo_context
 from oslo_utils import timeutils
 from oslo_utils import uuidutils
 
+from ironic.common import async_steps
 from ironic.common import boot_devices
 from ironic.common import boot_modes
 from ironic.common import exception
+from ironic.common import faults
 from ironic.common import health_states
 from ironic.common import network
 from ironic.common import neutron
@@ -1331,6 +1333,23 @@ class DeployingErrorHandlerTestCase(db_base.DbTestCase):
         self.assertNotIn('agent_url', self.node.driver_internal_info)
         self.task.process_event.assert_called_once_with('fail')
 
+    def test_deploying_error_handler_firmware_skips_clean_up(self):
+        self.node.maintenance = False
+        self.node.maintenance_reason = None
+        self.node.driver_internal_info[
+            async_steps.FIRMWARE_UPDATE_IN_PROGRESS] = True
+
+        conductor_utils.deploying_error_handler(self.task, self.logmsg,
+                                                self.errmsg)
+
+        self.task.driver.deploy.clean_up.assert_not_called()
+        self.assertTrue(self.node.maintenance)
+        self.assertEqual(faults.DEPLOY_FAILURE, self.node.fault)
+        self.assertIn('check the firmware jobs',
+                      self.node.maintenance_reason)
+        self.assertIn('check the firmware jobs', self.node.last_error)
+        self.task.process_event.assert_called_once_with('fail')
+
     def _test_deploying_error_handler_cleanup(self, exc, expected_str):
         clean_up_mock = self.task.driver.deploy.clean_up
         clean_up_mock.side_effect = exc
@@ -1435,7 +1454,11 @@ class ErrorHandlersTestCase(db_base.DbTestCase):
                                  provision_state=states.AVAILABLE,
                                  target_provision_state=states.NOSTATE,
                                  maintenance=False, maintenance_reason=None,
+                                 driver_internal_info={},
                                  id=fake_node.id)
+        self.node.del_driver_internal_info.side_effect = (
+            lambda key, default=None: self.node.driver_internal_info.pop(
+                key, default))
         self.task.context = self.context
 
     @mock.patch.object(conductor_utils, 'LOG', autospec=True)
@@ -1601,6 +1624,54 @@ class ErrorHandlersTestCase(db_base.DbTestCase):
         self.assertFalse(self.task.driver.deploy.tear_down_cleaning.called)
         self.task.process_event.assert_called_once_with('fail',
                                                         target_state=target)
+
+    @mock.patch.object(conductor_utils, 'node_power_action', autospec=True)
+    def test_cleaning_error_handler_firmware_keeps_power(self, power_mock):
+        self.config(poweroff_in_cleanfail=True, group='conductor')
+        self.node.provision_state = states.CLEANWAIT
+        self.node.clean_step = {'step': 'update', 'interface': 'firmware'}
+        self.node.driver_internal_info[
+            async_steps.FIRMWARE_UPDATE_IN_PROGRESS] = True
+
+        conductor_utils.cleaning_error_handler(self.task, 'log msg',
+                                               errmsg='Update failed.')
+
+        power_mock.assert_not_called()
+        self.assertFalse(self.task.driver.deploy.tear_down_cleaning.called)
+        self.assertTrue(self.node.maintenance)
+        self.assertEqual('clean failure', self.node.fault)
+        self.assertTrue(self.node.maintenance_reason.startswith(
+            'Update failed. Firmware may still be flashing'))
+        self.assertIn('check the firmware jobs', self.node.last_error)
+        # The flag goes with the step, so later failures power off again.
+        self.assertNotIn(async_steps.FIRMWARE_UPDATE_IN_PROGRESS,
+                         self.node.driver_internal_info)
+        self.task.process_event.assert_called_once_with('fail',
+                                                        target_state=None)
+
+    @mock.patch.object(conductor_utils, 'node_power_action', autospec=True)
+    def test_cleaning_error_handler_firmware_forces_maintenance(
+            self, power_mock):
+        self.node.driver_internal_info[
+            async_steps.FIRMWARE_UPDATE_IN_PROGRESS] = True
+
+        conductor_utils.cleaning_error_handler(self.task, 'foo',
+                                               set_maintenance=False)
+
+        self.assertTrue(self.node.maintenance)
+        self.assertIn('Firmware may still be flashing',
+                      self.node.maintenance_reason)
+
+    @mock.patch.object(conductor_utils, 'node_power_action', autospec=True)
+    def test_cleaning_error_handler_poweroff_without_firmware(
+            self, power_mock):
+        self.config(poweroff_in_cleanfail=True, group='conductor')
+
+        conductor_utils.cleaning_error_handler(self.task, 'foo')
+
+        power_mock.assert_called_once_with(self.task, states.POWER_OFF)
+        self.task.driver.deploy.tear_down_cleaning.assert_called_once_with(
+            self.task)
 
     def test_cleaning_error_handler_no_fail(self):
         conductor_utils.cleaning_error_handler(self.task, 'foo',
@@ -1894,6 +1965,26 @@ class ErrorHandlersTestCase(db_base.DbTestCase):
             self.task.process_event.assert_called_once_with('fail')
         self.assertNotIn('agent_url', self.node.driver_internal_info)
         mock_log_error.assert_called_once_with(msg, exc_info=False)
+
+    @mock.patch.object(conductor_utils, 'node_power_action', autospec=True)
+    def test_servicing_error_handler_firmware_keeps_power(self, power_mock):
+        self.config(poweroff_in_servicefail=True, group='conductor')
+        self.node.provision_state = states.SERVICEWAIT
+        self.node.service_step = {'step': 'update', 'interface': 'firmware'}
+        self.node.driver_internal_info[
+            async_steps.FIRMWARE_UPDATE_IN_PROGRESS] = True
+
+        conductor_utils.servicing_error_handler(self.task, 'log msg',
+                                                errmsg='Update failed')
+
+        power_mock.assert_not_called()
+        self.assertFalse(self.task.driver.deploy.tear_down_service.called)
+        self.assertTrue(self.node.maintenance)
+        self.assertEqual('service failure', self.node.fault)
+        self.assertIn('check the firmware jobs',
+                      self.node.maintenance_reason)
+        self.assertNotIn(async_steps.FIRMWARE_UPDATE_IN_PROGRESS,
+                         self.node.driver_internal_info)
 
     def test_servicing_error_handler(self):
         self._test_servicing_error_handler()

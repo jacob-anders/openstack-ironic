@@ -27,5 +27,8 @@ RESCUE_ABORT_FAILURE = 'rescue abort failure'
 SERVICE_FAILURE = 'service failure'
 """ Node is moved to maintenance due to failure of a service operation. """
 
+DEPLOY_FAILURE = 'deploy failure'
+"""Node is moved to maintenance due to a deployment failure."""
+
 VALID_FAULTS = (POWER_FAILURE, CLEAN_FAILURE, RESCUE_ABORT_FAILURE,
-                SERVICE_FAILURE)
+                SERVICE_FAILURE, DEPLOY_FAILURE)

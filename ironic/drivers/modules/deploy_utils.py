@@ -257,7 +257,8 @@ def set_failed_state(task, msg, collect_logs=True):
 
     This method sets the deployment as fail with the given message.
     It sets node's provision_state to DEPLOYFAIL and updates last_error
-    with the given error message. It also powers off the baremetal node.
+    with the given error message. It also powers off the baremetal node
+    unless an in-progress firmware update requires power to be preserved.
 
     :param task: a TaskManager instance containing the node to act on.
     :param msg: the message to set in logs and last_error of the node.
@@ -267,6 +268,7 @@ def set_failed_state(task, msg, collect_logs=True):
                          CONF.agent.deploy_logs_collect config option.
     """
     node = task.node
+    keep_power, errmsg = manager_utils.keep_power_for_firmware(node, msg)
 
     if (collect_logs
             and CONF.agent.deploy_logs_collect in ('on_failure', 'always')):
@@ -280,7 +282,7 @@ def set_failed_state(task, msg, collect_logs=True):
                 % {'node': node.uuid, 'state': node.provision_state})
         LOG.exception(msg2)
 
-    if CONF.deploy.power_off_after_deploy_failure:
+    if CONF.deploy.power_off_after_deploy_failure and not keep_power:
         try:
             manager_utils.node_power_action(task, states.POWER_OFF)
         except Exception:
@@ -291,7 +293,7 @@ def set_failed_state(task, msg, collect_logs=True):
             LOG.exception(msg2)
     # NOTE(tenbrae): node_power_action() erases node.last_error
     #             so we need to set it here.
-    node.last_error = msg
+    node.last_error = errmsg
     node.save()
 
 

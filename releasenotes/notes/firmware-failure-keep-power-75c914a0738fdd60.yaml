@@ -1,0 +1,13 @@
+---
+fixes:
+  - |
+    When a Redfish firmware update fails or times out after firmware has
+    been submitted to the BMC, the node is no longer powered off, even with
+    ``[conductor]poweroff_in_cleanfail`` or
+    ``[conductor]poweroff_in_servicefail`` set, and its cleaning, servicing
+    or deployment environment is not torn down, since the firmware may
+    still be flashing or staged for the next boot. The node is left in
+    maintenance; check the firmware jobs on its BMC before power-cycling
+    it. Deployment failures also set the node's fault to ``deploy failure``,
+    so affected nodes can be identified with the fault filter and
+    distinguished from nodes placed in maintenance by an operator.

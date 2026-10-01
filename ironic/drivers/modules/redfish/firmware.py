@@ -654,6 +654,18 @@ class RedfishFirmware(base.FirmwareInterface):
         """
         fw_upd['power_timeout'] = CONF.redfish.firmware_update_reboot_delay
 
+        # Resolve the action before any POST is attempted.
+        # MissingAttributeError from simple_update() itself is ambiguous:
+        # Sushy may raise it while parsing a task monitor returned by an
+        # accepted request.
+        try:
+            update_service._get_simple_update_element()
+        except sushy.exceptions.MissingAttributeError as e:
+            LOG.error('The attribute #UpdateService.SimpleUpdate is missing '
+                      'on node %(node)s. Error: %(error)s',
+                      {'node': node.uuid, 'error': e.message})
+            raise exception.RedfishError(error=e)
+
         try:
             systems_collection = redfish_utils.get_system_collection(node)
         except exception.RedfishError as e:
@@ -678,6 +690,13 @@ class RedfishFirmware(base.FirmwareInterface):
                   '%(node_uuid)s',
                   {'url': fw_upd['url'], 'component': fw_upd['component'],
                    'node_uuid': node.uuid})
+        # From here on the BMC may hold firmware to apply, so a failure must
+        # not power the node off until the update has finished.
+        submitted_before = node.driver_internal_info.get(
+            async_steps.FIRMWARE_UPDATE_IN_PROGRESS, False)
+        node.set_driver_internal_info(
+            async_steps.FIRMWARE_UPDATE_IN_PROGRESS, True)
+        node.save()
         try:
             if targets is not None:
                 task_monitor = update_service.simple_update(component_url,
@@ -685,9 +704,22 @@ class RedfishFirmware(base.FirmwareInterface):
             else:
                 task_monitor = update_service.simple_update(component_url)
         except sushy.exceptions.MissingAttributeError as e:
-            LOG.error('The attribute #UpdateService.SimpleUpdate is missing '
-                      'on node %(node)s. Error: %(error)s',
-                      {'node': node.uuid, 'error': e.message})
+            LOG.error('Unable to process the SimpleUpdate response for node '
+                      '%(node)s: %(error)s. The request may have been '
+                      'accepted; retaining the firmware power hold.',
+                      {'node': node.uuid, 'error': e})
+            raise exception.RedfishError(error=e)
+        except sushy.exceptions.HTTPError as e:
+            LOG.error('SimpleUpdate failed for node %(node)s: %(error)s',
+                      {'node': node.uuid, 'error': e})
+            # A client error confirms rejection; a server error may follow
+            # an accepted request, so keep the power hold in that case.
+            if (not submitted_before
+                    and e.status_code is not None
+                    and 400 <= e.status_code < 500):
+                node.del_driver_internal_info(
+                    async_steps.FIRMWARE_UPDATE_IN_PROGRESS)
+                node.save()
             raise exception.RedfishError(error=e)
 
         fw_upd['task_monitor'] = task_monitor.task_monitor_uri
@@ -860,8 +892,14 @@ class RedfishFirmware(base.FirmwareInterface):
     def _resume_step(self, task):
         """Notify the conductor to resume the current step.
 
+        The firmware update is over, so a later failure may power the node
+        off again.
+
         :param task: a TaskManager instance
         """
+        task.node.del_driver_internal_info(
+            async_steps.FIRMWARE_UPDATE_IN_PROGRESS)
+        task.node.save()
         if task.node.clean_step:
             manager_utils.notify_conductor_resume_clean(task)
         elif task.node.service_step:
@@ -1098,8 +1136,8 @@ class RedfishFirmware(base.FirmwareInterface):
                           'firmware_image': current_update['url'],
                           'errors': ",  ".join(messages)})
 
-            self._clear_updates(node)
             self._report_step_error(task, error_msg)
+            self._clear_updates(node)
 
     def _handle_nic_task_starting(self, task, task_monitor, settings,
                                   current_update):
@@ -1349,13 +1387,8 @@ class RedfishFirmware(base.FirmwareInterface):
                   'inspect the BMC before retrying.') %
                 {'node': node.uuid,
                  'firmware_image': current_update['url']})
+            self._report_step_error(task, error_msg)
             self._clear_updates(node)
-            if task.node.clean_step:
-                manager_utils.cleaning_error_handler(task, error_msg)
-            elif task.node.deploy_step:
-                manager_utils.deploying_error_handler(task, error_msg)
-            elif task.node.service_step:
-                manager_utils.servicing_error_handler(task, error_msg)
             return
         else:
             LOG.info('BIOS firmware update task disappeared for node '
@@ -1475,8 +1508,8 @@ class RedfishFirmware(base.FirmwareInterface):
                   'elapsed': int(elapsed.total_seconds())})
         LOG.error(msg)
         task.upgrade_lock()
-        self._clear_updates(node)
         self._report_step_error(task, msg, traceback=False)
+        self._clear_updates(node)
         return True
 
     def _handle_firmware_update_task(self, task, node, current_update,

@@ -34,10 +34,16 @@ CLEANING_POLLING = "cleaning_polling"
 DEPLOYMENT_POLLING = "deployment_polling"
 SERVICING_POLLING = "servicing_polling"
 
+# This flag tells the conductor that firmware submitted by the running step
+# may still be flashing or staged for the next boot, so a failure must not
+# power the node off or tear down its boot configuration.
+FIRMWARE_UPDATE_IN_PROGRESS = "firmware_update_in_progress"
+
 _ALL_FLAGS = [CLEANING_REBOOT, DEPLOYMENT_REBOOT, SERVICING_REBOOT,
               SKIP_CURRENT_CLEAN_STEP, SKIP_CURRENT_DEPLOY_STEP,
               SKIP_CURRENT_SERVICE_STEP,
-              CLEANING_POLLING, DEPLOYMENT_POLLING, SERVICING_POLLING]
+              CLEANING_POLLING, DEPLOYMENT_POLLING, SERVICING_POLLING,
+              FIRMWARE_UPDATE_IN_PROGRESS]
 
 
 def get_return_state(node):

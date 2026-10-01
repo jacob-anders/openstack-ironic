@@ -334,7 +334,8 @@ r_fault:
   description: |
     Filter the list of returned nodes, and only return those with the specified
     ``fault``. Possible values are determined by faults supported by ironic,
-    e.g., ``power failure``, ``clean failure`` or ``rescue abort failure``.
+    e.g., ``power failure``, ``clean failure``, ``rescue abort failure`` or
+    ``deploy failure``.
   in: query
   required: false
   type: string
@@ -1069,7 +1070,8 @@ fault:
     Node is in "maintenance mode".
     None means no fault has been detected by ironic. "power failure" indicates
     ironic failed to retrieve power state from this node. There are other
-    possible types, e.g., "clean failure" and "rescue abort failure".
+    possible types, e.g., "clean failure", "rescue abort failure" and
+    "deploy failure".
   in: body
   required: false
   type: string
