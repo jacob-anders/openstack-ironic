@@ -541,6 +541,30 @@ def cleanup_cleanwait_timeout(task):
                            set_fail_state=False)
 
 
+def _keep_power_for_firmware(node, errmsg):
+    """Check whether a failure must leave the node's power alone.
+
+    A driver sets ``async_steps.FIRMWARE_UPDATE_IN_PROGRESS`` while
+    firmware it submitted may still be flashing or staged for the next
+    boot. Powering the node off or tearing down its boot configuration
+    could then interrupt the flash, so the failure handlers skip both and
+    leave the node in maintenance for an operator to check.
+
+    :param node: the node whose step failed.
+    :param errmsg: the error message for the user.
+    :returns: a tuple (keep_power, errmsg), where errmsg tells the
+        operator what to check when keep_power is True.
+    """
+    if not node.driver_internal_info.get(
+            async_steps.FIRMWARE_UPDATE_IN_PROGRESS):
+        return False, errmsg
+    errmsg = _('%s. Firmware may still be flashing or staged for the next '
+               'boot, so the node was not powered off; check the firmware '
+               'jobs on its BMC before power-cycling it.') % (
+                   errmsg.rstrip('.'))
+    return True, errmsg
+
+
 def cleaning_error_handler(task, logmsg, errmsg=None, traceback=False,
                            tear_down_cleaning=True, set_fail_state=True,
                            set_maintenance=None):
@@ -559,17 +583,18 @@ def cleaning_error_handler(task, logmsg, errmsg=None, traceback=False,
         maintenance mode will be set if and only if a clean step is being
         executed on a node.
     """
-    if set_maintenance is None:
-        set_maintenance = bool(task.node.clean_step)
-
-    errmsg = errmsg or logmsg
-    LOG.error(logmsg, exc_info=traceback)
     node = task.node
+    keep_power, errmsg = _keep_power_for_firmware(node, errmsg or logmsg)
+    if set_maintenance is None:
+        set_maintenance = bool(node.clean_step)
+    set_maintenance = set_maintenance or keep_power
+
+    LOG.error(logmsg, exc_info=traceback)
     if set_maintenance:
         node.fault = faults.CLEAN_FAILURE
         node.maintenance = True
 
-    if tear_down_cleaning:
+    if tear_down_cleaning and not keep_power:
         try:
             task.driver.deploy.tear_down_cleaning(task)
         except Exception as e:
@@ -602,7 +627,7 @@ def cleaning_error_handler(task, logmsg, errmsg=None, traceback=False,
     if not node.maintenance_reason and set_maintenance:
         node.maintenance_reason = errmsg
 
-    if CONF.conductor.poweroff_in_cleanfail:
+    if CONF.conductor.poweroff_in_cleanfail and not keep_power:
         # NOTE(NobodyCam): Power off node in clean fail
         node_power_action(task, states.POWER_OFF)
 
@@ -722,9 +747,16 @@ def deploying_error_handler(task, logmsg, errmsg=None, traceback=False,
     :param traceback: Boolean; True to log a traceback
     :param clean_up: Boolean; True to clean up
     """
-    errmsg = errmsg or logmsg
     node = task.node
+    keep_power, errmsg = _keep_power_for_firmware(node, errmsg or logmsg)
     LOG.error(logmsg, exc_info=traceback)
+    if keep_power:
+        # Deploy clean up can change the boot configuration the staged
+        # firmware is applied with, so leave the node for the operator.
+        clean_up = False
+        node.maintenance = True
+        if not node.maintenance_reason:
+            node.maintenance_reason = errmsg
     node_history_record(node, event=errmsg, event_type=states.DEPLOYING,
                         error=True)
     node.save()
@@ -2091,17 +2123,18 @@ def servicing_error_handler(task, logmsg, errmsg=None, traceback=False,
         maintenance mode will be set if and only if a clean step is being
         executed on a node.
     """
-    if set_maintenance is None:
-        set_maintenance = bool(task.node.service_step)
-
-    errmsg = errmsg or logmsg
-    LOG.error(logmsg, exc_info=traceback)
     node = task.node
+    keep_power, errmsg = _keep_power_for_firmware(node, errmsg or logmsg)
+    if set_maintenance is None:
+        set_maintenance = bool(node.service_step)
+    set_maintenance = set_maintenance or keep_power
+
+    LOG.error(logmsg, exc_info=traceback)
     if set_maintenance:
         node.fault = faults.SERVICE_FAILURE
         node.maintenance = True
 
-    if tear_down_service:
+    if tear_down_service and not keep_power:
         try:
             task.driver.deploy.tear_down_service(task)
         except Exception as e:
@@ -2130,7 +2163,7 @@ def servicing_error_handler(task, logmsg, errmsg=None, traceback=False,
     if not node.maintenance_reason and set_maintenance:
         node.maintenance_reason = errmsg
 
-    if CONF.conductor.poweroff_in_servicefail:
+    if CONF.conductor.poweroff_in_servicefail and not keep_power:
         # NOTE(NobodyCam): Power off node in service fail
         node_power_action(task, states.POWER_OFF)
 

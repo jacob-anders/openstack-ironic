@@ -687,6 +687,12 @@ class RedfishFirmware(base.FirmwareInterface):
                   '%(node_uuid)s',
                   {'url': fw_upd['url'], 'component': fw_upd['component'],
                    'node_uuid': node.uuid})
+        # From here on the BMC may hold firmware to apply, so a failure must
+        # not power the node off until the update has finished.
+        submitted_before = node.driver_internal_info.get(
+            async_steps.FIRMWARE_UPDATE_IN_PROGRESS, False)
+        node.set_driver_internal_info(
+            async_steps.FIRMWARE_UPDATE_IN_PROGRESS, True)
         try:
             if targets is not None:
                 task_monitor = update_service.simple_update(component_url,
@@ -697,6 +703,11 @@ class RedfishFirmware(base.FirmwareInterface):
             LOG.error('The attribute #UpdateService.SimpleUpdate is missing '
                       'on node %(node)s. Error: %(error)s',
                       {'node': node.uuid, 'error': e.message})
+            # Nothing was submitted, so unless an earlier component was,
+            # there is nothing to protect.
+            if not submitted_before:
+                node.del_driver_internal_info(
+                    async_steps.FIRMWARE_UPDATE_IN_PROGRESS)
             raise exception.RedfishError(error=e)
 
         fw_upd['task_monitor'] = task_monitor.task_monitor_uri
@@ -960,8 +971,14 @@ class RedfishFirmware(base.FirmwareInterface):
     def _resume_step(self, task):
         """Notify the conductor to resume the current step.
 
+        The firmware update is over, so a later failure may power the node
+        off again.
+
         :param task: a TaskManager instance
         """
+        task.node.del_driver_internal_info(
+            async_steps.FIRMWARE_UPDATE_IN_PROGRESS)
+        task.node.save()
         if task.node.clean_step:
             manager_utils.notify_conductor_resume_clean(task)
         elif task.node.service_step:
