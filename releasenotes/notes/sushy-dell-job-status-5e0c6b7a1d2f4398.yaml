@@ -1,0 +1,7 @@
+---
+upgrade:
+  - |
+    The minimum required version of sushy is now 5.14.0. It reports the
+    outcome of each Dell Lifecycle Controller job, so a Redfish firmware
+    update on Dell iDRAC now always fails when the job applying the
+    firmware fails, instead of assuming that a finished job succeeded.

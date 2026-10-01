@@ -138,32 +138,6 @@ def check_scheduled_idrac_job(task, current_update):
     return False
 
 
-def _check_lc_jobs_fallback(task, job_collection, jids):
-    """Classify LC jobs using only the unfinished-jobs view.
-
-    Used when the installed sushy has no DellJobCollection.get_jobs(). A
-    job missing from the unfinished jobs has finished, but whether it
-    succeeded cannot be told, so it is reported as done.
-
-    :param task: a TaskManager instance
-    :param job_collection: a sushy DellJobCollection instance
-    :param jids: a list of JIDs to check
-    :returns: a tuple (status, detail), status is LCJobStatus.DONE or
-        LCJobStatus.RUNNING
-    :raises: sushy.exceptions.SushyError if the jobs cannot be read.
-    """
-    unfinished = job_collection.get_unfinished_jobs()
-    still_running = [jid for jid in jids if jid in unfinished]
-    LOG.debug('LC jobs %(jids)s checked via unfinished-jobs fallback for '
-              'node %(node)s; still running: %(running)s.',
-              {'jids': jids, 'node': task.node.uuid,
-               'running': still_running})
-    if still_running:
-        return LCJobStatus.RUNNING, ', '.join(still_running)
-
-    return LCJobStatus.DONE, None
-
-
 def _classify_dell_jobs(jids, jobs):
     """Classify DellJob objects into failed/running/done for `jids`.
 
@@ -232,12 +206,4 @@ def check_lc_jobs(task, jids):
                     {'jids': jids, 'node': node.uuid})
         return LCJobStatus.UNAVAILABLE, reason
 
-    get_jobs = getattr(job_collection, 'get_jobs', None)
-    if not callable(get_jobs):
-        LOG.warning('Sushy DellJobCollection.get_jobs() is not available '
-                    'for node %(node)s; per-job LC error detection needs '
-                    'a newer sushy release. Falling back to the '
-                    'unfinished-jobs check.', {'node': node.uuid})
-        return _check_lc_jobs_fallback(task, job_collection, jids)
-
-    return _classify_dell_jobs(jids, get_jobs(job_ids=jids))
+    return _classify_dell_jobs(jids, job_collection.get_jobs(job_ids=jids))

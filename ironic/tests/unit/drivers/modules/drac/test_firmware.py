@@ -86,31 +86,19 @@ class _LcJobsTestBase(test_utils.BaseDracTest):
                                                driver_info=INFO_DICT)
 
     def _mock_job_collection(self, get_system_mock, jobs=None,
-                             get_jobs_side_effect=None,
-                             unfinished_jobs=None, has_get_jobs=True):
+                             get_jobs_side_effect=None):
         """Mock manager.get_oem_extension('Dell').job_collection.
 
         :param jobs: DellJob objects get_jobs() should return
         :param get_jobs_side_effect: if given, get_jobs() raises this
-        :param unfinished_jobs: get_unfinished_jobs() return value
-        :param has_get_jobs: whether the collection exposes get_jobs()
-            at all (False simulates an older sushy release)
         """
         manager_mock = mock.Mock()
         oem_mock = manager_mock.get_oem_extension.return_value
-        if has_get_jobs:
-            job_collection = mock.Mock(
-                spec=['get_jobs', 'get_unfinished_jobs'])
-            if get_jobs_side_effect is not None:
-                job_collection.get_jobs.side_effect = (
-                    get_jobs_side_effect)
-            else:
-                job_collection.get_jobs.return_value = jobs or []
+        job_collection = mock.Mock(spec=['get_jobs'])
+        if get_jobs_side_effect is not None:
+            job_collection.get_jobs.side_effect = get_jobs_side_effect
         else:
-            job_collection = mock.Mock(spec=['get_unfinished_jobs'])
-        if unfinished_jobs is not None:
-            job_collection.get_unfinished_jobs.return_value = (
-                unfinished_jobs)
+            job_collection.get_jobs.return_value = jobs or []
         oem_mock.job_collection = job_collection
         get_system_mock.return_value.managers = [manager_mock]
         return job_collection
@@ -282,7 +270,7 @@ class CheckLcJobsTestCase(_LcJobsTestBase):
     @mock.patch.object(redfish_utils, 'get_system', autospec=True)
     def test_check_lc_jobs_get_jobs_fails(self, get_system_mock):
         # A read failure says nothing about the jobs, so it is not turned
-        # into a status, nor retried through the unfinished-jobs view.
+        # into a status.
         job_collection = self._mock_job_collection(
             get_system_mock,
             get_jobs_side_effect=sushy.exceptions.ConnectionError(
@@ -294,7 +282,8 @@ class CheckLcJobsTestCase(_LcJobsTestBase):
                               drac_fw.check_lc_jobs, task,
                               ['JID_111111111111'])
 
-        job_collection.get_unfinished_jobs.assert_not_called()
+        job_collection.get_jobs.assert_called_once_with(
+            job_ids=['JID_111111111111'])
 
     @mock.patch.object(redfish_utils, 'get_system', autospec=True)
     def test_check_lc_jobs_get_system_fails(self, get_system_mock):
@@ -355,52 +344,6 @@ class CheckLcJobsTestCase(_LcJobsTestBase):
         self.assertEqual((drac_fw.LCJobStatus.DONE, None), result)
         job_collection.get_jobs.assert_called_once_with(
             job_ids=['JID_111111111111'])
-
-    @mock.patch.object(redfish_utils, 'get_system', autospec=True)
-    def test_check_lc_jobs_fallback_fails(self, get_system_mock):
-        job_collection = self._mock_job_collection(
-            get_system_mock, has_get_jobs=False)
-        job_collection.get_unfinished_jobs.side_effect = (
-            sushy.exceptions.ConnectionError(
-                url='http://bmc', error='connection error'))
-
-        with task_manager.acquire(self.context, self.node.uuid,
-                                  shared=False) as task:
-            self.assertRaises(sushy.exceptions.ConnectionError,
-                              drac_fw.check_lc_jobs, task,
-                              ['JID_111111111111'])
-
-    @mock.patch.object(redfish_utils, 'get_system', autospec=True)
-    def test_check_lc_jobs_no_get_jobs_attribute_fallback_running(
-            self, get_system_mock):
-        # Simulates an older sushy release whose DellJobCollection has
-        # no get_jobs(), only get_unfinished_jobs().
-        job_collection = self._mock_job_collection(
-            get_system_mock, has_get_jobs=False,
-            unfinished_jobs=['JID_111111111111'])
-
-        with task_manager.acquire(self.context, self.node.uuid,
-                                  shared=False) as task:
-            status, detail = drac_fw.check_lc_jobs(
-                task, ['JID_111111111111', 'JID_222222222222'])
-
-        self.assertEqual(drac_fw.LCJobStatus.RUNNING, status)
-        self.assertEqual('JID_111111111111', detail)
-        job_collection.get_unfinished_jobs.assert_called_once_with()
-
-    @mock.patch.object(redfish_utils, 'get_system', autospec=True)
-    def test_check_lc_jobs_no_get_jobs_attribute_fallback_done(
-            self, get_system_mock):
-        job_collection = self._mock_job_collection(
-            get_system_mock, has_get_jobs=False, unfinished_jobs=[])
-
-        with task_manager.acquire(self.context, self.node.uuid,
-                                  shared=False) as task:
-            result = drac_fw.check_lc_jobs(
-                task, ['JID_111111111111', 'JID_222222222222'])
-
-        self.assertEqual((drac_fw.LCJobStatus.DONE, None), result)
-        job_collection.get_unfinished_jobs.assert_called_once_with()
 
 
 class CheckScheduledIdracJobTestCase(_LcJobsTestBase):
@@ -466,18 +409,6 @@ class CheckScheduledIdracJobTestCase(_LcJobsTestBase):
             result = drac_fw.check_scheduled_idrac_job(task, self.UPDATE)
 
         self.assertIsNone(result)
-
-    @mock.patch.object(redfish_utils, 'get_system', autospec=True)
-    def test_older_sushy_fallback(self, get_system_mock):
-        self._mock_job_collection(
-            get_system_mock, has_get_jobs=False,
-            unfinished_jobs=['JID_839968767020'])
-
-        with task_manager.acquire(self.context, self.node.uuid,
-                                  shared=False) as task:
-            result = drac_fw.check_scheduled_idrac_job(task, self.UPDATE)
-
-        self.assertIs(result, True)
 
     def test_no_task_monitor(self):
         with task_manager.acquire(self.context, self.node.uuid,
