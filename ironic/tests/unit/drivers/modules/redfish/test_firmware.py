@@ -1773,6 +1773,97 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
         ]
         log_mock.info.assert_has_calls(info_call)
 
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       'cache_firmware_components', autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       '_validate_resources_stability', autospec=True)
+    @mock.patch.object(manager_utils, 'notify_conductor_resume_clean',
+                       autospec=True)
+    def test_continue_updates_last_non_bmc_no_validation(
+            self, cond_resume_clean_mock, validate_mock, cache_mock):
+        """A non-BMC update resumes without the BMC stability wait.
+
+        Only a BMC firmware update can leave the BMC's web service
+        flapping; a BIOS update does not touch it.
+        """
+        self._generate_new_driver_internal_info(['bios'])
+        task = self._test_continue_updates()
+
+        cond_resume_clean_mock.assert_called_once_with(task)
+        validate_mock.assert_not_called()
+        cache_mock.assert_called_once_with(mock.ANY, task)
+
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       'cache_firmware_components', autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       '_validate_resources_stability', autospec=True)
+    @mock.patch.object(manager_utils, 'notify_conductor_resume_clean',
+                       autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       '_get_current_bmc_version', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
+    def test_bmc_completion_validates_stability(
+            self, get_us_mock, get_bmc_version_mock, cond_resume_clean_mock,
+            validate_mock, cache_mock):
+        """A completed BMC update validates before resuming the step."""
+        self._generate_new_driver_internal_info(['bmc'])
+        settings = self.node.driver_internal_info['redfish_fw_updates']
+        get_bmc_version_mock.return_value = '2.0.0'
+
+        firmware = redfish_fw.RedfishFirmware()
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            task.node.set_driver_internal_info(
+                'bmc_fw_version_before_update', '1.0.0')
+
+            firmware._handle_bmc_update_completion(
+                task, get_us_mock.return_value, settings, settings[0])
+
+            validate_mock.assert_called_once_with(firmware, task.node)
+            cond_resume_clean_mock.assert_called_once_with(task)
+
+    @mock.patch.object(redfish_fw.RedfishFirmware, '_resume_step',
+                       autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       'cache_firmware_components', autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       '_validate_resources_stability', autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       '_get_current_bmc_version', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
+    @mock.patch.object(timeutils, 'parse_isotime', autospec=True)
+    @mock.patch.object(timeutils, 'utcnow', autospec=True)
+    def test_bmc_noop_timeout_validates_before_resuming(
+            self, mock_utcnow, mock_parse_isotime, mock_get_update_service,
+            mock_get_bmc_version, mock_validate, mock_cache, mock_resume):
+        """An unchanged BMC version still stabilizes before resuming."""
+        import datetime
+
+        start = datetime.datetime(2025, 1, 1, tzinfo=datetime.timezone.utc)
+        mock_parse_isotime.return_value = start
+        mock_utcnow.return_value = start + datetime.timedelta(seconds=301)
+        mock_get_bmc_version.return_value = '1.0.0'
+        self.config(firmware_update_reboot_delay=300, group='redfish')
+        self._generate_new_driver_internal_info(['bmc'])
+        settings = self.node.driver_internal_info['redfish_fw_updates']
+        settings[0]['bmc_check_start_time'] = start.isoformat()
+
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            task.node.set_driver_internal_info(
+                'bmc_fw_version_before_update', '1.0.0')
+            task.node.set_driver_internal_info('redfish_fw_updates', settings)
+
+            firmware = redfish_fw.RedfishFirmware()
+            firmware._handle_bmc_update_completion(
+                task, mock_get_update_service.return_value,
+                settings, settings[0])
+
+            mock_validate.assert_called_once_with(firmware, task.node)
+            mock_resume.assert_called_once_with(firmware, task)
+            self.assertNotIn('firmware_reboot_requested',
+                             task.node.driver_internal_info)
+
     @mock.patch.object(redfish_utils, 'get_system', autospec=True)
     @mock.patch.object(redfish_fw.RedfishFirmware,
                        '_validate_resources_stability', autospec=True)
@@ -4053,6 +4144,110 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
         self.assertIsNotNone(saved_update['wait_start_time'])
         self.assertTrue(saved_update[redfish_fw.BIOS_REBOOT_VERIFIED])
 
+    @mock.patch.object(redfish_fw.RedfishFirmware, '_resume_step',
+                       autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       'cache_firmware_components', autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware, '_clear_updates',
+                       autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       '_validate_resources_stability', autospec=True)
+    def test_finish_post_reboot_bmc_finalize_validates_before_resume(
+            self, validate_mock, clear_mock, cache_mock, resume_mock):
+        """BMC apply reboots stabilize before finalizing."""
+        updates = self._setup_post_reboot_verify(
+            components=('bmc',), lc='skipped', boot='passed',
+            next_state='finalize')
+        firmware = redfish_fw.RedfishFirmware()
+        calls = []
+        validate_mock.side_effect = lambda _fw, _node: calls.append('validate')
+        clear_mock.side_effect = lambda _fw, _node: calls.append('clear')
+        cache_mock.side_effect = lambda _fw, _task: calls.append('cache')
+        resume_mock.side_effect = lambda _fw, _task: calls.append('resume')
+
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            firmware._finish_post_reboot_verify(
+                task, None, updates, updates[0],
+                updates[0][redfish_fw.POST_REBOOT_VERIFY])
+
+        self.assertEqual(['validate', 'clear', 'cache', 'resume'], calls)
+
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       '_execute_firmware_update', autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       '_validate_resources_stability', autospec=True)
+    def test_finish_post_reboot_bmc_continue_validates_before_next_update(
+            self, validate_mock, execute_mock):
+        """BMC apply reboots stabilize before submitting the next image."""
+        updates = self._setup_post_reboot_verify(
+            components=('bmc', 'bios'), lc='skipped', boot='passed',
+            next_state='continue')
+        firmware = redfish_fw.RedfishFirmware()
+        service = mock.Mock()
+        calls = []
+        validate_mock.side_effect = lambda _fw, _node: calls.append('validate')
+        execute_mock.side_effect = (
+            lambda _fw, _node, _service, _settings: calls.append('execute'))
+
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            firmware._finish_post_reboot_verify(
+                task, service, updates, updates[0],
+                updates[0][redfish_fw.POST_REBOOT_VERIFY])
+
+        self.assertEqual(['validate', 'execute'], calls)
+        self.assertEqual(['bios'], [update['component'] for update in updates])
+
+    @mock.patch.object(redfish_fw.RedfishFirmware, '_resume_step',
+                       autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       'cache_firmware_components', autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       '_validate_resources_stability', autospec=True)
+    def test_finish_post_reboot_non_bmc_finalize_skips_stability(
+            self, validate_mock, cache_mock, resume_mock):
+        """BIOS apply reboots skip the BMC stability wait."""
+        updates = self._setup_post_reboot_verify(
+            components=('bios',), lc='skipped', boot='passed',
+            next_state='finalize')
+        firmware = redfish_fw.RedfishFirmware()
+
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            firmware._finish_post_reboot_verify(
+                task, None, updates, updates[0],
+                updates[0][redfish_fw.POST_REBOOT_VERIFY])
+
+        validate_mock.assert_not_called()
+        cache_mock.assert_called_once()
+        resume_mock.assert_called_once()
+
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       '_execute_firmware_update', autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       '_validate_resources_stability', autospec=True)
+    def test_finish_post_reboot_non_bmc_continue_skips_stability(
+            self, validate_mock, execute_mock):
+        """BIOS apply reboots skip the BMC wait before continuing."""
+        updates = self._setup_post_reboot_verify(
+            components=('bios',), lc='skipped', boot='passed',
+            next_state='continue')
+        updates.append({'component': 'bmc', 'url': 'https://bmc/v2.0.0'})
+        firmware = redfish_fw.RedfishFirmware()
+        service = mock.Mock()
+
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            firmware._finish_post_reboot_verify(
+                task, service, updates, updates[0],
+                updates[0][redfish_fw.POST_REBOOT_VERIFY])
+
+        validate_mock.assert_not_called()
+        execute_mock.assert_called_once_with(
+            firmware, mock.ANY, service, updates)
+        self.assertEqual(['bmc'], [update['component'] for update in updates])
+
     @mock.patch.object(redfish_fw.RedfishFirmware,
                        '_validate_resources_stability', autospec=True)
     @mock.patch.object(redfish_fw.RedfishFirmware,
@@ -4486,7 +4681,9 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
             firmware._check_node_redfish_firmware_update(task)
 
             clear_mock.assert_called_once_with(firmware, task.node)
-            validate_mock.assert_called_once_with(firmware, task.node)
+            # The reboot gates have just read from the BMC, which never
+            # reset, so the stability validation is not run again.
+            validate_mock.assert_not_called()
             cache_mock.assert_called_once_with(firmware, task)
             resume_mock.assert_called_once_with(firmware, task)
 
@@ -5524,6 +5721,7 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
             clear_mock.assert_not_called()
             cache_mock.assert_not_called()
             resume_mock.assert_not_called()
+            # The BMC may still be flapping after the host reboot gates pass.
             validate_mock.assert_called_once_with(firmware, task.node)
             execute_mock.assert_called_once()
             # _execute_firmware_update(self, node, update_service, settings)
