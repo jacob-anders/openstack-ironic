@@ -166,6 +166,37 @@ opts = [
                       'start applying firmware, while others can begin '
                       'immediately. This timeout helps determine which '
                       'behavior the hardware exhibits.')),
+    cfg.IntOpt('firmware_update_post_reboot_verify_timeout',
+               min=0,
+               default=1800,
+               help=_('Maximum time (in seconds), after rebooting a node '
+                      'to apply firmware, for the update to be verified: '
+                      'its task finished, its Dell Lifecycle Controller '
+                      'jobs finished, and the node booted past POST. '
+                      'Firmware may be flashed during POST for part of '
+                      'this time, so it must cover a full POST. When it '
+                      'expires the step fails. Set to 0 to be bounded '
+                      'only by ``firmware_update_overall_timeout``.')),
+    cfg.IntOpt('firmware_update_boot_check_delay',
+               min=0,
+               default=600,
+               help=_('Time (in seconds) after a reboot to apply firmware '
+                      'before Ironic trusts a BootProgress state without '
+                      'having seen the node reset, since the BMC reports '
+                      'the state of the previous boot until the node '
+                      'resets. It is also how long a node whose BMC reports '
+                      'no BootProgress is held, unless a Dell Lifecycle '
+                      'Controller job confirmed the update, so it should '
+                      'exceed the slowest POST expected.')),
+    cfg.IntOpt('firmware_update_os_running_timeout',
+               min=0,
+               default=300,
+               help=_('During servicing, Ironic waits for BootProgress to '
+                      'report OSRunning after a reboot to apply firmware, '
+                      'so that the firmware versions it then reads are '
+                      'current. Some BMCs never report OSRunning: once the '
+                      'node is past POST, proceed after this many '
+                      'seconds.')),
     cfg.IntOpt('firmware_update_overall_timeout',
                min=0,
                default=7200,
