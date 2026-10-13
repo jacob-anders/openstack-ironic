@@ -1813,10 +1813,9 @@ class ConductorManager(base_manager.BaseConductorManager):
                     # NOTE(iurygregory): skip sync power state during firmware
                     # update, as BMC may be temporarily unresponsive and power
                     # cycling can interrupt the update process.
-                    has_fw_update = (
-                        task.node.driver_internal_info.get(
-                            'redfish_fw_updates') is not None
-                    )
+                    info = task.node.driver_internal_info
+                    has_fw_update = bool(info.get('redfish_fw_update')
+                                         or info.get('redfish_fw_updates'))
                     if (task.node.provision_state in SYNC_EXCLUDED_STATES
                             or task.node.maintenance
                             or task.node.target_power_state
