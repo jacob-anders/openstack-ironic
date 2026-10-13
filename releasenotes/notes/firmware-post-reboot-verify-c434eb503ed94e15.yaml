@@ -1,0 +1,33 @@
+---
+fixes:
+  - |
+    Redfish firmware updates no longer continue, or resume the clean,
+    service or deploy step, as soon as the task of an update applied by
+    rebooting the node finishes. Previously the node could be powered off
+    while firmware was still being flashed during POST, and the firmware
+    versions read before the new firmware was running. Ironic now also
+    waits until the node has booted past POST, to ``OSRunning`` while
+    servicing, according to ``BootProgress``, and on Dell iDRAC until the
+    Lifecycle Controller jobs applying the firmware have finished, failing
+    the step if one ends in error. A node whose BMC reports no
+    ``BootProgress``, such as HPE iLO, is held for a fixed delay instead.
+    If this cannot be verified in time, the step fails.
+  - |
+    A reboot requested by a Redfish firmware update that is carried out
+    only after later components have been updated, such as for a NIC
+    firmware update that is not the last one, is no longer forgotten when
+    the next component is submitted. Previously the step could complete
+    with that firmware staged but never applied. The Dell Lifecycle
+    Controller jobs of such updates are now also verified after the
+    reboot that applies them.
+upgrade:
+  - |
+    New ``[redfish]`` options bound the post-reboot verification of
+    firmware updates: ``firmware_update_post_reboot_verify_timeout``
+    (default 1800 seconds) for the whole verification,
+    ``firmware_update_boot_check_delay`` (default 600 seconds) for how long
+    a ``BootProgress`` state is not trusted unless the node was seen to
+    reset, and how long a node reporting no ``BootProgress`` is held, and
+    ``firmware_update_os_running_timeout`` (default 300 seconds) for how
+    long servicing waits for ``OSRunning`` once the node is past POST. Set
+    the delay above the slowest POST expected in the deployment.
