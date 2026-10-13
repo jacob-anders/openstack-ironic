@@ -1,0 +1,9 @@
+---
+upgrade:
+  - |
+    The Redfish firmware interface now keeps the state of a firmware update
+    step in a single ``redfish_fw_update`` entry of the node's
+    ``driver_internal_info``, with an explicit phase for each update,
+    instead of several separate entries. A firmware update started by an
+    earlier version of Ironic cannot be resumed by this version, and fails.
+    Let in-flight firmware updates finish before upgrading the conductor.
