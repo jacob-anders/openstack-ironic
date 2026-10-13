@@ -1,0 +1,36 @@
+---
+features:
+  - |
+    The Redfish ``firmware.update`` step accepts a new boolean argument,
+    ``allow_grouping_reboots``. When set, adjacent updates of components
+    other than the BMC are staged one after another and applied by a
+    single reboot of the node, instead of one reboot each, and verified
+    together after it. BMC updates are applied on their own, so for
+    example ``[bios, nic:NIC.1, bmc, nic:NIC.2, nic:NIC.3]`` needs three
+    reboots instead of five. Ironic does not reorder the components: list
+    the BMC first to get the fewest reboots. With grouping, a component
+    may appear only once, and only BMC components may set ``wait``. If
+    staging any component of a group fails, the step fails without
+    rebooting the node, and the error names the components already staged,
+    whose jobs may remain queued on the BMC. The default, ``False``, keeps
+    one reboot per component.
+fixes:
+  - |
+    Redfish BIOS and NIC firmware updates now follow a single flow, the
+    same with or without ``allow_grouping_reboots``: Ironic waits until the
+    BMC has staged the firmware -- its update task has completed, or has
+    waited in the ``Starting`` or ``Pending`` state for
+    ``[redfish]firmware_update_nic_starting_wait`` seconds -- then reboots
+    the node to apply it and verifies the update. Previously BIOS updates
+    rebooted the node while the BMC could still be downloading the
+    firmware, and a NIC update could reboot the node twice, or have its
+    reboot left until the end of the step. On Dell nodes, an update whose
+    task disappeared before staging finished is failed when its Lifecycle
+    Controller job did not stage the firmware. A BMC update that needs a
+    host reboot to take effect is applied the same way.
+upgrade:
+  - |
+    A BIOS or NIC firmware update started by an earlier version of Ironic
+    and not yet rebooted to apply cannot be resumed by this version, and
+    fails, leaving the node powered on. Let in-flight firmware updates
+    finish before upgrading the conductor.

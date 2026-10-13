@@ -91,53 +91,6 @@ def _get_dell_job_collection(task):
     return None
 
 
-def check_scheduled_idrac_job(task, current_update):
-    """Check Dell iDRAC for a scheduled Lifecycle Controller job.
-
-    Used when the Redfish task of a firmware update disappeared before
-    it could be observed: a job that is still scheduled or running means
-    the firmware was staged and a reboot will apply it, while a missing
-    or finished job means the download or staging did not leave anything
-    to apply.
-
-    :param task: a TaskManager instance
-    :param current_update: the current firmware update being processed
-    :returns: True if the job is still scheduled or running, False if it
-        has finished (successfully or not) or does not exist, None if
-        the task monitor does not name a job or the Dell OEM job
-        collection is not available
-    :raises: RedfishError, RedfishConnectionError or
-        sushy.exceptions.SushyError if the job collection cannot be read;
-        the job may still exist, so the caller should check again later.
-    """
-    node = task.node
-    jid = jid_from_task_monitor(current_update.get('task_monitor'))
-    if not jid:
-        LOG.warning('Task monitor %(uri)s of node %(node)s does not name a '
-                    'Lifecycle Controller job, so the job cannot be '
-                    'checked.',
-                    {'uri': current_update.get('task_monitor'),
-                     'node': node.uuid})
-        return None
-
-    status, detail = check_lc_jobs(task, [jid])
-    if status == LCJobStatus.UNAVAILABLE:
-        return None
-    if status == LCJobStatus.RUNNING:
-        LOG.debug('Found scheduled LC job %(jid)s for node %(node)s, '
-                  'firmware staging succeeded.',
-                  {'jid': jid, 'node': node.uuid})
-        return True
-    if status == LCJobStatus.ERROR:
-        LOG.warning('LC job %(jid)s for node %(node)s did not leave '
-                    'firmware to apply: %(detail)s',
-                    {'jid': jid, 'node': node.uuid, 'detail': detail})
-    else:
-        LOG.debug('LC job %(jid)s for node %(node)s has already '
-                  'finished.', {'jid': jid, 'node': node.uuid})
-    return False
-
-
 def _classify_dell_jobs(jids, jobs):
     """Classify DellJob objects into failed/running/done for `jids`.
 
