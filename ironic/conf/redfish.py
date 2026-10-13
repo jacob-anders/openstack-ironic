@@ -148,9 +148,9 @@ opts = [
                min=0,
                default=300,
                help=_('Default wait time (in seconds) for component-specific '
-                      'firmware update operations. Used for: BIOS firmware '
-                      'update wait before reboot, BMC firmware version check '
-                      'timeout, and NIC firmware task completion timeout.')),
+                      'firmware update operations. Used for: the BMC '
+                      'firmware version check timeout, and the power '
+                      'timeout of the reboot applying firmware.')),
     cfg.IntOpt('firmware_update_bmc_version_check_interval',
                min=0,
                default=30,
@@ -160,12 +160,13 @@ opts = [
     cfg.IntOpt('firmware_update_nic_starting_wait',
                min=0,
                default=30,
-               help=_('Time (in seconds) to wait for a NIC firmware update '
-                      'task to progress beyond the STARTING state before '
-                      'triggering a reboot. Some NICs need a reboot to '
-                      'start applying firmware, while others can begin '
-                      'immediately. This timeout helps determine which '
-                      'behavior the hardware exhibits.')),
+               help=_('Time (in seconds) a BIOS or NIC firmware update '
+                      'task must stay in the Starting or Pending state '
+                      'before Ironic treats the firmware as staged and '
+                      'reboots the node to apply it. A task waiting for '
+                      'the reboot stays in these states, while some '
+                      'hardware reports Starting briefly before applying '
+                      'the firmware without a reboot.')),
     cfg.IntOpt('firmware_update_post_reboot_verify_timeout',
                min=0,
                default=1800,
