@@ -2745,7 +2745,17 @@ class FastTrackTestCase(db_base.DbTestCase):
             task.node.provision_state = states.SERVICING
             self.assertFalse(conductor_utils.is_fast_track(task))
 
+    def test_is_fast_track_redfish_fw_update(self, mock_get_power):
+        mock_get_power.return_value = states.POWER_ON
+        with task_manager.acquire(
+                self.context, self.node.uuid, shared=False) as task:
+            task.node.set_driver_internal_info(
+                'redfish_fw_update', {'version': 1,
+                                      'updates': [{'url': 'http://test'}]})
+            self.assertFalse(conductor_utils.is_fast_track(task))
+
     def test_is_fast_track_redfish_fw_updates(self, mock_get_power):
+        # Recorded by an earlier version
         mock_get_power.return_value = states.POWER_ON
         with task_manager.acquire(
                 self.context, self.node.uuid, shared=False) as task:

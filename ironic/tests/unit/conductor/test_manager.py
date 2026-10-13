@@ -6692,8 +6692,10 @@ class ManagerSyncPowerStatesTestCase(mgr_utils.CommonMixIn,
         mapped_mock.return_value = True
         task = self._create_task(
             node_attrs=dict(uuid=self.node.uuid,
-                            driver_internal_info={'redfish_fw_updates': {
-                                'component': 'bmc', 'url': 'http://example.com'}}))
+                            driver_internal_info={'redfish_fw_update': {
+                                'version': 1, 'updates': [
+                                    {'component': 'bmc',
+                                     'url': 'http://example.com'}]}}))
         acquire_mock.side_effect = self._get_acquire_side_effect(task)
 
         self.service._sync_power_states(self.context)

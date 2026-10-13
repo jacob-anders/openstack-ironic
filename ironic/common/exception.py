@@ -713,6 +713,11 @@ class RedfishConnectionError(RedfishError):
     _msg_fmt = _("Redfish connection failed for node %(node)s: %(error)s")
 
 
+class InvalidFirmwareUpdatePhase(IronicException):
+    _msg_fmt = _("The %(component)s firmware update of node %(node)s cannot "
+                 "move from phase %(old)s to %(new)s.")
+
+
 class PortgroupPhysnetInconsistent(IronicException):
     _msg_fmt = _("Port group %(portgroup)s has member ports with inconsistent "
                  "physical networks (%(physical_networks)s). All ports in a "
