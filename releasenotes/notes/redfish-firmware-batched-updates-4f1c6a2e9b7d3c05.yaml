@@ -1,0 +1,35 @@
+---
+features:
+  - |
+    The Redfish ``firmware.update`` step accepts a new boolean argument,
+    ``allow_grouping_reboots``. When set, adjacent updates of components
+    other than the BMC are staged one after another and applied by a
+    single reboot, instead of one reboot each. For example
+    ``[bios, nic:NIC.1, bmc, nic:NIC.2, nic:NIC.3]`` needs two reboots
+    instead of five. Ironic does not reorder the components, so list the
+    BMC first for the fewest reboots. With grouping, the node is not
+    rebooted after a BMC update before the next updates are staged.
+    Hardware that needs this reboot before it can update device firmware,
+    such as some PLDM-based NICs, should have its BMC updated in a
+    separate step or without grouping. With grouping, a component may
+    appear only once, and only BMC components may set ``wait``. If staging
+    fails, the step fails without rebooting the node. The default,
+    ``False``, keeps one reboot per component.
+upgrade:
+  - |
+    Without ``allow_grouping_reboots``, each Redfish BIOS or NIC firmware
+    update is now applied by its own reboot as soon as the BMC has staged
+    it. Previously, consecutive NIC updates could share a single reboot at
+    the end of the step. Set ``allow_grouping_reboots`` to apply them with
+    one reboot.
+  - |
+    A BIOS or NIC firmware update started by an earlier version of Ironic
+    and not yet rebooted to apply cannot be resumed by this version, and
+    fails. Let in-flight firmware updates finish before upgrading the
+    conductor.
+deprecations:
+  - |
+    The ``[redfish]firmware_update_nic_starting_wait`` option is renamed to
+    ``[redfish]firmware_update_starting_wait``, as it now applies to the
+    firmware updates of every component other than the BMC. The old name
+    is deprecated and still accepted.
