@@ -15,17 +15,25 @@ mode, processing of the remaining updates will continue.
 .. note:: Only :doc:`/admin/drivers/redfish` supports firmware updates
    currently.
 
+All non-BMC firmware updates (BIOS, NIC) use a two-phase approach: the
+firmware is staged via Redfish SimpleUpdate, then the node is rebooted to
+apply it. By default, each non-BMC component gets its own reboot (a batch of
+one). Use ``allow_grouping_reboots`` to share a single reboot across
+adjacent non-BMC components — see `Batched updates (consolidated reboot)`_
+below.
+
 When updating the BMC firmware, the BMC may become unavailable for a period of
 time as it resets. In this case, it may be desirable to have the step
 wait after the update has been applied before indicating that the
 update was successful. This allows the BMC time to fully reset before further
 operations are carried out against it. To cause the step to wait after
-applying an update, an optional ``wait`` argument may be specified in the
+applying a BMC update, an optional ``wait`` argument may be specified in the
 firmware image dictionary. The value of this argument indicates the number of
-seconds to wait following the update. If the ``wait`` argument is not
-specified, then this is equivalent to ``wait 0``, meaning that it will not
-wait and immediately proceed with the next firmware update if there is one,
-or complete the step if not.
+seconds to wait following the update. With ``allow_grouping_reboots``, the
+``wait`` argument is only supported for BMC components. If the ``wait``
+argument is not specified, then this is equivalent to ``wait 0``,
+meaning that it will not wait and immediately proceed with the next firmware
+update if there is one, or complete the step if not.
 
 How it works
 ------------
@@ -92,6 +100,102 @@ mandatory, while the ``wait`` argument is optional.
 
 For ``url`` currently ``http``, ``https``, ``swift`` and ``file`` schemes are
 supported.
+
+Batched updates (consolidated reboot)
+--------------------------------------
+
+By default, the firmware update step applies each component sequentially and
+reboots the server after each one. When updating multiple non-BMC components
+(BIOS, NICs), you can use the ``allow_grouping_reboots`` argument to stage all
+firmware packages and apply them in a single consolidated reboot, reducing
+total downtime::
+
+    [{
+        "interface": "firmware",
+        "step": "update",
+        "args": {
+            "settings": [
+                {"component": "bios", "url": "http://192.0.2.10/BIOS_v2.0.EXE"},
+                {"component": "nic:NIC.1-1", "url": "http://192.0.2.10/NIC_v3.0.EXE"},
+                {"component": "nic:NIC.Slot.2", "url": "http://192.0.2.10/NIC2_v3.0.EXE"}
+            ],
+            "allow_grouping_reboots": true
+        }
+    }]
+
+**How batching works:**
+
+1. Each non-BMC component is submitted via Redfish SimpleUpdate one at a
+   time, on every platform. The step waits for the BMC to stage each one
+   before submitting the next: its task has completed, or has stayed in the
+   Starting or Pending state for
+   ``[redfish]firmware_update_starting_wait`` seconds, waiting for a
+   reboot to apply it.
+
+2. Once every component of the group is staged, the node is rebooted once.
+   The firmware is applied during that boot.
+
+3. After the reboot, the updates are verified together, as after any reboot
+   that applies firmware: every task has finished, any Dell Lifecycle
+   Controller jobs applying them have finished, and BootProgress shows the
+   node booted past POST. This is bounded by
+   ``[redfish]firmware_update_post_reboot_verify_timeout``.
+
+**Segmentation rules:**
+
+A reboot is shared by a maximal run of adjacent, distinct, non-BMC components.
+Ironic does not reorder the list. A BMC entry ends a group and is updated on
+its own, as a BMC update resets the management controller rather than the
+host. The node is not rebooted after a BMC update: once the BMC is stable,
+the next group is staged.
+
+For example, ``[bios, nic:NIC.1-1, bmc, nic:NIC.Slot.2, nic:NIC.Slot.3]``
+produces three phases: batch ``[bios, nic:NIC.1-1]`` with one reboot,
+``bmc`` on its own, then batch
+``[nic:NIC.Slot.2, nic:NIC.Slot.3]`` with one reboot — 2 reboots instead
+of 5.
+
+Without ``allow_grouping_reboots``, the node is rebooted after a BMC update
+that is followed by other components, because some hardware, such as some
+PLDM-based NICs, cannot update device firmware until the host has rebooted
+after a BMC update. Update the BMC of such hardware in a separate step, or
+without grouping.
+
+**Restrictions:**
+
+- With ``allow_grouping_reboots``, each component value must be unique within
+  the settings list. Duplicate components (e.g., two ``bios`` entries) are
+  rejected because batching stages
+  all packages against the running firmware and applies them in a single
+  reboot, making repeated updates of the same component unsafe. Use separate
+  ``firmware.update`` steps for staged upgrade paths.
+
+- With ``allow_grouping_reboots``, the ``wait`` per-component argument is
+  only supported for BMC components. Specifying ``wait`` on a non-BMC
+  component (BIOS, NIC) is rejected.
+
+**Timeout sizing:**
+
+With ``allow_grouping_reboots``, the overall timeout
+(``firmware_update_overall_timeout``) must account for staging time of all
+components plus the reboot. Firmware staging can take several minutes per
+component (Dell NIC firmware may take ~6.5 minutes). Size the timeout
+accordingly for the number of components being batched.
+
+**Failure semantics:**
+
+When ``allow_grouping_reboots`` is enabled, firmware is staged for every
+component of a group before the node is rebooted. If a failure occurs partway
+through staging, the step fails without rebooting the node. Components that
+were already staged may remain scheduled on the BMC and will apply on the
+next host boot, regardless of what triggers it (operator power-cycle, next
+cleaning attempt, deploy).
+
+The affected component names are listed in ``last_error`` on the node. Retrying
+``firmware.update`` will stage those components a second time — the same
+double-staging that the duplicate-component rule exists to prevent, arriving
+through a path validation cannot see. If this is a concern, inspect
+``last_error`` and take corrective action before retrying.
 
 Applying updates
 ----------------
